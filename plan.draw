@@ -1,0 +1,68 @@
+{
+  "format": "draw",
+  "formatVersion": 1,
+  "document": {
+    "id": "draw-roadmap-v1",
+    "title": "Draw: From First Canvas to What Comes Next",
+    "canvas": {
+      "infinite": true,
+      "background": {
+        "preset": "blackboard",
+        "styleVersion": 1,
+        "color": "#18191a",
+        "texture": "chalk-smudge-v1"
+      },
+      "viewport": { "x": 0, "y": 0, "zoom": 1 },
+      "previewBounds": { "x": 0, "y": 0, "width": 1080, "height": 1620 }
+    },
+    "elements": [
+      { "id": "title", "type": "text", "x": 72, "y": 48, "width": 780, "height": 72, "text": "DRAW", "style": { "font": "chalk-hand", "fontSize": 64, "color": "#f6f2e9", "weight": 700 } },
+      { "id": "subtitle", "type": "text", "x": 76, "y": 126, "width": 920, "height": 42, "text": "One canvas now. More ways to work later.", "style": { "font": "chalk-hand", "fontSize": 27, "color": "#e7e2d8" } },
+      { "id": "title-accent", "type": "line", "points": [[76, 184], [190, 184]], "style": { "stroke": "#f3c94c", "strokeWidth": 5, "roughness": 0.7 } },
+
+      { "id": "now-card", "type": "rectangle", "x": 72, "y": 220, "width": 936, "height": 178, "style": { "stroke": "#f2eee5", "strokeWidth": 3, "fill": "#18191a", "roughness": 1 } },
+      { "id": "now-heading", "type": "text", "x": 102, "y": 244, "width": 820, "height": 42, "text": "FIRST: ONE PERSISTENT, INFINITE CANVAS", "style": { "font": "chalk-hand", "fontSize": 28, "color": "#f3c94c", "weight": 700 } },
+      { "id": "now-body", "type": "text", "x": 102, "y": 296, "width": 850, "height": 76, "text": "Several diagrams live on one canvas.\nEdit them, save, and pick up later.", "style": { "font": "chalk-hand", "fontSize": 27, "color": "#f6f2e9" } },
+
+      { "id": "v1-heading", "type": "text", "x": 78, "y": 432, "width": 520, "height": 48, "text": "V1 · THE CORE LOOP", "style": { "font": "chalk-hand", "fontSize": 34, "color": "#f6f2e9", "weight": 700 } },
+
+      { "id": "edit-card", "type": "rectangle", "x": 72, "y": 500, "width": 448, "height": 176, "style": { "stroke": "#f2eee5", "strokeWidth": 2.5, "fill": "#18191a", "roughness": 1 } },
+      { "id": "edit-heading", "type": "text", "x": 96, "y": 522, "width": 400, "height": 34, "text": "EDIT THE CANVAS", "style": { "font": "chalk-hand", "fontSize": 25, "color": "#f6f2e9", "weight": 700 } },
+      { "id": "edit-body", "type": "text", "x": 96, "y": 566, "width": 394, "height": 90, "text": "Freehand · text · shapes\nArrows · select · undo / redo", "style": { "font": "chalk-hand", "fontSize": 22, "color": "#ddd8cf" } },
+
+      { "id": "save-card", "type": "rectangle", "x": 560, "y": 500, "width": 448, "height": 176, "style": { "stroke": "#f2eee5", "strokeWidth": 2.5, "fill": "#18191a", "roughness": 1 } },
+      { "id": "save-heading", "type": "text", "x": 584, "y": 522, "width": 400, "height": 34, "text": "SAVE · REOPEN · KEEP EDITING", "style": { "font": "chalk-hand", "fontSize": 23, "color": "#f3c94c", "weight": 700 } },
+      { "id": "save-body", "type": "text", "x": 584, "y": 566, "width": 392, "height": 90, "text": ".draw restores all editable\nelements, assets, and view.", "style": { "font": "chalk-hand", "fontSize": 22, "color": "#ddd8cf" } },
+
+      { "id": "bg-card", "type": "rectangle", "x": 72, "y": 700, "width": 448, "height": 176, "style": { "stroke": "#f2eee5", "strokeWidth": 2.5, "fill": "#18191a", "roughness": 1 } },
+      { "id": "bg-heading", "type": "text", "x": 96, "y": 722, "width": 400, "height": 34, "text": "PICK A BACKGROUND", "style": { "font": "chalk-hand", "fontSize": 25, "color": "#f6f2e9", "weight": 700 } },
+      { "id": "bg-body", "type": "text", "x": 96, "y": 766, "width": 394, "height": 84, "text": "Blackboard texture or white.\nChoice stays with the document.", "style": { "font": "chalk-hand", "fontSize": 22, "color": "#ddd8cf" } },
+
+      { "id": "export-card", "type": "rectangle", "x": 560, "y": 700, "width": 448, "height": 176, "style": { "stroke": "#f2eee5", "strokeWidth": 2.5, "fill": "#18191a", "roughness": 1 } },
+      { "id": "export-heading", "type": "text", "x": 584, "y": 722, "width": 400, "height": 34, "text": "EXPORT FOR SHARING", "style": { "font": "chalk-hand", "fontSize": 25, "color": "#f6f2e9", "weight": 700 } },
+      { "id": "export-body", "type": "text", "x": 584, "y": 766, "width": 392, "height": 84, "text": "PNG / JPEG are flattened images.\nThe .draw file keeps it editable.", "style": { "font": "chalk-hand", "fontSize": 22, "color": "#ddd8cf" } },
+
+      { "id": "mcp-card", "type": "rectangle", "x": 72, "y": 900, "width": 936, "height": 130, "style": { "stroke": "#79b9d2", "strokeWidth": 3, "fill": "#18191a", "roughness": 1 } },
+      { "id": "mcp-heading", "type": "text", "x": 100, "y": 918, "width": 820, "height": 36, "text": "MCP · CODEX CREATES NATIVE DRAW ELEMENTS", "style": { "font": "chalk-hand", "fontSize": 27, "color": "#79b9d2", "weight": 700 } },
+      { "id": "mcp-body", "type": "text", "x": 100, "y": 962, "width": 850, "height": 48, "text": "Create or edit on the open canvas. Then continue editing by hand.", "style": { "font": "chalk-hand", "fontSize": 22, "color": "#f6f2e9" } },
+
+      { "id": "next-arrow", "type": "arrow", "points": [[540, 1048], [540, 1094]], "style": { "stroke": "#f3c94c", "strokeWidth": 3, "roughness": 0.6, "endArrowhead": "triangle" } },
+      { "id": "later-card", "type": "rectangle", "x": 72, "y": 1112, "width": 936, "height": 360, "style": { "stroke": "#f3c94c", "strokeWidth": 3, "fill": "#18191a", "roughness": 1, "strokeStyle": "dashed" } },
+      { "id": "later-heading", "type": "text", "x": 102, "y": 1134, "width": 840, "height": 44, "text": "AFTER V1 · REVISIT THE NEXT NEEDS", "style": { "font": "chalk-hand", "fontSize": 30, "color": "#f3c94c", "weight": 700 } },
+      { "id": "later-1", "type": "text", "x": 112, "y": 1200, "width": 820, "height": 38, "text": "01  Organize: projects, boards, folders, pages", "style": { "font": "chalk-hand", "fontSize": 23, "color": "#f6f2e9" } },
+      { "id": "later-2", "type": "text", "x": 112, "y": 1250, "width": 820, "height": 38, "text": "02  Reach: accounts and cloud sync", "style": { "font": "chalk-hand", "fontSize": 23, "color": "#f6f2e9" } },
+      { "id": "later-3", "type": "text", "x": 112, "y": 1300, "width": 820, "height": 38, "text": "03  Share: collaborators and permissions", "style": { "font": "chalk-hand", "fontSize": 23, "color": "#f6f2e9" } },
+      { "id": "later-4", "type": "text", "x": 112, "y": 1350, "width": 820, "height": 38, "text": "04  Explore: Excalidraw import and broader parity", "style": { "font": "chalk-hand", "fontSize": 23, "color": "#f6f2e9" } },
+      { "id": "later-5", "type": "text", "x": 112, "y": 1400, "width": 820, "height": 38, "text": "05  Grow: more backgrounds, libraries, presentations", "style": { "font": "chalk-hand", "fontSize": 23, "color": "#f6f2e9" } },
+
+      { "id": "proof-line", "type": "line", "points": [[78, 1510], [1002, 1510]], "style": { "stroke": "#aaa69c", "strokeWidth": 1.5, "roughness": 0.4 } },
+      { "id": "proof", "type": "text", "x": 86, "y": 1530, "width": 930, "height": 52, "text": "THE PROOF: save → reopen → edit → export", "style": { "font": "chalk-hand", "fontSize": 25, "color": "#f3c94c", "weight": 700, "align": "center" } }
+    ],
+    "assets": {
+      "chalk-smudge-v1": {
+        "kind": "procedural-background",
+        "description": "Subtle charcoal board texture with erased chalk smudges, kept separate from editable diagram elements."
+      }
+    }
+  }
+}
