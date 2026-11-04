@@ -1,6 +1,6 @@
 export type DrawExportMimeType = "image/png" | "image/jpeg";
 
-export function selectExportElements<T extends { id: string; isDeleted?: boolean }>(
+export function selectExportElements<T extends { id: string; isDeleted?: boolean; containerId?: string | null }>(
   elements: readonly T[],
   selectedElementIds: Record<string, boolean> | undefined,
 ): T[] {
@@ -8,7 +8,9 @@ export function selectExportElements<T extends { id: string; isDeleted?: boolean
   const selected = selectedElementIds
     ? live.filter((element) => selectedElementIds[element.id] === true)
     : [];
-  return selected.length ? selected : live;
+  if (!selected.length) return live;
+  const selectedIds = new Set(selected.map((element) => element.id));
+  return live.filter((element) => selectedIds.has(element.id) || (element.containerId != null && selectedIds.has(element.containerId)));
 }
 
 const BLACKBOARD_BG = `

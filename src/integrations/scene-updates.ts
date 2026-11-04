@@ -28,6 +28,94 @@ function touch(element: EditableSceneElement, patch: Record<string, unknown> = {
   };
 }
 
+const EDITABLE_PATCH_FIELDS = new Set([
+  "text", "x", "y", "width", "height", "strokeColor", "backgroundColor",
+]);
+
+function measureApproximateText(text: string, fontSize: number, maxWidth: number): { width: number; height: number } {
+  const characterWidth = Math.max(1, fontSize * 0.58);
+  const capacity = Math.max(1, Math.floor(maxWidth / characterWidth));
+  let lineCount = 0;
+  let widestLine = 0;
+  for (const paragraph of text.split("\n")) {
+    const words = paragraph.split(/\s+/).filter(Boolean);
+    if (!words.length) {
+      lineCount += 1;
+      continue;
+    }
+    let lineLength = 0;
+    for (const word of words) {
+      let remaining = word.length;
+      while (remaining > 0) {
+        const gap = lineLength ? 1 : 0;
+        const room = capacity - lineLength - gap;
+        if (room <= 0) {
+          widestLine = Math.max(widestLine, lineLength);
+          lineCount += 1;
+          lineLength = 0;
+          continue;
+        }
+        const taken = Math.min(remaining, room);
+        lineLength += gap + taken;
+        remaining -= taken;
+        if (remaining > 0) {
+          widestLine = Math.max(widestLine, lineLength);
+          lineCount += 1;
+          lineLength = 0;
+        }
+      }
+    }
+    widestLine = Math.max(widestLine, lineLength);
+    lineCount += 1;
+  }
+  const lineHeight = fontSize * 1.25;
+  return { width: Math.min(maxWidth, Math.max(characterWidth, widestLine * characterWidth)), height: Math.max(lineHeight, lineCount * lineHeight) };
+}
+
+function refreshUpdatedText(
+  elements: EditableSceneElement[],
+  textElementId: string,
+): void {
+  const textIndex = elements.findIndex((element) => element.id === textElementId && !element.isDeleted);
+  if (textIndex < 0) return;
+  const textElement = elements[textIndex];
+  if (textElement.type !== "text" || typeof textElement.text !== "string") return;
+  const container = textElement.containerId
+    ? elements.find((element) => element.id === textElement.containerId && !element.isDeleted)
+    : undefined;
+  const shapeContainer = container && ["rectangle", "ellipse", "diamond"].includes(container.type) ? container : undefined;
+  const fontSize = typeof textElement.fontSize === "number" && textElement.fontSize > 0 ? textElement.fontSize : 20;
+  const maxWidth = shapeContainer
+    ? Math.max(1, (shapeContainer.width ?? textElement.width ?? 1) - 20)
+    : Math.max(1, Math.max(textElement.width ?? 1, textElement.text.length * fontSize * 0.58));
+  const dimensions = measureApproximateText(textElement.text, fontSize, maxWidth);
+  const width = shapeContainer ? maxWidth : dimensions.width;
+  const height = dimensions.height;
+  const nextText = touch(textElement, {
+    width,
+    height,
+    ...(shapeContainer ? {
+      x: (shapeContainer.x ?? 0) + ((shapeContainer.width ?? width) - width) / 2,
+      y: (shapeContainer.y ?? 0) + ((shapeContainer.height ?? height) - height) / 2,
+    } : {}),
+  });
+  elements[textIndex] = nextText;
+
+  // Keep the text inside its shape. Bound labels can wrap to more lines than
+  // the shape previously allowed, so grow the shape vertically to fit them.
+  if (shapeContainer && height + 20 > (shapeContainer.height ?? 0)) {
+    const containerIndex = elements.findIndex((element) => element.id === shapeContainer.id);
+    if (containerIndex >= 0) {
+      const newHeight = height + 20;
+      const nextContainer = touch(elements[containerIndex], { height: newHeight });
+      elements[containerIndex] = nextContainer;
+      elements[textIndex] = touch(elements[textIndex], {
+        y: (nextContainer.y ?? 0) + (newHeight - height) / 2,
+      });
+    }
+  }
+}
+
 function center(element: EditableSceneElement): [number, number] {
   return [(element.x ?? 0) + (element.width ?? 0) / 2, (element.y ?? 0) + (element.height ?? 0) / 2];
 }
@@ -143,6 +231,13 @@ export function applyElementUpdates(
     const index = elements.findIndex((element) => element.id === update.id && !element.isDeleted);
     if (index < 0) throw new Error(`No active editable element found with id "${update.id}".`);
     const target = elements[index];
+    const patchFields = Object.keys(update.patch as Record<string, unknown>);
+    const unsupportedField = patchFields.find((field) => !EDITABLE_PATCH_FIELDS.has(field));
+    if (unsupportedField) throw new Error(`Update field "${unsupportedField}" is unsupported.`);
+    if ((target.type === "arrow" || target.type === "line" || target.type === "freedraw") &&
+      Array.isArray(target.points) && ("width" in update.patch || "height" in update.patch)) {
+      throw new Error("Width or height updates are unsupported for points-based geometry; provide endpoint-aware point scaling instead.");
+    }
     const { text, ...geometryPatch } = update.patch;
     if (Object.keys(geometryPatch).length) {
       const changed = touch(target, geometryPatch);
@@ -164,6 +259,8 @@ export function applyElementUpdates(
       const textIndex = labelIndex >= 0 ? labelIndex : index;
       elements[textIndex] = touch(elements[textIndex], { text, originalText: text });
       updatedIds.add(elements[textIndex].id);
+      refreshUpdatedText(elements, elements[textIndex].id);
+      if (elements[textIndex].containerId) updatedIds.add(elements[textIndex].containerId!);
     }
   }
 

@@ -13,21 +13,26 @@ type BridgeAck = {
   document?: DrawDocumentBridgeValue;
   result?: unknown;
   error?: string;
+  warning?: string;
 };
 
 type PendingCommand = {
   clientId: string;
   resolve: (ack: BridgeAck) => void;
   timeout: ReturnType<typeof setTimeout>;
+  cleanupTimeout?: ReturnType<typeof setTimeout>;
+  timedOut: boolean;
 };
 
 export type DrawMcpBridgeOptions = {
   commandTimeoutMs?: number;
+  lateAckRetentionMs?: number;
   maxBodyBytes?: number;
 };
 
 const API_ROOT = "/__draw/api";
 const DEFAULT_COMMAND_TIMEOUT_MS = 20_000;
+const DEFAULT_LATE_ACK_RETENTION_MS = 60_000;
 const DEFAULT_MAX_BODY_BYTES = 100 * 1024 * 1024;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -82,6 +87,7 @@ function asMcpCommand(body: unknown): McpCommand {
 
 export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin {
   const commandTimeoutMs = options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+  const lateAckRetentionMs = options.lateAckRetentionMs ?? DEFAULT_LATE_ACK_RETENTION_MS;
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const pending = new Map<string, PendingCommand>();
   let document: DrawDocumentBridgeValue | null = null;
@@ -102,6 +108,15 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
 
         const origin = request.headers.origin;
         const host = request.headers.host;
+        const allowedHosts = new Set([
+          `127.0.0.1:${server.config.server.port}`,
+          `localhost:${server.config.server.port}`,
+          `[::1]:${server.config.server.port}`,
+        ]);
+        if (typeof host !== "string" || !allowedHosts.has(host.toLowerCase())) {
+          sendJson(response, 403, { error: "Draw MCP bridge accepts only its configured loopback host." });
+          return;
+        }
         if (typeof origin === "string" && (!host || origin !== `http://${host}`)) {
           sendJson(response, 403, { error: "Draw MCP bridge accepts same-origin browser requests only." });
           return;
@@ -133,11 +148,15 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
 
           if (request.method === "PUT" && path === `${API_ROOT}/document`) {
             const body = await readJsonBody(request, maxBodyBytes);
-            if (!isDrawDocument(body)) {
-              sendJson(response, 400, { error: "Body must be a valid Draw document (format draw, version 1)." });
+            if (!isRecord(body) || typeof body.clientId !== "string" || body.clientId !== activeClientId) {
+              sendJson(response, 409, { error: "Only the active Draw canvas may sync its document." });
               return;
             }
-            document = body;
+            if (!isDrawDocument(body.document)) {
+              sendJson(response, 400, { error: "Body must include a valid Draw document (format draw, version 1)." });
+              return;
+            }
+            document = body.document;
             sendJson(response, 200, { ok: true, documentId: document.document.id });
             return;
           }
@@ -168,13 +187,17 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
             const clientId = activeClientId;
             const ackPromise = new Promise<BridgeAck>((resolve, reject) => {
               const timeout = setTimeout(() => {
-                pending.delete(id);
-                reject(new Error("The Draw canvas did not acknowledge the MCP command in time."));
+                const waiting = pending.get(id);
+                if (!waiting) return;
+                waiting.timedOut = true;
+                waiting.cleanupTimeout = setTimeout(() => pending.delete(id), lateAckRetentionMs);
+                reject(new Error("Timed out waiting for the Draw canvas. Call get_current_canvas before retrying, because the edit may already have been applied."));
               }, commandTimeoutMs);
               pending.set(id, {
                 clientId,
                 resolve: (ack) => resolve(ack),
                 timeout,
+                timedOut: false,
               });
             });
             server.ws.send("draw:mcp-command", { id, clientId, ...command });
@@ -196,7 +219,12 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
                 sendJson(response, 500, { error: "Canvas command finished before the Draw document was synchronized." });
                 return;
               }
-              sendJson(response, 200, { ok: true, documentId: document.document.id, result: ack.result ?? null });
+              sendJson(response, 200, {
+                ok: true,
+                documentId: document.document.id,
+                result: ack.result ?? null,
+                ...(ack.warning ? { warning: ack.warning } : {}),
+              });
             } catch (error) {
               sendJson(response, 504, { error: error instanceof Error ? error.message : "MCP command timed out." });
             }
@@ -229,15 +257,18 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               return;
             }
             clearTimeout(waiting.timeout);
+            if (waiting.cleanupTimeout) clearTimeout(waiting.cleanupTimeout);
             pending.delete(id);
+            if (isDrawDocument(body.document)) document = body.document;
             waiting.resolve({
               id,
               clientId: body.clientId,
               ...(typeof body.error === "string" ? { error: body.error } : {}),
+              ...(typeof body.warning === "string" ? { warning: body.warning } : {}),
               ...(isDrawDocument(body.document) ? { document: body.document } : {}),
               ...(body.result !== undefined ? { result: body.result } : {}),
             });
-            sendJson(response, 200, { ok: true });
+            sendJson(response, 200, { ok: true, late: waiting.timedOut });
             return;
           }
 

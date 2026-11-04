@@ -10,6 +10,19 @@ describe("export background composition", () => {
     expect(selectExportElements(elements, {}).map((element) => element.id)).toEqual(["one", "two", "three"]);
   });
 
+  it("keeps labels bound to selected containers and arrows", () => {
+    const elements = [
+      { id: "box", type: "rectangle" },
+      { id: "box-label", type: "text", containerId: "box" },
+      { id: "other-box", type: "rectangle" },
+      { id: "arrow", type: "arrow" },
+      { id: "arrow-label", type: "text", containerId: "arrow" },
+      { id: "unrelated", type: "text" },
+    ];
+    expect(selectExportElements(elements, { box: true }).map((element) => element.id)).toEqual(["box", "box-label"]);
+    expect(selectExportElements(elements, { arrow: true }).map((element) => element.id)).toEqual(["arrow", "arrow-label"]);
+  });
+
   it("places the selected white background behind existing scene elements", () => {
     const result = composeBackgroundSvg(svg, "white");
     expect(result.indexOf('data-draw-background="white"')).toBeLessThan(result.indexOf('id="scene"'));

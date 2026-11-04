@@ -206,16 +206,45 @@ export function parseMcpToolInput(
   throw new McpValidationError(`Unknown Draw MCP tool "${name}".`);
 }
 
-/** Compact summary that excludes soft-deleted scene objects and keeps recent IDs visible. */
-export function summarizeCurrentCanvas(document: DrawDocument, limit = 250) {
+export interface CanvasPageOptions {
+  /** Zero-based index among active (non-deleted) scene elements. */
+  offset?: number;
+  /** Maximum number of elements in this page. */
+  limit?: number;
+}
+
+const MAX_CANVAS_PAGE_SIZE = 250;
+const MAX_CANVAS_OFFSET = 1_000_000;
+
+/** Compact, paginated summary that excludes soft-deleted scene objects. */
+export function summarizeCurrentCanvas(document: DrawDocument, options: CanvasPageOptions | number = {}) {
   const elements = document.document.elements.filter((element) => element.isDeleted !== true);
-  const visible = elements.slice(-limit);
+  const legacyLimit = typeof options === "number";
+  const limit = legacyLimit ? options : (options.limit ?? MAX_CANVAS_PAGE_SIZE);
+  const offset = legacyLimit
+    ? Math.max(0, elements.length - limit)
+    : (options.offset ?? 0);
+
+  if (!Number.isInteger(offset) || offset < 0 || offset > MAX_CANVAS_OFFSET) {
+    throw new McpValidationError(`offset must be an integer between 0 and ${MAX_CANVAS_OFFSET}.`);
+  }
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_CANVAS_PAGE_SIZE) {
+    throw new McpValidationError(`limit must be an integer between 1 and ${MAX_CANVAS_PAGE_SIZE}.`);
+  }
+
+  const visible = elements.slice(offset, offset + limit);
+  const nextOffset = offset + visible.length;
+  const hasMore = nextOffset < elements.length;
   return {
     id: document.document.id,
     title: document.document.title,
     background: document.document.canvas.background.preset,
     viewport: document.document.canvas.viewport,
     elementCount: elements.length,
+    offset,
+    limit,
+    nextOffset: hasMore ? nextOffset : null,
+    hasMore,
     elements: visible.map((element: any) => ({
       id: element.id,
       type: element.type,
@@ -224,8 +253,12 @@ export function summarizeCurrentCanvas(document: DrawDocument, limit = 250) {
       y: element.y,
       width: element.width,
       height: element.height,
+      containerId: element.containerId,
+      boundElements: Array.isArray(element.boundElements) ? element.boundElements : undefined,
+      strokeColor: element.strokeColor,
+      backgroundColor: element.backgroundColor,
     })),
     assetsCount: Object.keys(document.document.assets).length,
-    truncated: elements.length > visible.length,
+    truncated: hasMore || offset > 0,
   };
 }
