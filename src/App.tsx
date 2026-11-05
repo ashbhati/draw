@@ -1,4 +1,4 @@
-import { CaptureUpdateAction, Excalidraw, convertToExcalidrawElements, exportToSvg } from "@excalidraw/excalidraw";
+import { CaptureUpdateAction, Excalidraw, FONT_FAMILY, convertToExcalidrawElements, exportToSvg } from "@excalidraw/excalidraw";
 import type { ExcalidrawImperativeAPI, ExcalidrawInitialDataState } from "@excalidraw/excalidraw/types";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -11,12 +11,14 @@ import {
   type DrawDocument,
 } from "./document/document";
 import { composeBackgroundSvg, renderExportBlob, selectExportElements } from "./export/background";
+import { recolorDefaultElements } from "./export/background-recolor";
 import { saveCurrentDocument, loadCurrentDocument } from "./ui/storage";
-import { applyElementUpdates } from "./integrations/scene-updates";
+import { applyElementUpdates, type EditableSceneElement } from "./integrations/scene-updates";
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
 import { createDebouncedSaver } from "./ui/autosave";
 import { buildDiagramSkeletons } from "./integrations/diagram-builder";
 import { persistAppliedDocument } from "./integrations/command-persistence";
+import { createBridgeSynchronizer } from "./integrations/bridge-sync";
 
 type Status = "loading" | "ready" | "saving" | "saved" | "error";
 type BridgeCommand = { id: string; clientId: string; operation: "create_diagram" | "update_elements"; input: any };
@@ -25,6 +27,19 @@ const EDITOR_UI_OPTIONS = {
   canvasActions: { loadScene: false, saveToActiveFile: false, export: false, toggleTheme: false, changeViewBackgroundColor: false },
 } as const;
 const randomId = () => globalThis.crypto?.randomUUID?.() ?? `el-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+function measureTextWithExcalidraw(text: string, fontSize: number, element: EditableSceneElement) {
+  const skeleton: Record<string, unknown> = {
+    id: "draw-text-measurement",
+    type: "text",
+    text,
+    fontSize,
+    fontFamily: element.fontFamily ?? FONT_FAMILY.Virgil,
+  };
+  if (typeof element.lineHeight === "number") skeleton.lineHeight = element.lineHeight;
+  const [measured] = convertToExcalidrawElements([skeleton] as any[], { regenerateIds: false }) as any[];
+  return { width: measured.width as number, height: measured.height as number };
+}
 
 function download(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
@@ -50,6 +65,7 @@ export default function App() {
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
   const docRef = useRef<DrawDocument | null>(null);
   const clientId = useRef(randomId());
+  const bridgeSync = useMemo(() => createBridgeSynchronizer(clientId.current), []);
   const writerOwned = useRef(false);
   const titleInput = useRef<HTMLInputElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -69,6 +85,17 @@ export default function App() {
     setMessage(`Autosave failed: ${error instanceof Error ? error.message : String(error)}`);
   }), []);
 
+  const syncBridgeDocument = useCallback(async (value: DrawDocument) => {
+    if (!import.meta.env.DEV) return;
+    if (!writerOwned.current) throw new Error("This tab does not own the active Draw canvas.");
+    await bridgeSync(value);
+  }, [bridgeSync]);
+
+  const bridgeAutosave = useMemo(() => createDebouncedSaver<DrawDocument>(syncBridgeDocument, 350, (error) => {
+    setStatus("error");
+    setMessage(`MCP bridge sync failed: ${error instanceof Error ? error.message : String(error)}`);
+  }), [syncBridgeDocument]);
+
   useEffect(() => {
     let live = true;
     let lock: WriterLock | null = null;
@@ -81,7 +108,7 @@ export default function App() {
         if (!lock.acquired) {
           setAutosaveBlocked(true);
           setMessage(lock.supported
-            ? "Draw is already open in another tab. This tab is read-only to protect your autosave. Close the other tab to edit here."
+            ? "Draw is already open in another tab. Close that tab, then reload this tab to edit."
             : "This browser cannot coordinate Draw tabs safely. This tab is read-only to protect your autosave.");
         }
         try {
@@ -115,25 +142,13 @@ export default function App() {
         writerOwned.current = false;
         lock?.release();
       };
-      if (autosave.isBusy()) void autosave.flush().finally(release);
-      else release();
+      if (autosave.isBusy() || bridgeAutosave.isBusy()) {
+        void Promise.all([autosave.flush(), bridgeAutosave.flush()])
+          .catch((error: unknown) => console.error("Could not flush Draw before closing:", error))
+          .finally(release);
+      } else release();
     };
-  }, [autosave, setDocument]);
-
-  const syncBridgeDocument = useCallback(async (value: DrawDocument) => {
-    if (!import.meta.env.DEV) return;
-    if (!writerOwned.current) throw new Error("This tab does not own the active Draw canvas.");
-    const client = await fetch("/__draw/api/client", {
-      method: "PUT", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ clientId: clientId.current }),
-    });
-    if (!client.ok) throw new Error(`Draw bridge rejected client registration (HTTP ${client.status}).`);
-    const response = await fetch("/__draw/api/document", {
-      method: "PUT", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ clientId: clientId.current, document: value }),
-    });
-    if (!response.ok) throw new Error(`Draw bridge rejected document sync (HTTP ${response.status}).`);
-  }, []);
+  }, [autosave, bridgeAutosave, setDocument]);
 
   const onChange = useCallback((elements: readonly any[], appState: any, files: any) => {
     if (!writerOwned.current) return;
@@ -158,20 +173,18 @@ export default function App() {
     }
     setStatus("saving");
     autosave.schedule(next);
-    void syncBridgeDocument(next).catch((error: unknown) => {
-      setStatus("error"); setMessage(error instanceof Error ? error.message : "Could not sync Draw with MCP.");
-    });
-  }, [autosave, autosaveBlocked, setDocument, syncBridgeDocument]);
+    bridgeAutosave.schedule(next);
+  }, [autosave, autosaveBlocked, bridgeAutosave, setDocument]);
 
   useEffect(() => {
     if (!doc || !canWrite || !import.meta.env.DEV) return;
-    void syncBridgeDocument(doc).catch((error: unknown) => setMessage(error instanceof Error ? error.message : "Could not connect Draw to MCP."));
-  }, [canWrite, doc?.document.id, doc ? editorKey : -1, syncBridgeDocument]);
+    bridgeAutosave.schedule(doc);
+  }, [bridgeAutosave, canWrite, doc?.document.id, doc ? editorKey : -1]);
 
   useEffect(() => {
     const flushPending = () => {
-      if (!writerOwned.current || !autosave.isBusy()) return;
-      void autosave.flush().catch((error: unknown) => {
+      if (!writerOwned.current || (!autosave.isBusy() && !bridgeAutosave.isBusy())) return;
+      void Promise.all([autosave.flush(), bridgeAutosave.flush()]).catch((error: unknown) => {
         setStatus("error");
         setMessage(`Could not flush the last local save: ${error instanceof Error ? error.message : String(error)}`);
       });
@@ -183,7 +196,7 @@ export default function App() {
       window.removeEventListener("pagehide", flushPending);
       document.removeEventListener("visibilitychange", flushWhenHidden);
     };
-  }, [autosave]);
+  }, [autosave, bridgeAutosave]);
 
   const loadDocument = useCallback(async (next: DrawDocument) => {
     if (!writerOwned.current) {
@@ -191,6 +204,7 @@ export default function App() {
       return;
     }
     if (autosave.isBusy()) await autosave.flush();
+    if (bridgeAutosave.isBusy()) await bridgeAutosave.flush();
     setDocument(next);
     setStatus("ready"); setMessage(""); setEditorKey((key) => key + 1);
     setAutosaveBlocked(false);
@@ -203,7 +217,7 @@ export default function App() {
       setStatus("error");
       setMessage(`The file opened, but local autosave failed: ${error instanceof Error ? error.message : String(error)}. Use Save .draw to preserve it.`);
     }
-  }, [autosave, setDocument, syncBridgeDocument]);
+  }, [autosave, bridgeAutosave, setDocument, syncBridgeDocument]);
 
   const openFile = async (file?: File) => {
     if (!file) return;
@@ -243,16 +257,26 @@ export default function App() {
     const current = docRef.current;
     if (!current) return;
     const color = DEFAULT_COLOR[preset];
+    const elements = recolorDefaultElements(
+      current.document.elements,
+      current.document.canvas.background.preset,
+      preset,
+    );
     const next: DrawDocument = {
       ...current,
       document: {
         ...current.document,
+        elements,
         canvas: { ...current.document.canvas, background: { preset, styleVersion: 1, color, ...(preset === "blackboard" ? { texture: "chalk-smudge-v1" } : {}) } },
         appState: { ...current.document.appState, viewBackgroundColor: color, currentItemStrokeColor: preset === "blackboard" ? "#f6f2e9" : "#1e1e1e" },
       },
     };
     setDocument(next);
-    apiRef.current?.updateScene({ appState: { viewBackgroundColor: color, currentItemStrokeColor: preset === "blackboard" ? "#f6f2e9" : "#1e1e1e" } });
+    apiRef.current?.updateScene({
+      elements: elements as any,
+      appState: { viewBackgroundColor: color, currentItemStrokeColor: preset === "blackboard" ? "#f6f2e9" : "#1e1e1e" },
+      captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+    });
     if (autosaveBlocked) {
       setStatus("error");
       setMessage("Local autosave is unavailable. Save a portable .draw file to keep this change.");
@@ -260,7 +284,7 @@ export default function App() {
     }
     setStatus("saving");
     autosave.schedule(next);
-    void syncBridgeDocument(next).catch(() => undefined);
+    bridgeAutosave.schedule(next);
   };
 
   const handleMcpCommand = useCallback(async (event: BridgeCommand) => {
@@ -300,7 +324,7 @@ export default function App() {
           ...(titleElement ? { titleElementId: titleElement.id } : {}),
         };
       } else {
-        const update = applyElementUpdates(elements, event.input.updates);
+        const update = applyElementUpdates(elements, event.input.updates, measureTextWithExcalidraw);
         elements = update.elements;
         result = { updatedElementIds: update.updatedIds };
       }
@@ -373,7 +397,7 @@ export default function App() {
         if (autosaveBlocked) { setStatus("error"); return; }
         setStatus("saving");
         autosave.schedule(next);
-        void syncBridgeDocument(next).catch((error: unknown) => setMessage(error instanceof Error ? error.message : "Could not sync Draw with MCP."));
+        bridgeAutosave.schedule(next);
       }} /></span></div>
       <div className="toolbar-actions">
         <span className={`save-indicator ${status}`}><i />{statusText}</span>

@@ -18,6 +18,8 @@ export type EditableSceneElement = {
   versionNonce?: number;
   [key: string]: unknown;
 };
+export type TextMetrics = { width: number; height: number };
+export type MeasureText = (text: string, fontSize: number, element: EditableSceneElement) => TextMetrics;
 
 function touch(element: EditableSceneElement, patch: Record<string, unknown> = {}): EditableSceneElement {
   return {
@@ -75,6 +77,7 @@ function measureApproximateText(text: string, fontSize: number, maxWidth: number
 function refreshUpdatedText(
   elements: EditableSceneElement[],
   textElementId: string,
+  measureText: MeasureText,
 ): void {
   const textIndex = elements.findIndex((element) => element.id === textElementId && !element.isDeleted);
   if (textIndex < 0) return;
@@ -85,13 +88,19 @@ function refreshUpdatedText(
     : undefined;
   const shapeContainer = container && ["rectangle", "ellipse", "diamond"].includes(container.type) ? container : undefined;
   const fontSize = typeof textElement.fontSize === "number" && textElement.fontSize > 0 ? textElement.fontSize : 20;
+  const rawText = textElement.originalText ?? textElement.text;
   const maxWidth = shapeContainer
     ? Math.max(1, (shapeContainer.width ?? textElement.width ?? 1) - 20)
-    : Math.max(1, Math.max(textElement.width ?? 1, textElement.text.length * fontSize * 0.58));
-  const dimensions = measureApproximateText(textElement.text, fontSize, maxWidth);
+    : Math.max(1, textElement.width ?? rawText.length * fontSize * 0.58);
+  const wrappedText = shapeContainer
+    ? wrapTextToWidth(rawText, maxWidth, (line) => measureText(line, fontSize, { ...textElement, width: maxWidth }).width)
+    : rawText;
+  const dimensions = measureText(wrappedText, fontSize, { ...textElement, width: maxWidth });
   const width = shapeContainer ? maxWidth : dimensions.width;
   const height = dimensions.height;
   const nextText = touch(textElement, {
+    text: wrappedText,
+    originalText: rawText,
     width,
     height,
     ...(shapeContainer ? {
@@ -114,6 +123,30 @@ function refreshUpdatedText(
       });
     }
   }
+}
+
+function wrapTextToWidth(text: string, maxWidth: number, measureLine: (text: string) => number): string {
+  return text.split("\n").map((paragraph) => {
+    const words = paragraph.split(/\s+/).filter(Boolean);
+    if (words.length === 0) return "";
+    const lines: string[] = [];
+    let line = "";
+    for (const word of words) {
+      const pieces = measureLine(word) > maxWidth ? Array.from(word) : [word];
+      for (const piece of pieces) {
+        const candidate = line ? `${line} ${piece}` : piece;
+        if (!line || measureLine(candidate) <= maxWidth) line = candidate;
+        else { lines.push(line); line = piece; }
+      }
+    }
+    if (line) lines.push(line);
+    return lines.join("\n");
+  }).join("\n");
+}
+
+function fallbackMeasureText(text: string, fontSize: number, element: EditableSceneElement): TextMetrics {
+  const availableWidth = Math.max(1, element.width ?? text.length * fontSize * 0.58);
+  return measureApproximateText(text, fontSize, availableWidth);
 }
 
 function center(element: EditableSceneElement): [number, number] {
@@ -222,6 +255,7 @@ function repositionBoundArrowLabels(
 export function applyElementUpdates(
   scene: readonly EditableSceneElement[],
   updates: readonly ElementUpdateInput[],
+  measureText: MeasureText = fallbackMeasureText,
 ): { elements: EditableSceneElement[]; updatedIds: string[] } {
   const elements = scene.map((element) => ({ ...element }));
   const updatedIds = new Set<string>();
@@ -259,7 +293,7 @@ export function applyElementUpdates(
       const textIndex = labelIndex >= 0 ? labelIndex : index;
       elements[textIndex] = touch(elements[textIndex], { text, originalText: text });
       updatedIds.add(elements[textIndex].id);
-      refreshUpdatedText(elements, elements[textIndex].id);
+      refreshUpdatedText(elements, elements[textIndex].id, measureText);
       if (elements[textIndex].containerId) updatedIds.add(elements[textIndex].containerId!);
     }
   }

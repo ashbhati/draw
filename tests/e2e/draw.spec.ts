@@ -11,6 +11,18 @@ async function currentBridgeDocument(page: Page) {
   return response.json();
 }
 
+async function waitForBridge(page: Page) {
+  const registrationRequest = page.waitForRequest((request) => request.url().endsWith("/__draw/api/client") && request.method() === "PUT");
+  const documentRequest = page.waitForRequest((request) => request.url().endsWith(documentApi) && request.method() === "PUT");
+  await page.goto("/");
+  await page.locator(".topbar").waitFor();
+  const registered = await registrationRequest;
+  const synced = await documentRequest;
+  expect(synced.postDataJSON().clientId).toBe(registered.postDataJSON().clientId);
+  const health = await (await page.request.get("/__draw/api/health")).json();
+  expect(health.clientReady && health.documentReady).toBe(true);
+}
+
 async function readLocalDocument(page: Page) {
   return page.evaluate(() => new Promise((resolve, reject) => {
     const request = indexedDB.open("draw-local", 1);
@@ -24,9 +36,26 @@ async function readLocalDocument(page: Page) {
   }));
 }
 
+async function countWarmImagePixels(page: Page, image: Buffer): Promise<number> {
+  return page.evaluate(async (bytes) => {
+    const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: "image/png" }));
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Canvas pixel inspection is unavailable.");
+    context.drawImage(bitmap, 0, 0);
+    const pixels = context.getImageData(0, 0, bitmap.width, bitmap.height).data;
+    let warm = 0;
+    for (let index = 0; index < pixels.length; index += 4) {
+      if (pixels[index] > 170 && pixels[index + 1] > 110 && pixels[index] > pixels[index + 1] * 1.08 && pixels[index + 1] > pixels[index + 2] * 1.08) warm += 1;
+    }
+    return warm;
+  }, Array.from(image));
+}
+
 test.beforeEach(async ({ page }) => {
-  await page.goto("/");
-  await page.locator(".topbar").waitFor();
+  await waitForBridge(page);
   await page.locator(".excalidraw canvas").first().waitFor();
   await expect(page.getByRole("button", { name: "Blackboard" })).toBeEnabled();
 });
@@ -51,17 +80,35 @@ test("MCP create and update stay editable through save, reload, open, and image 
   expect(created.result.nodes.check).toBeTruthy();
   expect(created.result.edges).toHaveLength(1);
 
+  const undo = page.getByRole("button", { name: "Undo" });
+  await expect(undo).toBeEnabled();
+  await undo.click();
+  await expect.poll(async () => {
+    const current = await currentBridgeDocument(page);
+    return created.result.addedElementIds.every((id: string) => !current.document.elements.some((element: any) => element.id === id && element.isDeleted !== true));
+  }).toBe(true);
+  await page.getByRole("button", { name: "Redo" }).click();
+  await expect.poll(async () => {
+    const current = await currentBridgeDocument(page);
+    return created.result.addedElementIds.every((id: string) => current.document.elements.some((element: any) => element.id === id && element.isDeleted !== true));
+  }).toBe(true);
+
   const editedElementId = created.result.nodes.spec;
-  const afterCreate = await currentBridgeDocument(page);
+  const longText = "A considerably longer label that should wrap inside the node";
   const updateResponse = await page.request.post(commandApi, { data: {
     operation: "update_elements",
-    input: { updates: [{ id: editedElementId, patch: { text: "Requirements", x: 96, y: 132 } }] },
+    input: { updates: [{ id: editedElementId, patch: { text: longText, x: 96, y: 132 } }] },
   } });
-  expect(updateResponse.ok(), `${await updateResponse.text()} map=${editedElementId} ids=${afterCreate.document.elements.map((element: any) => element.id).join(",")}`).toBeTruthy();
+  expect(updateResponse.ok(), await updateResponse.text()).toBeTruthy();
   const document = await currentBridgeDocument(page);
   expect(document.document.canvas.background.preset).toBe("white");
-  expect(document.document.elements.some((element: any) => element.text === "Requirements")).toBeTruthy();
-  expect((await readLocalDocument(page)).document.elements.some((element: any) => element.text === "Requirements")).toBeTruthy();
+  const wrappedLabel = document.document.elements.find((element: any) => element.id === created.result.nodeLabels.spec);
+  const wrappedContainer = document.document.elements.find((element: any) => element.id === editedElementId);
+  expect(wrappedLabel.originalText).toBe(longText);
+  expect(wrappedLabel.text).toContain("\n");
+  expect(wrappedLabel.text.split("\n").join(" ")).toBe(longText);
+  expect(wrappedContainer.height).toBeGreaterThanOrEqual(wrappedLabel.height + 20);
+  expect((await readLocalDocument(page)).document.elements.some((element: any) => element.originalText === longText && element.text.includes("\n"))).toBeTruthy();
 
   const drawDownloadWait = page.waitForEvent("download");
   await page.getByRole("button", { name: /Save \.draw/ }).click();
@@ -69,7 +116,7 @@ test("MCP create and update stay editable through save, reload, open, and image 
   const drawBuffer = await readFile(await drawDownload.path());
   const savedFile = JSON.parse(drawBuffer.toString("utf8"));
   expect(savedFile.format).toBe("draw");
-  expect(savedFile.document.elements.some((element: any) => element.text === "Requirements")).toBeTruthy();
+  expect(savedFile.document.elements.some((element: any) => element.originalText === longText)).toBeTruthy();
 
   const pngWait = page.waitForEvent("download");
   await page.locator("button.export-main").click();
@@ -84,7 +131,7 @@ test("MCP create and update stay editable through save, reload, open, and image 
   await page.reload();
   await page.locator(".excalidraw canvas").first().waitFor();
   await expect(page.locator(".canvas-label")).toContainText("White");
-  expect((await readLocalDocument(page)).document.elements.some((element: any) => element.text === "Requirements")).toBeTruthy();
+  expect((await readLocalDocument(page)).document.elements.some((element: any) => element.originalText === longText)).toBeTruthy();
 
   page.once("dialog", (dialog) => dialog.accept());
   await page.locator('input[type="file"]').setInputFiles({
@@ -94,7 +141,7 @@ test("MCP create and update stay editable through save, reload, open, and image 
   });
   await expect.poll(async () => {
     const reopened = await currentBridgeDocument(page);
-    return reopened.document.elements.some((element: any) => element.text === "Requirements");
+    return reopened.document.elements.some((element: any) => element.originalText === longText);
   }).toBe(true);
 });
 
@@ -124,7 +171,7 @@ test("a second tab is read-only while the first tab owns local autosave", async 
   await secondTab.goto("/");
   await secondTab.locator(".excalidraw canvas").first().waitFor();
 
-  await expect(secondTab.getByText(/already open in another tab/i)).toBeVisible();
+  await expect(secondTab.getByText(/reload this tab to edit/i)).toBeVisible();
   await expect(secondTab.getByLabel("Drawing title")).toBeDisabled();
   await expect(secondTab.getByRole("button", { name: "White" })).toBeDisabled();
 });
@@ -136,4 +183,84 @@ test("title edits flush to IndexedDB on pagehide and survive reload", async ({ p
   await page.reload();
   await page.locator(".topbar").waitFor();
   await expect(page.getByLabel("Drawing title")).toHaveValue("Pagehide preserved");
+});
+
+test("coalesces a pointer drag to a bounded number of whole-document bridge writes", async ({ page }) => {
+  const documentPuts: string[] = [];
+  const clientPuts: string[] = [];
+  page.on("request", (request) => {
+    if (request.method() !== "PUT") return;
+    if (request.url().endsWith(documentApi)) documentPuts.push(request.postData() ?? "");
+    if (request.url().endsWith("/__draw/api/client")) clientPuts.push(request.postData() ?? "");
+  });
+
+  await page.keyboard.press("r");
+  const canvas = page.locator(".excalidraw canvas").last();
+  const bounds = await canvas.boundingBox();
+  if (!bounds) throw new Error("Could not locate the drawing canvas.");
+  const start = { x: bounds.x + bounds.width / 2 - 70, y: bounds.y + bounds.height / 2 - 30 };
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  for (let step = 1; step <= 40; step += 1) {
+    await page.mouse.move(start.x + step * 2, start.y + step);
+  }
+  await page.mouse.up();
+  await page.waitForTimeout(600);
+
+  expect(documentPuts.length).toBeLessThanOrEqual(2);
+  expect(clientPuts).toHaveLength(0);
+});
+
+test("loads fonts and exports the hand-drawn scene without network access", async ({ page }) => {
+  const externalRequests: string[] = [];
+  const localFontRequests: string[] = [];
+  page.on("request", (request) => {
+    const url = request.url();
+    if (url.includes("/fonts/Excalifont/")) localFontRequests.push(url);
+    if (url.startsWith("http") && !url.startsWith("http://127.0.0.1:5181")) externalRequests.push(url);
+  });
+  await page.route("**/*", (route) => {
+    if (route.request().url().startsWith("http://127.0.0.1:5181")) return route.continue();
+    return route.abort();
+  });
+  await waitForBridge(page);
+  await expect(page.getByRole("button", { name: "Blackboard" })).toBeEnabled();
+  const response = await page.request.post(commandApi, { data: {
+    operation: "create_diagram",
+    input: { nodes: [{ id: "offline", label: "Offline hand-drawn text", x: 100, y: 100 }], edges: [] },
+  } });
+  expect(response.ok()).toBeTruthy();
+  await expect.poll(() => localFontRequests.length).toBeGreaterThan(0);
+  await expect.poll(async () => (await currentBridgeDocument(page)).document.elements.length).toBeGreaterThan(0);
+
+  const downloadWait = page.waitForEvent("download");
+  await page.locator("button.export-main").click();
+  const exported = await downloadWait;
+  const image = await readFile(await exported.path());
+  expect(image.subarray(0, 8).toString("hex")).toBe("89504e470d0a1a0a");
+  expect(image.byteLength).toBeGreaterThan(5_000);
+  expect(await countWarmImagePixels(page, image)).toBeGreaterThan(40);
+  expect(externalRequests).toEqual([]);
+  expect(localFontRequests.every((url) => url.startsWith("http://127.0.0.1:5181/fonts/"))).toBe(true);
+});
+
+test("background changes adapt Draw defaults while preserving chosen colors", async ({ page }) => {
+  await page.getByRole("button", { name: "Blackboard" }).click();
+  const response = await page.request.post(commandApi, { data: {
+    operation: "create_diagram",
+    input: {
+      title: "Preset test",
+      nodes: [{ id: "custom", label: "Custom color", x: 100, y: 100, color: "#ff00cc" }],
+      edges: [],
+    },
+  } });
+  expect(response.ok()).toBeTruthy();
+  const created = await response.json();
+  await page.getByRole("button", { name: "White" }).click();
+  await expect.poll(async () => {
+    const current = await currentBridgeDocument(page);
+    const title = current.document.elements.find((element: any) => element.id === created.result.titleElementId);
+    const node = current.document.elements.find((element: any) => element.id === created.result.nodes.custom);
+    return title?.strokeColor === "#1e1e1e" && node?.strokeColor === "#ff00cc" && node?.backgroundColor === "#ffffff";
+  }).toBe(true);
 });

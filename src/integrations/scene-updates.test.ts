@@ -35,11 +35,18 @@ describe("MCP scene updates", () => {
       { id: "box", type: "rectangle", x: 0, y: 0, width: 120, height: 64, boundElements: [{ id: "label", type: "text" }] },
       { id: "label", type: "text", x: 20, y: 17, width: 80, height: 30, fontSize: 20, fontFamily: 1, text: "A", originalText: "A", containerId: "box", textAlign: "center", verticalAlign: "middle", lineHeight: 1.25 },
     ];
-    const result = applyElementUpdates(scene, [{ id: "box", patch: { text: "A much longer label that needs several lines" } }]);
+    const originalText = "A much longer label that needs several lines";
+    const measure = (text: string) => {
+      const lines = text.split("\n");
+      return { width: Math.max(...lines.map((line) => line.length * 10), 1), height: lines.length * 24 };
+    };
+    const result = applyElementUpdates(scene, [{ id: "box", patch: { text: originalText } }], measure);
     const label = result.elements.find((element) => element.id === "label");
     const box = result.elements.find((element) => element.id === "box");
-    expect(label?.text).toBe("A much longer label that needs several lines");
-    expect(label?.originalText).toBe(label?.text);
+    expect(label?.text).toContain("\n");
+    expect(label?.text?.split("\n").join(" ")).toBe(originalText);
+    expect(label?.originalText).toBe(originalText);
+    expect(Math.max(...(label?.text?.split("\n").map((line) => line.length * 10) ?? []))).toBeLessThanOrEqual(100);
     expect(label?.height).toBeGreaterThan(30);
     expect(box?.height).toBeGreaterThan(64);
     expect((label?.x ?? 0) + (label?.width ?? 0)).toBeLessThanOrEqual((box?.x ?? 0) + (box?.width ?? 0));

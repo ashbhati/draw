@@ -18,7 +18,11 @@ Open <http://127.0.0.1:5173>. The current canvas autosaves in this browser on th
 ```sh
 npm test
 npm run build
+npx playwright install chromium
+npm run test:e2e
 ```
+
+The e2e suite runs the app locally in Chromium. Playwright downloads its browser separately; on managed systems where its default browser cache is unavailable, set `PLAYWRIGHT_BROWSERS_PATH` to a writable directory when installing and running the suite.
 
 ## Connect an MCP client
 
@@ -38,9 +42,11 @@ The local MCP server communicates with the active development canvas. Start the 
 
 Available tools:
 
-- `get_current_canvas`: read the active document summary and element IDs.
+- `get_current_canvas`: read the active document summary and element IDs. Optional `offset` (default `0`) and `limit` (default `250`, maximum `250`) paginate the active elements; use the returned `nextOffset` when `hasMore` is true.
 - `create_diagram`: add editable labeled nodes and arrows to the open canvas.
 - `update_elements`: move, resize, recolor, or change text on existing elements.
+
+`create_diagram` returns `nodes`, mapping each caller-provided node ID to its Draw element ID; `nodeLabels` maps those node IDs to their bound text IDs. `edges` contains each created arrow's `elementId`, optional `labelElementId`, and input index. The result also includes `addedElementIds` and, when supplied, `titleElementId`. Use these returned IDs with `update_elements`.
 
 The MCP bridge is provided by the Vite development server, bound to loopback only. Keep the Draw tab open while using its MCP tools. The MCP tools are intentionally unavailable in a production build in this first version.
 
