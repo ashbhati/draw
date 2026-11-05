@@ -89,7 +89,7 @@ describe("Draw document contract", () => {
   it("round-trips an Excalidraw scene through the document adapters without losing engine fields", () => {
     const scene = {
       elements: [exampleElement],
-      appState: { viewBackgroundColor: "#18191a", scrollX: 12, scrollY: -7, zoom: { value: 2 } },
+      appState: { viewBackgroundColor: "transparent", scrollX: 12, scrollY: -7, zoom: { value: 2 } },
       files: {
         "image-1": {
           id: "image-1",

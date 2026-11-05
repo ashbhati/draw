@@ -257,6 +257,7 @@ export default function App() {
     const current = docRef.current;
     if (!current) return;
     const color = DEFAULT_COLOR[preset];
+    const viewBackgroundColor = preset === "blackboard" ? "transparent" : color;
     const elements = recolorDefaultElements(
       current.document.elements,
       current.document.canvas.background.preset,
@@ -268,13 +269,13 @@ export default function App() {
         ...current.document,
         elements,
         canvas: { ...current.document.canvas, background: { preset, styleVersion: 1, color, ...(preset === "blackboard" ? { texture: "chalk-smudge-v1" } : {}) } },
-        appState: { ...current.document.appState, viewBackgroundColor: color, currentItemStrokeColor: preset === "blackboard" ? "#f6f2e9" : "#1e1e1e" },
+        appState: { ...current.document.appState, viewBackgroundColor, currentItemStrokeColor: preset === "blackboard" ? "#f6f2e9" : "#1e1e1e" },
       },
     };
     setDocument(next);
     apiRef.current?.updateScene({
       elements: elements as any,
-      appState: { viewBackgroundColor: color, currentItemStrokeColor: preset === "blackboard" ? "#f6f2e9" : "#1e1e1e" },
+      appState: { viewBackgroundColor, currentItemStrokeColor: preset === "blackboard" ? "#f6f2e9" : "#1e1e1e" },
       captureUpdate: CaptureUpdateAction.IMMEDIATELY,
     });
     if (autosaveBlocked) {

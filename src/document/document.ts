@@ -110,8 +110,9 @@ const copyJsonValue = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
 const defaultAppState = (background: DrawBackground, viewport: DrawViewport) => ({
   viewBackgroundColor:
-    background.color ??
-    (background.preset === "white" ? DEFAULT_WHITE_COLOR : DEFAULT_BLACKBOARD_COLOR),
+    background.preset === "blackboard"
+      ? "transparent"
+      : background.color ?? DEFAULT_WHITE_COLOR,
   scrollX: viewport.x,
   scrollY: viewport.y,
   zoom: { value: viewport.zoom },
@@ -329,7 +330,7 @@ export function toExcalidrawScene(doc: DrawDocument): {
     (doc.document.canvas.background.preset === "white" ? DEFAULT_WHITE_COLOR : DEFAULT_BLACKBOARD_COLOR);
   const appState = {
     ...copyJsonValue(doc.document.appState),
-    viewBackgroundColor: backgroundColor,
+    viewBackgroundColor: doc.document.canvas.background.preset === "blackboard" ? "transparent" : backgroundColor,
     scrollX: doc.document.canvas.viewport.x,
     scrollY: doc.document.canvas.viewport.y,
     zoom: { value: doc.document.canvas.viewport.zoom },

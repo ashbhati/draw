@@ -8,7 +8,7 @@ export function buildDiagramSkeletons(
   createId: () => string,
 ) {
   const onBlackboard = background === "blackboard";
-  const defaultStroke = onBlackboard ? "#f2d27a" : "#546271";
+  const defaultStroke = onBlackboard ? "#f6f2e9" : "#546271";
   const nodeElementIds: Record<string, string> = {};
   const edgeElementIds: string[] = [];
   const skeletons: Record<string, unknown>[] = [];

@@ -61,8 +61,6 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("MCP create and update stay editable through save, reload, open, and image export", async ({ page }) => {
-  await page.getByRole("button", { name: "White" }).click();
-  await expect(page.locator(".canvas-label")).toContainText("White");
   const createdResponse = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
     input: {
@@ -87,6 +85,9 @@ test("MCP create and update stay editable through save, reload, open, and image 
     const current = await currentBridgeDocument(page);
     return created.result.addedElementIds.every((id: string) => !current.document.elements.some((element: any) => element.id === id && element.isDeleted !== true));
   }).toBe(true);
+
+  await page.getByRole("button", { name: "White" }).click();
+  await expect(page.locator(".canvas-label")).toContainText("White");
   await page.getByRole("button", { name: "Redo" }).click();
   await expect.poll(async () => {
     const current = await currentBridgeDocument(page);
@@ -227,7 +228,7 @@ test("loads fonts and exports the hand-drawn scene without network access", asyn
   await expect(page.getByRole("button", { name: "Blackboard" })).toBeEnabled();
   const response = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
-    input: { nodes: [{ id: "offline", label: "Offline hand-drawn text", x: 100, y: 100 }], edges: [] },
+    input: { nodes: [{ id: "offline", label: "Offline hand-drawn text", x: 100, y: 100, color: "#f2d27a" }], edges: [] },
   } });
   expect(response.ok()).toBeTruthy();
   await expect.poll(() => localFontRequests.length).toBeGreaterThan(0);
@@ -262,5 +263,48 @@ test("background changes adapt Draw defaults while preserving chosen colors", as
     const title = current.document.elements.find((element: any) => element.id === created.result.titleElementId);
     const node = current.document.elements.find((element: any) => element.id === created.result.nodes.custom);
     return title?.strokeColor === "#1e1e1e" && node?.strokeColor === "#ff00cc" && node?.backgroundColor === "#ffffff";
+  }).toBe(true);
+});
+
+test("embedded image assets survive autosave and editable Draw save/reopen", async ({ page }) => {
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jJ5sAAAAASUVORK5CYII=", "base64");
+  await page.locator(".excalidraw").evaluate((editor, bytes) => {
+    const bounds = editor.getBoundingClientRect();
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([new Uint8Array(bytes)], "embedded.png", { type: "image/png" }));
+    const coordinates = { clientX: bounds.left + bounds.width / 2, clientY: bounds.top + bounds.height / 2, bubbles: true, cancelable: true, dataTransfer: transfer };
+    editor.dispatchEvent(new DragEvent("dragenter", coordinates));
+    editor.dispatchEvent(new DragEvent("dragover", coordinates));
+    editor.dispatchEvent(new DragEvent("drop", coordinates));
+  }, Array.from(png));
+
+  await expect.poll(async () => {
+    const current = await currentBridgeDocument(page);
+    return current.document.elements.some((element: any) => element.type === "image") && Object.keys(current.document.assets).length > 0;
+  }).toBe(true);
+  const autosaved = await readLocalDocument(page);
+  expect(Object.values(autosaved.document.assets).some((asset: any) => asset.dataURL?.startsWith("data:image/png;base64,"))).toBe(true);
+
+  const downloadWait = page.waitForEvent("download");
+  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  const drawDownload = await downloadWait;
+  const saved = JSON.parse((await readFile(await drawDownload.path())).toString("utf8"));
+  expect(saved.document.elements.some((element: any) => element.type === "image")).toBe(true);
+  expect(Object.keys(saved.document.assets)).not.toHaveLength(0);
+
+  await page.reload();
+  await page.locator(".excalidraw canvas").first().waitFor();
+  expect((await readLocalDocument(page)).document.elements.some((element: any) => element.type === "image")).toBe(true);
+  expect(Object.keys((await readLocalDocument(page)).document.assets)).not.toHaveLength(0);
+
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "image-roundtrip.draw",
+    mimeType: "application/vnd.draw+json",
+    buffer: Buffer.from(JSON.stringify(saved)),
+  });
+  await expect.poll(async () => {
+    const reopened = await currentBridgeDocument(page);
+    return reopened.document.elements.some((element: any) => element.type === "image") && Object.keys(reopened.document.assets).length > 0;
   }).toBe(true);
 });

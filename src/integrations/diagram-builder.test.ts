@@ -17,12 +17,12 @@ describe("MCP diagram construction", () => {
     expect(result.edgeElementIds).toEqual(["id-4"]);
     expect(result.skeletons).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: "id-1", type: "text", text: "Release flow" }),
-      expect.objectContaining({ id: "id-2", type: "rectangle", label: { text: "Specification", fontSize: 20, strokeColor: "#f2d27a" } }),
-      expect.objectContaining({ id: "id-3", type: "ellipse", label: { text: "Implementation", fontSize: 20, strokeColor: "#f2d27a" } }),
+      expect.objectContaining({ id: "id-2", type: "rectangle", label: { text: "Specification", fontSize: 20, strokeColor: "#f6f2e9" } }),
+      expect.objectContaining({ id: "id-3", type: "ellipse", label: { text: "Implementation", fontSize: 20, strokeColor: "#f6f2e9" } }),
       expect.objectContaining({
         id: "id-4", type: "arrow", endArrowhead: "arrow",
         start: { id: "id-2" }, end: { id: "id-3" },
-        label: { text: "Builds", fontSize: 16, strokeColor: "#f2d27a" },
+        label: { text: "Builds", fontSize: 16, strokeColor: "#f6f2e9" },
       }),
     ]));
   });
