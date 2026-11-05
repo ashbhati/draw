@@ -95,10 +95,10 @@ function createServer() {
   server.registerTool(
     "get_current_canvas",
     {
-      description: "Read a paginated summary of the open Draw document, including stable element IDs, container relationships, and colors for targeted edits. Use nextOffset to request more elements.",
+      description: "Flush and read the latest active Draw document, then return a paginated summary including stable element IDs, container relationships, and colors for targeted edits. Use nextOffset to request more elements.",
       inputSchema: z.object({ offset: z.number().int().min(0).max(1_000_000).optional(), limit: z.number().int().min(1).max(250).optional() }),
     },
-    async (input) => textResult(summarizeCurrentCanvas(await bridgeRequest("/__draw/api/document"), input)),
+    async (input) => textResult(summarizeCurrentCanvas(await bridgeRequest("/__draw/api/document?flush=1"), input)),
   );
 
   server.registerTool(

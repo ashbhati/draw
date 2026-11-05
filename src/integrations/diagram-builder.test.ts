@@ -27,13 +27,19 @@ describe("MCP diagram construction", () => {
     ]));
   });
 
-  it("uses contrasting defaults for a white canvas while respecting explicit colors", () => {
+  it("uses Draw's recolorable default for a white canvas while respecting explicit colors", () => {
     const result = buildDiagramSkeletons({
-      nodes: [{ id: "n", label: "Custom", x: 0, y: 0, color: "#147a55" }],
+      nodes: [
+        { id: "default", label: "Default", x: 0, y: 0 },
+        { id: "custom", label: "Custom", x: 220, y: 0, color: "#147a55" },
+      ],
       edges: [],
     }, "white", () => "node-id");
 
     expect(result.skeletons[0]).toMatchObject({
+      id: "node-id", type: "rectangle", strokeColor: "#1e1e1e", backgroundColor: "#ffffff",
+    });
+    expect(result.skeletons[1]).toMatchObject({
       id: "node-id", type: "rectangle", strokeColor: "#147a55", backgroundColor: "#ffffff",
       label: { text: "Custom", strokeColor: "#147a55" },
     });

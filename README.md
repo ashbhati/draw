@@ -42,7 +42,7 @@ The local MCP server communicates with the active development canvas. Start the 
 
 Available tools:
 
-- `get_current_canvas`: read the active document summary and element IDs. Optional `offset` (default `0`) and `limit` (default `250`, maximum `250`) paginate the active elements; use the returned `nextOffset` when `hasMore` is true.
+- `get_current_canvas`: flush and read the active document before returning its summary and element IDs. Optional `offset` (default `0`) and `limit` (default `250`, maximum `250`) paginate the active elements; use the returned `nextOffset` when `hasMore` is true.
 - `create_diagram`: add editable labeled nodes and arrows to the open canvas.
 - `update_elements`: move, resize, recolor, or change text on existing elements.
 
@@ -55,5 +55,7 @@ The MCP bridge is provided by the Vite development server, bound to loopback onl
 `.draw` is a versioned JSON document containing editable scene elements, view state, background metadata, and embedded assets. `plan.draw` is the initial planning canvas and remains available to open in Draw.
 
 The drawing engine is the `@excalidraw/excalidraw` package. Draw uses its editor API and maintains its own `.draw` document format; it does not promise Excalidraw file import/export compatibility.
+
+The editor's bundled font files are served locally so diagrams render offline, including CJK glyphs. Their family-specific attributions and license texts are in [public/fonts/LICENSES.md](./public/fonts/LICENSES.md). The CJK font subsets are retained for multilingual documents and account for most of the font bundle's size.
 
 See [PLAN.md](./PLAN.md) for the V1 scope, acceptance checks, and deferred capabilities.

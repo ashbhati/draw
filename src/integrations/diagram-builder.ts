@@ -8,7 +8,7 @@ export function buildDiagramSkeletons(
   createId: () => string,
 ) {
   const onBlackboard = background === "blackboard";
-  const defaultStroke = onBlackboard ? "#f6f2e9" : "#546271";
+  const defaultStroke = onBlackboard ? "#f6f2e9" : "#1e1e1e";
   const nodeElementIds: Record<string, string> = {};
   const edgeElementIds: string[] = [];
   const skeletons: Record<string, unknown>[] = [];
@@ -17,8 +17,8 @@ export function buildDiagramSkeletons(
     skeletons.push({
       id: createId(), type: "text",
       x: Math.min(...input.nodes.map((node) => node.x)),
-      y: Math.min(...input.nodes.map((node) => node.y)) - 56,
-      text: input.title, fontSize: 28,
+      y: Math.max(Math.min(...input.nodes.map((node) => node.y)) - 56, 72),
+      text: input.title, fontSize: 20,
       strokeColor: onBlackboard ? "#f6f2e9" : "#1e1e1e", roughness: 1,
     });
   }

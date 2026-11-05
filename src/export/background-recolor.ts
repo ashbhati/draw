@@ -16,9 +16,18 @@ export function recolorDefaultElements<T extends Record<string, unknown>>(
   to: DrawBackgroundPreset,
 ): T[] {
   if (from === to) return elements.map((element) => ({ ...element }));
-  return elements.map((element) => ({
-    ...element,
-    ...(element.strokeColor === FOREGROUND[from] ? { strokeColor: FOREGROUND[to] } : {}),
-    ...(element.backgroundColor === BACKGROUND[from] ? { backgroundColor: BACKGROUND[to] } : {}),
-  }));
+  return elements.map((element) => {
+    const next = {
+      ...element,
+      ...(element.strokeColor === FOREGROUND[from] ? { strokeColor: FOREGROUND[to] } : {}),
+      ...(element.backgroundColor === BACKGROUND[from] ? { backgroundColor: BACKGROUND[to] } : {}),
+    };
+    if (next.strokeColor === element.strokeColor && next.backgroundColor === element.backgroundColor) return next;
+    return {
+      ...next,
+      version: (typeof element.version === "number" ? element.version : 0) + 1,
+      versionNonce: (typeof element.versionNonce === "number" ? element.versionNonce : 0) + 1,
+      updated: Date.now(),
+    };
+  });
 }

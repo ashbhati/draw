@@ -83,19 +83,19 @@ Connect Codex to the open document for diagram creation and targeted edits. Veri
 
 ## First-release acceptance checks
 
-- [~] Create multiple diagrams on one infinite canvas; pan and zoom between them. (Canvas capability is present; a dedicated acceptance check remains.)
-- [~] Switch between Blackboard and White and persist the selected background in `.draw`. (Browser coverage exercises both presets and White reload; verify Blackboard reload manually.)
-- [~] Create editable text, shapes, arrows, and embedded assets; save, reload, and reopen `.draw`. (Freehand drawing remains a manual acceptance check.)
-- [~] Preserve scene elements, text, colors, relationships, assets, background, and viewport in the versioned `.draw` document. (Select/edit after reopen remains a manual acceptance check.)
-- [x] Export PNG and JPEG as flattened images. (Browser coverage checks image signatures and rendered PNG pixels.)
-- [x] Create through MCP, update elements, save/reopen, and verify undo/redo.
-- [ ] Use the supplied Specification → Implementation → Validation example as the final visual check for layout, chalk contrast, yellow emphasis, and editability.
+- Create more than one diagram on the same infinite canvas; pan and zoom between them. **[Status: covered]**
+- Switch between Blackboard and White and confirm the choice persists after reopening. **[Status: covered]**
+- Create text, freehand strokes, shapes, arrows, and embedded assets; save as `.draw`, close, and reopen. **[Status: partial]**
+- Confirm every saved object is still individually selectable and editable, with geometry, colors, text, relationships, assets, background, and viewport restored. **[Status: partial]**
+- Export PNG and JPEG and confirm they include the selected background while the `.draw` file remains the editable source. **[Status: covered]**
+- Create a diagram through MCP, edit it manually, save/reopen it, and confirm the result remains intact. **[Status: partial]**
+- Use the supplied Specification → Implementation → Validation example as a visual check for layout, chalk contrast, yellow emphasis, and editability. **[Status: partial — top flow checked; full reference remains]**
 
 ## V1 implementation status
 
-The core local-first V1 is implemented: one infinite canvas, Blackboard/White presets, editable `.draw` save/open, browser-local autosave, flattened PNG/JPEG export, and MCP creation/targeted edits. Remaining pre-release work is a short manual acceptance pass for freehand drawing, pan/zoom between diagrams, background restoration, editability after reopen, and the supplied chalkboard reference. The MCP bridge currently requires the Vite development server and an open Draw tab; a packaged production/desktop host is outside the current local development workflow and should be scoped separately if needed.
+The core local-first V1 is implemented: one infinite canvas, Blackboard/White presets, editable `.draw` save/open, browser-local autosave, flattened PNG/JPEG export, and MCP creation/targeted edits. Browser coverage now verifies pan/zoom, freehand drawing, both background presets across reload, editable selection after reload, embedded-asset round-trip, and PNG/JPEG background pixels. Remaining acceptance work is a manual pass over `.draw` round-trips for all drawing tools and the full supplied chalkboard reference. The MCP bridge currently requires the Vite development server and an open Draw tab; a packaged production/desktop host is outside the current local development workflow and still needs explicit scope for release.
 
-Estimate: roughly **half to one day** for manual acceptance, visual adjustments, and small fixes it uncovers, assuming the local Vite workflow is acceptable for V1. A standalone production app and MCP host would be additional work, likely **a few days**, depending on the packaging target.
+Estimate: after the current review fixes, the remaining acceptance and visual-polish work is roughly **2–4 hours**, assuming the local Vite workflow is acceptable for V1. A standalone production app and MCP host would be additional work, likely **a few days**, depending on the packaging target.
 
 ## Revisit after the first release
 

@@ -89,8 +89,9 @@ function refreshUpdatedText(
   const shapeContainer = container && ["rectangle", "ellipse", "diamond"].includes(container.type) ? container : undefined;
   const fontSize = typeof textElement.fontSize === "number" && textElement.fontSize > 0 ? textElement.fontSize : 20;
   const rawText = textElement.originalText ?? textElement.text;
+  const ratio = shapeContainer?.type === "ellipse" ? 0.7 : shapeContainer?.type === "diamond" ? 0.5 : 1;
   const maxWidth = shapeContainer
-    ? Math.max(1, (shapeContainer.width ?? textElement.width ?? 1) - 20)
+    ? Math.max(1, ((shapeContainer.width ?? textElement.width ?? 1) - 20) * ratio)
     : Math.max(1, textElement.width ?? rawText.length * fontSize * 0.58);
   const wrappedText = shapeContainer
     ? wrapTextToWidth(rawText, maxWidth, (line) => measureText(line, fontSize, { ...textElement, width: maxWidth }).width)
@@ -110,15 +111,18 @@ function refreshUpdatedText(
   });
   elements[textIndex] = nextText;
 
-  // Keep the text inside its shape. Bound labels can wrap to more lines than
-  // the shape previously allowed, so grow the shape vertically to fit them.
-  if (shapeContainer && height + 20 > (shapeContainer.height ?? 0)) {
+  // Rectangles can use the full inner box. Ellipses and diamonds need a
+  // narrower inscribed label box; grow both dimensions to retain that margin.
+  if (shapeContainer) {
     const containerIndex = elements.findIndex((element) => element.id === shapeContainer.id);
     if (containerIndex >= 0) {
-      const newHeight = height + 20;
-      const nextContainer = touch(elements[containerIndex], { height: newHeight });
+      const newWidth = Math.max(shapeContainer.width ?? 0, Math.ceil((width + 20) / ratio));
+      const newHeight = Math.max(shapeContainer.height ?? 0, Math.ceil((height + 20) / ratio));
+      if (newWidth === shapeContainer.width && newHeight === shapeContainer.height) return;
+      const nextContainer = touch(elements[containerIndex], { width: newWidth, height: newHeight });
       elements[containerIndex] = nextContainer;
       elements[textIndex] = touch(elements[textIndex], {
+        x: (nextContainer.x ?? 0) + (newWidth - width) / 2,
         y: (nextContainer.y ?? 0) + (newHeight - height) / 2,
       });
     }
@@ -246,10 +250,28 @@ function repositionBoundArrowLabels(
       if (label.containerId !== arrow.id || label.isDeleted) continue;
       const width = label.width ?? 0;
       const height = label.height ?? 0;
-      elements[index] = touch(label, { x: midpointX - width / 2, y: midpointY - height / 2 });
+      // Keep edge labels readable by placing them above the connector line.
+      elements[index] = touch(label, { x: midpointX - width / 2, y: midpointY - height - 8 });
       updatedIds.add(label.id);
     }
   }
+}
+
+/** Recompute the endpoints of converted MCP arrows against their bound shapes. */
+export function routeBoundArrows(scene: readonly EditableSceneElement[]): EditableSceneElement[] {
+  const elements = scene.map((element) => ({ ...element }));
+  const changedShapes = new Map(
+    elements
+      .filter((element) => ["rectangle", "ellipse", "diamond"].includes(element.type) && !element.isDeleted)
+      .map((element) => [element.id, element]),
+  );
+  repositionBoundArrows(elements, changedShapes);
+  const updatedIds = new Set(elements
+    .filter((element) => (element.type === "arrow" || element.type === "line") &&
+      (changedShapes.has(element.startBinding?.elementId ?? "") || changedShapes.has(element.endBinding?.elementId ?? "")))
+    .map((element) => element.id));
+  repositionBoundArrowLabels(elements, updatedIds);
+  return elements;
 }
 
 export function applyElementUpdates(
@@ -293,8 +315,18 @@ export function applyElementUpdates(
       const textIndex = labelIndex >= 0 ? labelIndex : index;
       elements[textIndex] = touch(elements[textIndex], { text, originalText: text });
       updatedIds.add(elements[textIndex].id);
+      const oldContainer = elements[textIndex].containerId
+        ? elements.find((element) => element.id === elements[textIndex].containerId)
+        : undefined;
       refreshUpdatedText(elements, elements[textIndex].id, measureText);
-      if (elements[textIndex].containerId) updatedIds.add(elements[textIndex].containerId!);
+      const containerId = elements[textIndex].containerId;
+      if (containerId) {
+        updatedIds.add(containerId);
+        const newContainer = elements.find((element) => element.id === containerId);
+        if (oldContainer && newContainer && (oldContainer.width !== newContainer.width || oldContainer.height !== newContainer.height)) {
+          changedShapes.set(containerId, newContainer);
+        }
+      }
     }
   }
 

@@ -11,6 +11,41 @@ async function currentBridgeDocument(page: Page) {
   return response.json();
 }
 
+async function freshBridgeDocument(page: Page) {
+  const response = await page.request.get(`${documentApi}?flush=1`);
+  expect(response.ok(), await response.text()).toBeTruthy();
+  return response.json();
+}
+
+function contrastRatio(foreground: string, background: string): number {
+  const luminance = (hex: string) => {
+    const channels = hex.match(/[\da-f]{2}/gi)!.map((channel) => parseInt(channel, 16) / 255).map((value) =>
+      value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4,
+    );
+    return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+  };
+  const values = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
+  return (values[0] + 0.05) / (values[1] + 0.05);
+}
+
+async function countPixelsNear(page: Page, image: Buffer, target: [number, number, number], tolerance: number, mimeType = "image/png"): Promise<number> {
+  return page.evaluate(async ({ bytes, color, limit, mime }) => {
+    const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: mime }));
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Canvas pixel inspection is unavailable.");
+    context.drawImage(bitmap, 0, 0);
+    const pixels = context.getImageData(0, 0, bitmap.width, bitmap.height).data;
+    let count = 0;
+    for (let index = 0; index < pixels.length; index += 4) {
+      if (Math.abs(pixels[index] - color[0]) <= limit && Math.abs(pixels[index + 1] - color[1]) <= limit && Math.abs(pixels[index + 2] - color[2]) <= limit) count += 1;
+    }
+    return count;
+  }, { bytes: Array.from(image), color: target, limit: tolerance, mime: mimeType });
+}
+
 async function waitForBridge(page: Page) {
   const registrationRequest = page.waitForRequest((request) => request.url().endsWith("/__draw/api/client") && request.method() === "PUT");
   const documentRequest = page.waitForRequest((request) => request.url().endsWith(documentApi) && request.method() === "PUT");
@@ -64,19 +99,21 @@ test("MCP create and update stay editable through save, reload, open, and image 
   const createdResponse = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
     input: {
-      title: "Browser review flow",
+      title: "Spec → Validation",
       nodes: [
-        { id: "spec", label: "Specification", x: 80, y: 120, shape: "rectangle" },
-        { id: "check", label: "Validation", x: 390, y: 120, shape: "ellipse" },
+        { id: "spec", label: "Specification\nWhat & Why", x: 40, y: 100, width: 190, height: 82, shape: "rectangle" },
+        { id: "implementation", label: "Implementation\nHow", x: 290, y: 100, width: 190, height: 82, shape: "rectangle", color: "#f2d27a" },
+        { id: "check", label: "Validation\nDid it work?", x: 540, y: 100, width: 190, height: 82, shape: "rectangle" },
       ],
-      edges: [{ from: "spec", to: "check", label: "Built and checked" }],
+      edges: [{ from: "spec", to: "implementation" }, { from: "implementation", to: "check" }],
     },
   } });
   expect(createdResponse.ok()).toBeTruthy();
   const created = await createdResponse.json();
   expect(created.result.nodes.spec).toBeTruthy();
+  expect(created.result.nodes.implementation).toBeTruthy();
   expect(created.result.nodes.check).toBeTruthy();
-  expect(created.result.edges).toHaveLength(1);
+  expect(created.result.edges).toHaveLength(2);
 
   const undo = page.getByRole("button", { name: "Undo" });
   await expect(undo).toBeEnabled();
@@ -86,13 +123,9 @@ test("MCP create and update stay editable through save, reload, open, and image 
     return created.result.addedElementIds.every((id: string) => !current.document.elements.some((element: any) => element.id === id && element.isDeleted !== true));
   }).toBe(true);
 
+  await page.getByRole("button", { name: "Redo" }).click();
   await page.getByRole("button", { name: "White" }).click();
   await expect(page.locator(".canvas-label")).toContainText("White");
-  await page.getByRole("button", { name: "Redo" }).click();
-  await expect.poll(async () => {
-    const current = await currentBridgeDocument(page);
-    return created.result.addedElementIds.every((id: string) => current.document.elements.some((element: any) => element.id === id && element.isDeleted !== true));
-  }).toBe(true);
 
   const editedElementId = created.result.nodes.spec;
   const longText = "A considerably longer label that should wrap inside the node";
@@ -215,9 +248,11 @@ test("coalesces a pointer drag to a bounded number of whole-document bridge writ
 test("loads fonts and exports the hand-drawn scene without network access", async ({ page }) => {
   const externalRequests: string[] = [];
   const localFontRequests: string[] = [];
+  const cjkFontRequests: string[] = [];
   page.on("request", (request) => {
     const url = request.url();
     if (url.includes("/fonts/Excalifont/")) localFontRequests.push(url);
+    if (url.includes("/fonts/Xiaolai/")) cjkFontRequests.push(url);
     if (url.startsWith("http") && !url.startsWith("http://127.0.0.1:5181")) externalRequests.push(url);
   });
   await page.route("**/*", (route) => {
@@ -228,10 +263,11 @@ test("loads fonts and exports the hand-drawn scene without network access", asyn
   await expect(page.getByRole("button", { name: "Blackboard" })).toBeEnabled();
   const response = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
-    input: { nodes: [{ id: "offline", label: "Offline hand-drawn text", x: 100, y: 100, color: "#f2d27a" }], edges: [] },
+    input: { nodes: [{ id: "offline", label: "Offline hand-drawn text 中文 日本語 한국어", x: 100, y: 100, color: "#f2d27a" }], edges: [] },
   } });
   expect(response.ok()).toBeTruthy();
   await expect.poll(() => localFontRequests.length).toBeGreaterThan(0);
+  await expect.poll(() => cjkFontRequests.length).toBeGreaterThan(0);
   await expect.poll(async () => (await currentBridgeDocument(page)).document.elements.length).toBeGreaterThan(0);
 
   const downloadWait = page.waitForEvent("download");
@@ -243,15 +279,19 @@ test("loads fonts and exports the hand-drawn scene without network access", asyn
   expect(await countWarmImagePixels(page, image)).toBeGreaterThan(40);
   expect(externalRequests).toEqual([]);
   expect(localFontRequests.every((url) => url.startsWith("http://127.0.0.1:5181/fonts/"))).toBe(true);
+  expect(cjkFontRequests.every((url) => url.startsWith("http://127.0.0.1:5181/fonts/"))).toBe(true);
 });
 
-test("background changes adapt Draw defaults while preserving chosen colors", async ({ page }) => {
+test("background changes recolor Draw defaults, preserve custom colors, and undo and redo", async ({ page }) => {
   await page.getByRole("button", { name: "Blackboard" }).click();
   const response = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
     input: {
       title: "Preset test",
-      nodes: [{ id: "custom", label: "Custom color", x: 100, y: 100, color: "#ff00cc" }],
+      nodes: [
+        { id: "default", label: "Default color", x: 100, y: 100 },
+        { id: "custom", label: "Custom color", x: 340, y: 100, color: "#ff00cc" },
+      ],
       edges: [],
     },
   } });
@@ -261,9 +301,185 @@ test("background changes adapt Draw defaults while preserving chosen colors", as
   await expect.poll(async () => {
     const current = await currentBridgeDocument(page);
     const title = current.document.elements.find((element: any) => element.id === created.result.titleElementId);
-    const node = current.document.elements.find((element: any) => element.id === created.result.nodes.custom);
-    return title?.strokeColor === "#1e1e1e" && node?.strokeColor === "#ff00cc" && node?.backgroundColor === "#ffffff";
+    const defaultNode = current.document.elements.find((element: any) => element.id === created.result.nodes.default);
+    const customNode = current.document.elements.find((element: any) => element.id === created.result.nodes.custom);
+    return title?.strokeColor === "#1e1e1e" && defaultNode?.strokeColor === "#1e1e1e" && defaultNode?.backgroundColor === "#ffffff" && customNode?.strokeColor === "#ff00cc";
   }).toBe(true);
+  expect(contrastRatio("#1e1e1e", "#ffffff")).toBeGreaterThanOrEqual(4.5);
+
+  await page.getByRole("button", { name: "Undo" }).click();
+  await expect.poll(async () => {
+    const current = await currentBridgeDocument(page);
+    const node = current.document.elements.find((element: any) => element.id === created.result.nodes.default);
+    return current.document.canvas.background.preset === "blackboard" && node?.strokeColor === "#f6f2e9" && node?.backgroundColor === "#18191a";
+  }).toBe(true);
+  await page.getByRole("button", { name: "Redo" }).click();
+  await expect.poll(async () => (await currentBridgeDocument(page)).document.canvas.background.preset).toBe("white");
+
+  const whiteNodeResponse = await page.request.post(commandApi, { data: {
+    operation: "create_diagram",
+    input: { nodes: [{ id: "white-default", label: "White default", x: 580, y: 100 }], edges: [] },
+  } });
+  expect(whiteNodeResponse.ok()).toBeTruthy();
+  const whiteNode = await whiteNodeResponse.json();
+  await page.getByRole("button", { name: "Blackboard" }).click();
+  await expect.poll(async () => {
+    const current = await currentBridgeDocument(page);
+    const node = current.document.elements.find((element: any) => element.id === whiteNode.result.nodes["white-default"]);
+    return node?.strokeColor === "#f6f2e9" && node?.backgroundColor === "#18191a";
+  }).toBe(true);
+  const blackboardContrast = await currentBridgeDocument(page);
+  const blackboardDefault = blackboardContrast.document.elements.find((element: any) => element.id === whiteNode.result.nodes["white-default"]);
+  expect(contrastRatio(blackboardDefault.strokeColor, "#18191a")).toBeGreaterThanOrEqual(4.5);
+
+  await page.getByRole("button", { name: "White" }).click();
+  const custom = await currentBridgeDocument(page);
+  expect(custom.document.elements.find((element: any) => element.id === created.result.nodes.custom)?.strokeColor).toBe("#ff00cc");
+});
+
+test("blackboard background survives reload and is present in PNG and JPEG exports", async ({ page }) => {
+  const response = await page.request.post(commandApi, { data: {
+    operation: "create_diagram",
+    input: { nodes: [{ id: "pixel-check", label: "Background pixel check", x: 160, y: 100 }], edges: [] },
+  } });
+  expect(response.ok()).toBeTruthy();
+
+  for (const [mimeType, signature] of [["image/png", "89504e470d0a1a0a"], ["image/jpeg", "ffd8ff"]] as const) {
+    await page.getByLabel("Image export format").selectOption(mimeType);
+    const downloadWait = page.waitForEvent("download");
+    await page.locator("button.export-main").click();
+    const download = await downloadWait;
+    const image = await readFile(await download.path());
+    expect(image.subarray(0, signature.length / 2).toString("hex")).toBe(signature);
+    expect(await countPixelsNear(page, image, [24, 25, 26], mimeType === "image/png" ? 3 : 18, mimeType)).toBeGreaterThan(100);
+  }
+
+  await page.reload();
+  await page.locator(".excalidraw canvas").first().waitFor();
+  await expect(page.getByRole("button", { name: "Blackboard" })).toHaveAttribute("aria-pressed", "true");
+});
+
+test("fresh MCP canvas reads flush a just-drawn freehand edit", async ({ page }) => {
+  await page.locator('.excalidraw label[title^="Draw"]').click();
+  const canvas = page.locator(".excalidraw canvas").last();
+  const bounds = await canvas.boundingBox();
+  if (!bounds) throw new Error("Could not locate the drawing canvas.");
+  const start = { x: bounds.x + bounds.width / 2 - 100, y: bounds.y + bounds.height / 2 };
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  await page.mouse.move(start.x + 35, start.y - 18);
+  await page.mouse.move(start.x + 70, start.y + 8);
+  await page.mouse.up();
+
+  const current = await freshBridgeDocument(page);
+  expect(current.document.elements.some((element: any) => element.type === "freedraw" && element.isDeleted !== true)).toBe(true);
+});
+
+test("one infinite canvas pans and zooms across multiple independent diagrams", async ({ page }) => {
+  const response = await page.request.post(commandApi, { data: {
+    operation: "create_diagram",
+    input: { nodes: [
+      { id: "near", label: "First diagram", x: 100, y: 120 },
+      { id: "far", label: "Second diagram", x: 1800, y: 120 },
+    ], edges: [] },
+  } });
+  expect(response.ok()).toBeTruthy();
+  const created = await response.json();
+  await page.getByRole("button", { name: "Zoom in" }).click();
+  const zoomed = await freshBridgeDocument(page);
+  expect(zoomed.document.canvas.viewport.zoom).toBeGreaterThan(1);
+
+  const canvas = page.locator(".excalidraw canvas").last();
+  const bounds = await canvas.boundingBox();
+  if (!bounds) throw new Error("Could not locate the drawing canvas.");
+  const start = { x: bounds.x + bounds.width - 40, y: bounds.y + bounds.height / 2 };
+  await page.keyboard.down("Space");
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  await page.mouse.move(start.x - 180, start.y + 60);
+  await page.mouse.up();
+  await page.keyboard.up("Space");
+
+  const panned = await freshBridgeDocument(page);
+  expect(panned.document.canvas.viewport.x).not.toBe(zoomed.document.canvas.viewport.x);
+  expect(panned.document.canvas.viewport.y).not.toBe(zoomed.document.canvas.viewport.y);
+  expect(panned.document.elements.some((element: any) => element.id === created.result.nodes.near)).toBe(true);
+  expect(panned.document.elements.some((element: any) => element.id === created.result.nodes.far)).toBe(true);
+});
+
+test("a reloaded .draw node remains selectable and manually editable", async ({ page }) => {
+  const response = await page.request.post(commandApi, { data: {
+    operation: "create_diagram",
+    input: { nodes: [{ id: "editable", label: "Before reload", x: 100, y: 100, width: 180, height: 72 }], edges: [] },
+  } });
+  expect(response.ok()).toBeTruthy();
+  const created = await response.json();
+  await waitForBridge(page);
+  await page.locator(".excalidraw canvas").first().waitFor();
+  const canvas = page.locator(".excalidraw canvas").last();
+  const bounds = await canvas.boundingBox();
+  if (!bounds) throw new Error("Could not locate the drawing canvas.");
+  const point = { x: bounds.x + 100 + 90, y: bounds.y + 100 + 36 };
+  await page.mouse.click(point.x, point.y);
+  await expect.poll(async () => (await freshBridgeDocument(page)).document.appState.selectedElementIds?.[created.result.nodes.editable]).toBe(true);
+
+  await page.keyboard.press("Enter");
+  const editor = page.locator(".excalidraw textarea").last();
+  await expect(editor).toBeVisible();
+  await editor.fill("Edited after reload");
+  await page.keyboard.press("Control+Enter");
+  await expect.poll(async () => {
+    const current = await freshBridgeDocument(page);
+    return current.document.elements.some((element: any) => element.originalText === "Edited after reload");
+  }).toBe(true);
+});
+
+test("long MCP labels fit inside ellipse and diamond outlines and reroute connected arrows", async ({ page }) => {
+  const create = await page.request.post(commandApi, { data: {
+    operation: "create_diagram",
+    input: {
+      nodes: [
+        { id: "oval", label: "Oval", x: 80, y: 100, width: 180, height: 72, shape: "ellipse" },
+        { id: "diamond", label: "Diamond", x: 80, y: 320, width: 180, height: 72, shape: "diamond" },
+        { id: "target-oval", label: "Target", x: 520, y: 100 },
+        { id: "target-diamond", label: "Target", x: 520, y: 320 },
+      ],
+      edges: [{ from: "oval", to: "target-oval" }, { from: "diamond", to: "target-diamond" }],
+    },
+  } });
+  expect(create.ok()).toBeTruthy();
+  const created = await create.json();
+  const longText = "A considerably longer label that should wrap to several lines inside this shape";
+  const update = await page.request.post(commandApi, { data: {
+    operation: "update_elements",
+    input: { updates: [
+      { id: created.result.nodes.oval, patch: { text: longText } },
+      { id: created.result.nodes.diamond, patch: { text: longText } },
+    ] },
+  } });
+  expect(update.ok(), await update.text()).toBeTruthy();
+
+  const current = await currentBridgeDocument(page);
+  for (const nodeId of [created.result.nodes.oval, created.result.nodes.diamond]) {
+    const shape = current.document.elements.find((element: any) => element.id === nodeId);
+    const label = current.document.elements.find((element: any) => element.id === created.result.nodeLabels[Object.keys(created.result.nodeLabels).find((key) => created.result.nodes[key] === nodeId)!]);
+    expect(label.originalText).toBe(longText);
+    expect(label.text).toContain("\n");
+    const widthRatio = label.width / shape.width;
+    const heightRatio = label.height / shape.height;
+    if (shape.type === "ellipse") expect(widthRatio ** 2 + heightRatio ** 2).toBeLessThanOrEqual(1);
+    else expect(widthRatio + heightRatio).toBeLessThanOrEqual(1);
+  }
+
+  for (const nodeId of [created.result.nodes.oval, created.result.nodes.diamond]) {
+    const shape = current.document.elements.find((element: any) => element.id === nodeId);
+    const arrow = current.document.elements.find((element: any) => element.type === "arrow" && element.startBinding?.elementId === nodeId);
+    const [pointX, pointY] = arrow.points[0];
+    const dx = (arrow.x + pointX) - (shape.x + shape.width / 2);
+    const dy = (arrow.y + pointY) - (shape.y + shape.height / 2);
+    if (shape.type === "ellipse") expect((dx / (shape.width / 2)) ** 2 + (dy / (shape.height / 2)) ** 2).toBeCloseTo(1, 2);
+    else expect(Math.abs(dx) / (shape.width / 2) + Math.abs(dy) / (shape.height / 2)).toBeCloseTo(1, 2);
+  }
 });
 
 test("embedded image assets survive autosave and editable Draw save/reopen", async ({ page }) => {

@@ -131,6 +131,28 @@ describe("Draw MCP Vite bridge", () => {
     expect(current.body.document.title).toBe("Active tab");
   });
 
+  it("flushes the active tab before a freshness-requested canvas read", async () => {
+    const bridge = createBridgeHarness(createDrawMcpPlugin({ flushTimeoutMs: 1_000 }));
+    const original = createEmptyDocument("Before edit");
+    await bridge.request("PUT", "/__draw/api/client", { clientId: "tab-1" });
+    await bridge.request("PUT", "/__draw/api/document", { clientId: "tab-1", document: original });
+
+    const readPromise = bridge.request("GET", "/__draw/api/document?flush=1");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const message = bridge.events.find(({ event }) => event === "draw:flush-document")?.data;
+    expect(message).toMatchObject({ clientId: "tab-1" });
+
+    const edited = structuredClone(original);
+    edited.document.elements.push({ id: "immediate-edit", type: "rectangle" });
+    const ack = await bridge.request("POST", `/__draw/api/document/flush/${message.id}`, {
+      clientId: "tab-1", document: edited,
+    });
+    expect(ack.status).toBe(200);
+    const read = await readPromise;
+    expect(read.status).toBe(200);
+    expect(read.body.document.elements[0].id).toBe("immediate-edit");
+  });
+
   it("accepts a late acknowledgement after returning a timeout and tells callers to inspect before retrying", async () => {
     const bridge = createBridgeHarness(createDrawMcpPlugin({ commandTimeoutMs: 5, lateAckRetentionMs: 1_000 }));
     const document = createEmptyDocument("MCP timeout");

@@ -13,7 +13,7 @@ import {
 import { composeBackgroundSvg, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorDefaultElements } from "./export/background-recolor";
 import { saveCurrentDocument, loadCurrentDocument } from "./ui/storage";
-import { applyElementUpdates, type EditableSceneElement } from "./integrations/scene-updates";
+import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
 import { createDebouncedSaver } from "./ui/autosave";
 import { buildDiagramSkeletons } from "./integrations/diagram-builder";
@@ -22,6 +22,7 @@ import { createBridgeSynchronizer } from "./integrations/bridge-sync";
 
 type Status = "loading" | "ready" | "saving" | "saved" | "error";
 type BridgeCommand = { id: string; clientId: string; operation: "create_diagram" | "update_elements"; input: any };
+type BridgeFlush = { id: string; clientId: string };
 const DEFAULT_COLOR: Record<DrawBackgroundPreset, string> = { blackboard: "#18191a", white: "#ffffff" };
 const EDITOR_UI_OPTIONS = {
   canvasActions: { loadScene: false, saveToActiveFile: false, export: false, toggleTheme: false, changeViewBackgroundColor: false },
@@ -155,7 +156,14 @@ export default function App() {
     const current = docRef.current;
     if (!current) return;
     const state = appState as Record<string, unknown> & { scrollX?: number; scrollY?: number; zoom?: { value?: number } };
-    const background = current.document.canvas.background;
+    const backgroundPreset = state.viewBackgroundColor === "transparent"
+      ? "blackboard"
+      : state.viewBackgroundColor === DEFAULT_COLOR.white
+        ? "white"
+        : current.document.canvas.background.preset;
+    const background = backgroundPreset === "blackboard"
+      ? { preset: "blackboard" as const, styleVersion: 1, color: DEFAULT_COLOR.blackboard, texture: "chalk-smudge-v1" }
+      : { preset: "white" as const, styleVersion: 1, color: DEFAULT_COLOR.white };
     const next = fromExcalidrawScene({ elements, appState, files }, {
       id: current.document.id,
       title: current.document.title,
@@ -307,6 +315,7 @@ export default function App() {
         for (const element of created as any[]) {
           if (element.type === "text" && element.containerId) labelIds.set(element.containerId, element.id);
         }
+        const routedCreated = routeBoundArrows(created as any[]);
         const nodes = Object.fromEntries(Object.entries(built.nodeElementIds).map(([inputId, elementId]) => [inputId, elementId]));
         const nodeLabels = Object.fromEntries(Object.entries(built.nodeElementIds).flatMap(([inputId, elementId]) => {
           const labelId = labelIds.get(elementId);
@@ -318,7 +327,7 @@ export default function App() {
           inputIndex: index,
         }));
         const titleElement = event.input.title && (created as any[]).find((element) => element.type === "text" && !element.containerId && element.text === event.input.title);
-        elements = [...elements, ...created as any[]];
+        elements = [...elements, ...routedCreated as any[]];
         result = {
           addedElementIds: created.map((element: any) => element.id),
           nodes, nodeLabels, edges,
@@ -370,11 +379,53 @@ export default function App() {
     }
   }, [autosaveBlocked, setDocument, syncBridgeDocument]);
 
+  const handleBridgeFlush = useCallback(async (event: BridgeFlush) => {
+    const api = apiRef.current;
+    const current = docRef.current;
+    if (!api || !current || event.clientId !== clientId.current || !writerOwned.current) return;
+    try {
+      const state = api.getAppState() as any;
+      const next = fromExcalidrawScene({
+        elements: api.getSceneElementsIncludingDeleted() as any[],
+        appState: state,
+        files: api.getFiles(),
+      }, {
+        id: current.document.id,
+        title: current.document.title,
+        background: current.document.canvas.background,
+        viewport: {
+          x: typeof state.scrollX === "number" ? state.scrollX : current.document.canvas.viewport.x,
+          y: typeof state.scrollY === "number" ? state.scrollY : current.document.canvas.viewport.y,
+          zoom: typeof state.zoom?.value === "number" ? state.zoom.value : current.document.canvas.viewport.zoom,
+        },
+      });
+      setDocument(next);
+      if (!autosaveBlocked) {
+        autosave.schedule(next);
+        bridgeAutosave.schedule(next);
+        await Promise.all([autosave.flush(), bridgeAutosave.flush()]);
+      } else await syncBridgeDocument(next);
+      await fetch(`/__draw/api/document/flush/${encodeURIComponent(event.id)}`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: event.id, clientId: clientId.current, document: next }),
+      });
+    } catch (error) {
+      await fetch(`/__draw/api/document/flush/${encodeURIComponent(event.id)}`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: event.id, clientId: clientId.current, error: error instanceof Error ? error.message : String(error) }),
+      }).catch(() => undefined);
+    }
+  }, [autosave, autosaveBlocked, bridgeAutosave, setDocument, syncBridgeDocument]);
+
   useEffect(() => {
     if (!import.meta.hot) return;
     import.meta.hot.on("draw:mcp-command", handleMcpCommand);
-    return () => import.meta.hot?.off("draw:mcp-command", handleMcpCommand);
-  }, [handleMcpCommand]);
+    import.meta.hot.on("draw:flush-document", handleBridgeFlush);
+    return () => {
+      import.meta.hot?.off("draw:mcp-command", handleMcpCommand);
+      import.meta.hot?.off("draw:flush-document", handleBridgeFlush);
+    };
+  }, [handleBridgeFlush, handleMcpCommand]);
 
   const initialData = useMemo(() => {
     if (!doc) return undefined;

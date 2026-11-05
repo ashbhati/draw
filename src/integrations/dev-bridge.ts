@@ -24,8 +24,16 @@ type PendingCommand = {
   timedOut: boolean;
 };
 
+type PendingFlush = {
+  clientId: string;
+  resolve: (document: DrawDocumentBridgeValue) => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+};
+
 export type DrawMcpBridgeOptions = {
   commandTimeoutMs?: number;
+  flushTimeoutMs?: number;
   lateAckRetentionMs?: number;
   maxBodyBytes?: number;
 };
@@ -87,9 +95,11 @@ function asMcpCommand(body: unknown): McpCommand {
 
 export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin {
   const commandTimeoutMs = options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+  const flushTimeoutMs = options.flushTimeoutMs ?? 1_000;
   const lateAckRetentionMs = options.lateAckRetentionMs ?? DEFAULT_LATE_ACK_RETENTION_MS;
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const pending = new Map<string, PendingCommand>();
+  const pendingFlushes = new Map<string, PendingFlush>();
   let document: DrawDocumentBridgeValue | null = null;
   let activeClientId: string | null = null;
   let commandSequence = 0;
@@ -166,7 +176,62 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               sendJson(response, 404, { error: "No Draw document is open in the app." });
               return;
             }
+            const flushRequested = new URL(request.url ?? "/", "http://127.0.0.1").searchParams.get("flush") === "1";
+            if (flushRequested && activeClientId) {
+              const clientId = activeClientId;
+              commandSequence += 1;
+              const id = `draw-flush-${Date.now().toString(36)}-${commandSequence.toString(36)}`;
+              const freshDocument = await new Promise<DrawDocumentBridgeValue>((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                  pendingFlushes.delete(id);
+                  reject(new Error("Timed out waiting for the active Draw canvas to flush its latest edit."));
+                }, flushTimeoutMs);
+                pendingFlushes.set(id, { clientId, resolve, reject, timeout });
+                server.ws.send("draw:flush-document", { id, clientId });
+              }).catch((error: unknown) => {
+                sendJson(response, 504, { error: error instanceof Error ? error.message : "Timed out waiting for Draw." });
+                return null;
+              });
+              if (!freshDocument) return;
+              document = freshDocument;
+            } else if (flushRequested) {
+              sendJson(response, 409, { error: "No active Draw canvas is connected to flush its latest edit." });
+              return;
+            }
             sendJson(response, 200, document);
+            return;
+          }
+
+          const flushAckMatch = path.match(/^\/__draw\/api\/document\/flush\/([^/]+)$/);
+          if (request.method === "POST" && flushAckMatch) {
+            const body = await readJsonBody(request, maxBodyBytes);
+            if (!isRecord(body) || typeof body.clientId !== "string" || (body.error === undefined && !isDrawDocument(body.document)) || (body.error !== undefined && typeof body.error !== "string")) {
+              sendJson(response, 400, { error: "Flush acknowledgement must include a clientId and a valid Draw document or error." });
+              return;
+            }
+            const id = decodeURIComponent(flushAckMatch[1]);
+            const waiting = pendingFlushes.get(id);
+            if (!waiting) {
+              sendJson(response, 404, { error: "No pending Draw document flush matches this acknowledgement." });
+              return;
+            }
+            if (body.clientId !== waiting.clientId || body.clientId !== activeClientId) {
+              sendJson(response, 409, { error: "Flush acknowledgement came from a canvas that is no longer active." });
+              return;
+            }
+            clearTimeout(waiting.timeout);
+            pendingFlushes.delete(id);
+            if (typeof body.error === "string") {
+              waiting.reject(new Error(body.error));
+            } else {
+              if (!isDrawDocument(body.document)) {
+                sendJson(response, 400, { error: "Flush acknowledgement document is invalid." });
+                return;
+              }
+              document = body.document;
+              waiting.resolve(body.document);
+            }
+            sendJson(response, 200, { ok: true });
             return;
           }
 

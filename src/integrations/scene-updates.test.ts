@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyElementUpdates } from "./scene-updates";
+import { applyElementUpdates, routeBoundArrows } from "./scene-updates";
 
 describe("MCP scene updates", () => {
   it("moves container labels and recomputes both ends of connected arrows", () => {
@@ -53,6 +53,55 @@ describe("MCP scene updates", () => {
     expect((label?.y ?? 0) + (label?.height ?? 0)).toBeLessThanOrEqual((box?.y ?? 0) + (box?.height ?? 0));
   });
 
+  it.each(["ellipse", "diamond"] as const)("keeps long labels inside the %s inscribed text area", (shapeType) => {
+    const scene = [
+      { id: "shape", type: shapeType, x: 20, y: 30, width: 180, height: 72 },
+      { id: "label", type: "text", x: 30, y: 50, width: 160, height: 24, fontSize: 20, text: "Short", originalText: "Short", containerId: "shape" },
+    ];
+    const measure = (text: string) => ({
+      width: Math.max(...text.split("\n").map((line) => line.length * 10), 1),
+      height: text.split("\n").length * 24,
+    });
+    const result = applyElementUpdates(scene, [{ id: "shape", patch: { text: "A considerably longer label that should wrap to several lines inside this shape" } }], measure);
+    const shape = result.elements.find((element) => element.id === "shape")!;
+    const label = result.elements.find((element) => element.id === "label")!;
+    const widthRatio = (label.width ?? 0) / (shape.width ?? 1);
+    const heightRatio = (label.height ?? 0) / (shape.height ?? 1);
+    if (shapeType === "ellipse") expect(widthRatio ** 2 + heightRatio ** 2).toBeLessThanOrEqual(1);
+    else expect(widthRatio + heightRatio).toBeLessThanOrEqual(1);
+    expect(label.text).toContain("\n");
+  });
+
+  it("repositions a bound arrow to the resized ellipse boundary after a label grows", () => {
+    const scene = [
+      { id: "ellipse", type: "ellipse", x: 20, y: 30, width: 180, height: 72, boundElements: [{ id: "ellipse-label", type: "text" }] },
+      { id: "ellipse-label", type: "text", x: 30, y: 50, width: 160, height: 24, fontSize: 20, text: "Short", originalText: "Short", containerId: "ellipse" },
+      { id: "box", type: "rectangle", x: 360, y: 60, width: 120, height: 72 },
+      { id: "arrow", type: "arrow", x: 200, y: 66, width: 160, height: 0, points: [[0, 0], [160, 0]], startBinding: { elementId: "ellipse" }, endBinding: { elementId: "box" }, version: 1, versionNonce: 3 },
+    ];
+    const result = applyElementUpdates(scene, [{ id: "ellipse", patch: { text: "A long label that grows the ellipse and should keep its connector on the edge" } }], (text) => ({ width: 160, height: text.split("\n").length * 24 }));
+    const ellipse = result.elements.find((element) => element.id === "ellipse")!;
+    const arrow = result.elements.find((element) => element.id === "arrow")!;
+    const [x, y] = arrow.points![0];
+    const absoluteX = (arrow.x ?? 0) + x;
+    const absoluteY = (arrow.y ?? 0) + y;
+    const centerX = (ellipse.x ?? 0) + (ellipse.width ?? 0) / 2;
+    const centerY = (ellipse.y ?? 0) + (ellipse.height ?? 0) / 2;
+    expect(((absoluteX - centerX) / ((ellipse.width ?? 1) / 2)) ** 2 + ((absoluteY - centerY) / ((ellipse.height ?? 1) / 2)) ** 2).toBeCloseTo(1, 2);
+    expect(result.updatedIds).toContain("arrow");
+  });
+
+  it("routes newly converted MCP arrows from shape boundaries", () => {
+    const routed = routeBoundArrows([
+      { id: "a", type: "rectangle", x: 0, y: 0, width: 100, height: 80 },
+      { id: "b", type: "diamond", x: 240, y: 0, width: 100, height: 80 },
+      { id: "arrow", type: "arrow", x: 50, y: 40, width: 240, height: 0, points: [[0, 0], [240, 0]], startBinding: { elementId: "a" }, endBinding: { elementId: "b" } },
+    ]);
+    const arrow = routed.find((element) => element.id === "arrow")!;
+    expect((arrow.x ?? 0) + arrow.points![0][0]).toBeCloseTo(100);
+    expect((arrow.x ?? 0) + arrow.points![arrow.points!.length - 1][0]).toBeCloseTo(240);
+  });
+
   it("rejects points patches because linear geometry needs endpoint-aware rescaling", () => {
     const scene = [{ id: "arrow", type: "arrow", x: 0, y: 0, width: 100, height: 0, points: [[0, 0], [100, 0]] }];
     expect(() => applyElementUpdates(scene, [{ id: "arrow", patch: { points: [[0, 0], [200, 0]] } } as never])).toThrow(/points.*unsupported|unsupported.*points/i);
@@ -68,6 +117,7 @@ describe("MCP scene updates", () => {
     const label = result.elements.find((element) => element.id === "label");
     expect(arrow?.points).toEqual([[0, 0], [100, 0]]);
     expect((label?.x ?? 0) + (label?.width ?? 0) / 2).toBeCloseTo(60);
+    expect((label?.y ?? 0) + (label?.height ?? 0)).toBeLessThan((arrow?.y ?? 0) + (arrow?.points?.[0]?.[1] ?? 0));
     expect(result.updatedIds).toContain("arrow");
   });
 
