@@ -96,10 +96,15 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("canvas choices are in the main toolbar and replace the quick-start rail", async ({ page }) => {
-  const toolbar = page.getByRole("group", { name: "Canvas background" });
+  const toolbar = page.getByRole("group", { name: "Canvas" });
   await expect(toolbar).toBeVisible();
   await expect(toolbar.getByRole("button", { name: "Blackboard Canvas" })).toBeVisible();
   await expect(toolbar.getByRole("button", { name: "Whiteboard Canvas" })).toBeVisible();
+  await expect(toolbar).toContainText("Canvas");
+  await expect(toolbar).toContainText("Blackboard Canvas");
+  await expect(toolbar).toContainText("Whiteboard Canvas");
+  await expect(page.locator(".editor-shell").getByRole("group", { name: "Canvas" })).toBeVisible();
+  await expect(toolbar.locator(".draw-canvas-option").first()).toBeVisible();
   await expect(page.locator(".side-rail")).toHaveCount(0);
   await expect(page.getByText("QUICK START")).toHaveCount(0);
 
@@ -108,6 +113,19 @@ test("canvas choices are in the main toolbar and replace the quick-start rail", 
   await expect.poll(async () => (await currentBridgeDocument(page)).document.canvas.background.preset).toBe("white");
   await toolbar.getByRole("button", { name: "Blackboard Canvas" }).click();
   await expect(toolbar.getByRole("button", { name: "Blackboard Canvas" })).toHaveAttribute("aria-pressed", "true");
+});
+
+test("canvas controls remain visible and usable at phone width", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const toolbar = page.getByRole("group", { name: "Canvas" });
+  const selector = toolbar.getByLabel("Canvas background");
+  const bounds = await selector.boundingBox();
+  expect(bounds).not.toBeNull();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(390);
+  await expect(selector.locator("option")).toHaveText(["Blackboard Canvas", "Whiteboard Canvas"]);
+  await selector.selectOption("white");
+  await expect.poll(async () => (await currentBridgeDocument(page)).document.canvas.background.preset).toBe("white");
 });
 
 test("MCP create and update stay editable through save, reload, open, and image export", async ({ page }) => {
