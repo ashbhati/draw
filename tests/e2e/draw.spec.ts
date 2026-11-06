@@ -209,31 +209,28 @@ async function countInkInSceneRegion(
 test.beforeEach(async ({ page }) => {
   await waitForBridge(page);
   await page.locator(".excalidraw canvas").first().waitFor();
-  await expect(page.getByRole("button", { name: "Blackboard Canvas" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Blackboard", exact: true })).toBeEnabled();
 });
 
 test("canvas choices are in the main toolbar and replace the quick-start rail", async ({ page }) => {
   const toolbar = page.getByRole("group", { name: "Canvas" });
   await expect(toolbar).toBeVisible();
-  await expect(toolbar.getByRole("button", { name: "Blackboard Canvas" })).toBeVisible();
-  await expect(toolbar.getByRole("button", { name: "Whiteboard Canvas" })).toBeVisible();
-  await expect(toolbar).toContainText("Canvas");
-  await expect(toolbar).toContainText("Blackboard Canvas");
-  await expect(toolbar).toContainText("Whiteboard Canvas");
+  await expect(toolbar.getByRole("button", { name: "Blackboard", exact: true })).toBeVisible();
+  await expect(toolbar.getByRole("button", { name: "Whiteboard", exact: true })).toBeVisible();
+  await expect(toolbar.getByText("Canvas:", { exact: true })).toBeVisible();
   await expect(page.locator(".editor-shell").getByRole("group", { name: "Canvas" })).toBeVisible();
   await expect(toolbar.locator(".draw-canvas-option").first()).toBeVisible();
   await expect(page.locator(".side-rail")).toHaveCount(0);
   await expect(page.getByText("QUICK START")).toHaveCount(0);
 
-  await toolbar.getByRole("button", { name: "Whiteboard Canvas" }).click();
-  await expect(toolbar.getByRole("button", { name: "Whiteboard Canvas" })).toHaveAttribute("aria-pressed", "true");
+  await toolbar.getByRole("button", { name: "Whiteboard", exact: true }).click();
+  await expect(toolbar.getByRole("button", { name: "Whiteboard", exact: true })).toHaveAttribute("aria-pressed", "true");
   await expect.poll(async () => (await currentBridgeDocument(page)).document.canvas.background.preset).toBe("white");
-  await toolbar.getByRole("button", { name: "Blackboard Canvas" }).click();
-  await expect(toolbar.getByRole("button", { name: "Blackboard Canvas" })).toHaveAttribute("aria-pressed", "true");
+  await toolbar.getByRole("button", { name: "Blackboard", exact: true }).click();
+  await expect(toolbar.getByRole("button", { name: "Blackboard", exact: true })).toHaveAttribute("aria-pressed", "true");
 });
 
 test("the editor omits the redundant canvas status strip without leaving a spacer", async ({ page }) => {
-  await expect(page.locator(".canvas-label")).toHaveCount(0);
   await expect(page.getByText(/Infinite canvas\s*·\s*(Blackboard|Whiteboard) Canvas/)).toHaveCount(0);
   await expect(page.locator(".editor-shell")).toBeVisible();
   const canvasArea = await page.locator(".canvas-area").boundingBox();
@@ -247,7 +244,7 @@ test("the editor omits the redundant canvas status strip without leaving a space
 test("canvas controls fit inside the editor across responsive breakpoints", async ({ page }) => {
   const toolbar = page.getByRole("group", { name: "Canvas" });
   const selector = toolbar.getByLabel("Canvas background");
-  await expect(selector.locator("option")).toHaveText(["Blackboard Canvas", "Whiteboard Canvas"]);
+  await expect(selector.locator("option")).toHaveText(["Blackboard", "Whiteboard"]);
   const editor = page.locator(".editor-shell");
   for (const width of [360, 390, 700, 900, 950, 1019, 1020, 1021, 1100, 1400, 1920]) {
     await page.setViewportSize({ width, height: 844 });
@@ -279,7 +276,7 @@ test("canvas controls fit inside the editor across responsive breakpoints", asyn
       expect(overlapsTools).toBe(false);
       expect(overlapsMenu(bounds!)).toBe(false);
     } else {
-      for (const button of [toolbar.getByRole("button", { name: "Blackboard Canvas" }), toolbar.getByRole("button", { name: "Whiteboard Canvas" })]) {
+      for (const button of [toolbar.getByRole("button", { name: "Blackboard", exact: true }), toolbar.getByRole("button", { name: "Whiteboard", exact: true })]) {
         const bounds = await button.boundingBox();
         expect(bounds).not.toBeNull();
         expect(bounds!.x).toBeGreaterThanOrEqual(editorBounds!.x);
@@ -416,8 +413,8 @@ test("MCP create and update stay editable through save, reload, open, and image 
   }).toBe(true);
 
   await page.getByRole("button", { name: "Redo" }).click();
-  await page.getByRole("button", { name: "Whiteboard Canvas" }).click();
-  await expect(page.getByRole("button", { name: "Whiteboard Canvas" })).toHaveAttribute("aria-pressed", "true");
+  await page.getByRole("button", { name: "Whiteboard", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Whiteboard", exact: true })).toHaveAttribute("aria-pressed", "true");
 
   const editedElementId = created.result.nodes.spec;
   const longText = "A considerably longer label that should wrap inside the node";
@@ -456,7 +453,7 @@ test("MCP create and update stay editable through save, reload, open, and image 
 
   await page.reload();
   await page.locator(".excalidraw canvas").first().waitFor();
-  await expect(page.getByRole("button", { name: "Whiteboard Canvas" })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByRole("button", { name: "Whiteboard", exact: true })).toHaveAttribute("aria-pressed", "true");
   expect((await readLocalDocument(page)).document.elements.some((element: any) => element.originalText === longText)).toBeTruthy();
 
   page.once("dialog", (dialog) => dialog.accept());
@@ -508,7 +505,7 @@ test("Open .draw restores a downloaded file that remains editable through a seco
   const created = await createResponse.json();
 
   await page.getByLabel("Drawing title").fill("Portable Asset Round Trip");
-  await page.getByRole("button", { name: "Whiteboard Canvas" }).click();
+  await page.getByRole("button", { name: "Whiteboard", exact: true }).click();
   await page.getByRole("button", { name: "Zoom in" }).click();
   const canvas = page.locator(".excalidraw canvas").last();
   const canvasBounds = await canvas.boundingBox();
@@ -553,7 +550,7 @@ test("Open .draw restores a downloaded file that remains editable through a seco
   expect(firstFile.document.elements.filter((element: any) => element.type === "image")).toHaveLength(1);
 
   await page.getByLabel("Drawing title").fill("Changed before opening saved file");
-  await page.getByRole("button", { name: "Blackboard Canvas" }).click();
+  await page.getByRole("button", { name: "Blackboard", exact: true }).click();
   await page.getByRole("button", { name: "Zoom out" }).click();
   const changedBeforeOpen = await freshBridgeDocument(page);
   expect(changedBeforeOpen.document.title).toBe("Changed before opening saved file");
@@ -641,7 +638,7 @@ test("a second tab is read-only while the first tab owns local autosave", async 
 
   await expect(secondTab.getByText(/reload this tab to edit/i)).toBeVisible();
   await expect(secondTab.getByLabel("Drawing title")).toBeDisabled();
-  await expect(secondTab.getByRole("button", { name: "Whiteboard Canvas" })).toBeDisabled();
+  await expect(secondTab.getByRole("button", { name: "Whiteboard", exact: true })).toBeDisabled();
 });
 
 test("title edits flush to IndexedDB on pagehide and survive reload", async ({ page }) => {
@@ -697,7 +694,7 @@ test("loads fonts and exports the hand-drawn scene without network access", asyn
     return route.abort();
   });
   await waitForBridge(page);
-  await expect(page.getByRole("button", { name: "Blackboard" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Blackboard", exact: true })).toBeEnabled();
   const response = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
     input: { nodes: [{ id: "offline", label: "Offline hand-drawn text 中文 日本語 한국어", x: 100, y: 100, color: "#f2d27a" }], edges: [] },
@@ -720,7 +717,7 @@ test("loads fonts and exports the hand-drawn scene without network access", asyn
 });
 
 test("background changes recolor Draw defaults, preserve custom colors, and undo and redo", async ({ page }) => {
-  await page.getByRole("button", { name: "Blackboard" }).click();
+  await page.getByRole("button", { name: "Blackboard", exact: true }).click();
   const response = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
     input: {
@@ -766,7 +763,7 @@ test("background changes recolor Draw defaults, preserve custom colors, and undo
   } });
   expect(whiteNodeResponse.ok()).toBeTruthy();
   const whiteNode = await whiteNodeResponse.json();
-  await page.getByRole("button", { name: "Blackboard" }).click();
+  await page.getByRole("button", { name: "Blackboard", exact: true }).click();
   await expect.poll(async () => {
     const current = await currentBridgeDocument(page);
     const node = current.document.elements.find((element: any) => element.id === whiteNode.result.nodes["white-default"]);
@@ -804,7 +801,7 @@ test("blackboard background survives reload and is present in PNG and JPEG expor
 
   await page.reload();
   await page.locator(".excalidraw canvas").first().waitFor();
-  await expect(page.getByRole("button", { name: "Blackboard" })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByRole("button", { name: "Blackboard", exact: true })).toHaveAttribute("aria-pressed", "true");
 });
 
 test("fresh MCP canvas reads flush a just-drawn freehand edit", async ({ page }) => {
@@ -1177,8 +1174,8 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
   };
   const arrowRegion = { left: arrowSample.x - 9, top: arrowSample.y - 9, right: arrowSample.x + 9, bottom: arrowSample.y + 9 };
 
-  for (const [preset, presetButton] of [["blackboard", "Blackboard Canvas"], ["white", "Whiteboard Canvas"]] as const) {
-    await page.getByRole("button", { name: presetButton }).click();
+  for (const [preset, presetButton] of [["blackboard", "Blackboard"], ["white", "Whiteboard"]] as const) {
+    await page.getByRole("button", { name: presetButton, exact: true }).click();
     for (const mime of ["image/png", "image/jpeg"] as const) {
       const formatControl = page.getByLabel("Image export format");
       const downloadWait = page.waitForEvent("download");

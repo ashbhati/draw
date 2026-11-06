@@ -334,11 +334,11 @@ export default function App() {
     const selected = docRef.current?.document.canvas.background.preset ?? "blackboard";
     return <div className="draw-canvas-picker" role="group" aria-label="Canvas">
       <span className="draw-canvas-label">Canvas:</span>
-      <button className={`draw-canvas-option ${selected === "blackboard" ? "active" : ""}`} disabled={!canWrite} aria-label="Blackboard Canvas" aria-pressed={selected === "blackboard"} onClick={() => selectBackground("blackboard")}>Blackboard Canvas</button>
-      <button className={`draw-canvas-option ${selected === "white" ? "active" : ""}`} disabled={!canWrite} aria-label="Whiteboard Canvas" aria-pressed={selected === "white"} onClick={() => selectBackground("white")}>Whiteboard Canvas</button>
+      <button className={`draw-canvas-option ${selected === "blackboard" ? "active" : ""}`} disabled={!canWrite} aria-label="Blackboard" aria-pressed={selected === "blackboard"} onClick={() => selectBackground("blackboard")}>Blackboard</button>
+      <button className={`draw-canvas-option ${selected === "white" ? "active" : ""}`} disabled={!canWrite} aria-label="Whiteboard" aria-pressed={selected === "white"} onClick={() => selectBackground("white")}>Whiteboard</button>
       <select className="draw-canvas-mobile" aria-label="Canvas background" disabled={!canWrite} value={selected} onChange={(event) => selectBackground(event.target.value as DrawBackgroundPreset)}>
-        <option value="blackboard">Blackboard Canvas</option>
-        <option value="white">Whiteboard Canvas</option>
+        <option value="blackboard">Blackboard</option>
+        <option value="white">Whiteboard</option>
       </select>
     </div>;
   }, [canWrite, selectBackground]);
