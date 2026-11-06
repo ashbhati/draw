@@ -532,7 +532,6 @@ export default function App() {
     </header>
     <div className="workspace">
       <section className="canvas-area" aria-label="Drawing canvas">
-        <div className="canvas-label"><span className="canvas-live"/>Infinite canvas <span className="dot-separator">·</span> {background === "blackboard" ? "Blackboard Canvas" : "Whiteboard Canvas"}</div>
     <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onChange} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS}
       renderTopRightUI={renderCanvasToolbar}>{DRAW_MENU}</Excalidraw></div>
       </section>
