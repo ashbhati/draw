@@ -111,7 +111,7 @@ Keep these out of the first build, then prioritize them based on actual use:
 
 - **Canvas model:** one infinite scene, multiple diagrams within it.
 - **Persistence:** local working autosave plus portable `.draw` documents.
-- **Initial backgrounds:** Blackboard and White.
+- **Initial backgrounds:** Blackboard Canvas and Whiteboard Canvas.
 - **Image exports:** PNG and JPEG; flattened by definition.
 - **Interoperability:** no Excalidraw-file compatibility requirement for v1.
 - **Future scope:** revisit the deferred capabilities after the first release is implemented and used.
