@@ -164,6 +164,41 @@ test("canvas controls fit inside the editor across responsive breakpoints", asyn
   await expect.poll(async () => (await currentBridgeDocument(page)).document.canvas.background.preset).toBe("white");
 });
 
+test("the main menu retains Find without outbound links, exporter options, or a destructive reset", async ({ page }) => {
+  await page.locator('[data-testid="main-menu-trigger"]').click();
+  const menu = page.locator(".dropdown-menu");
+
+  await expect(menu.getByText("Find on canvas", { exact: true })).toBeVisible();
+  await expect(menu.getByText("Export image...", { exact: true })).toHaveCount(0);
+  await expect(menu.getByText("Help", { exact: true })).toHaveCount(0);
+  await expect(menu.getByText("Reset the canvas", { exact: true })).toHaveCount(0);
+  await expect(menu.getByText("Excalidraw links", { exact: true })).toHaveCount(0);
+  await expect(menu.locator('a[href^="http"]')).toHaveCount(0);
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(page.getByText(/Embed scene/i)).toHaveCount(0);
+  await expect(page.getByText(/Dark mode/i)).toHaveCount(0);
+});
+
+test("the bottom-right Help control is unavailable", async ({ page }) => {
+  await expect(page.locator(".help-icon")).toBeHidden();
+});
+
+test("the question-mark shortcut cannot open external help", async ({ page }) => {
+  await page.locator(".excalidraw").click({ position: { x: 500, y: 350 } });
+  await page.keyboard.press("?");
+  await expect(page.locator(".HelpDialog")).toHaveCount(0);
+  await expect(page.locator('a[href^="http"]')).toHaveCount(0);
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+test("Meta+Shift+E cannot open Excalidraw's image exporter", async ({ page }) => {
+  await page.locator(".excalidraw").click({ position: { x: 500, y: 350 } });
+  await page.keyboard.press("Meta+Shift+E");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(page.getByText(/Embed scene/i)).toHaveCount(0);
+  await expect(page.locator('a[href^="http"]')).toHaveCount(0);
+});
+
 test("MCP create and update stay editable through save, reload, open, and image export", async ({ page }) => {
   const createdResponse = await page.request.post(commandApi, { data: {
     operation: "create_diagram",

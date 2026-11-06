@@ -1,4 +1,4 @@
-import { CaptureUpdateAction, Excalidraw, FONT_FAMILY, convertToExcalidrawElements, exportToSvg } from "@excalidraw/excalidraw";
+import { CaptureUpdateAction, Excalidraw, FONT_FAMILY, MainMenu, convertToExcalidrawElements, exportToSvg } from "@excalidraw/excalidraw";
 import type { ExcalidrawImperativeAPI, ExcalidrawInitialDataState } from "@excalidraw/excalidraw/types";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -27,6 +27,11 @@ const DEFAULT_COLOR: Record<DrawBackgroundPreset, string> = { blackboard: "#1819
 const EDITOR_UI_OPTIONS = {
   canvasActions: { loadScene: false, saveToActiveFile: false, export: false, toggleTheme: false, changeViewBackgroundColor: false },
 } as const;
+const DRAW_MENU = (
+  <MainMenu>
+    <MainMenu.DefaultItems.SearchMenu />
+  </MainMenu>
+);
 const randomId = () => globalThis.crypto?.randomUUID?.() ?? `el-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 function measureTextWithExcalidraw(text: string, fontSize: number, element: EditableSceneElement) {
@@ -78,6 +83,20 @@ export default function App() {
   const titleInput = useRef<HTMLInputElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const onEditorReady = useCallback((api: ExcalidrawImperativeAPI) => { apiRef.current = api; }, []);
+
+  useEffect(() => {
+    const blockExcalidrawDialogs = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLElement && target.closest("input, textarea, select, [contenteditable='true']")) return;
+      const opensHelp = event.key === "?";
+      const opensImageExporter = (event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "e";
+      if (!opensHelp && !opensImageExporter) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
+    window.addEventListener("keydown", blockExcalidrawDialogs, true);
+    return () => window.removeEventListener("keydown", blockExcalidrawDialogs, true);
+  }, []);
 
   const setDocument = useCallback((next: DrawDocument) => {
     docRef.current = next;
@@ -505,7 +524,7 @@ export default function App() {
       <section className="canvas-area" aria-label="Drawing canvas">
         <div className="canvas-label"><span className="canvas-live"/>Infinite canvas <span className="dot-separator">·</span> {background === "blackboard" ? "Blackboard Canvas" : "Whiteboard Canvas"}</div>
     <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onChange} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS}
-      renderTopRightUI={renderCanvasToolbar} /></div>
+      renderTopRightUI={renderCanvasToolbar}>{DRAW_MENU}</Excalidraw></div>
       </section>
     </div>
     {message && <div className="toast" role="status"><span>{message}</span><button onClick={() => setMessage("")} aria-label="Dismiss message">×</button></div>}
