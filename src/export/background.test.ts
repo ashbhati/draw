@@ -37,21 +37,16 @@ describe("export background composition", () => {
     expect(result).toContain('id="scene"');
   });
 
-  it("cover-scales one shared charcoal texture without distorting or repeating it", () => {
+  it("cover-scales the shared natural slate texture without distorting or repeating it", () => {
     const result = composeBackgroundSvg(svg, "blackboard");
     expect(result.indexOf('data-draw-background="blackboard"')).toBeLessThan(result.indexOf('id="scene"'));
     expect(result).not.toContain("<pattern");
-    expect(result).toContain('data-draw-background-texture="blackboard" x="-40" y="0" width="480" height="300"');
+    expect(result).toContain('data-draw-background-texture="blackboard" x="-25" y="0" width="450" height="300"');
     expect(result).toContain('preserveAspectRatio="none"');
     expect(result).toContain('clipPathUnits="userSpaceOnUse"');
     expect(result).toContain('clip-path="url(#draw-blackboard-texture-clip)"');
-    expect(result).toContain('href="data:image/svg+xml,');
-    const embeddedTextureData = result.match(/href="data:image\/svg\+xml,([^"]+)"/)?.[1];
-    expect(embeddedTextureData).toBeDefined();
-    const embeddedTexture = decodeURIComponent(embeddedTextureData!);
-    expect(embeddedTexture).toContain('viewBox="0 0 1280 800"');
-    expect(embeddedTexture).toContain('filter id="chalk-surface" x="-12%" y="-12%" width="124%" height="124%"');
-    expect(embeddedTexture).toContain('filter id="soft-dust" x="-30%" y="-200%" width="160%" height="500%"');
+    expect(result).toContain('href="/src/ui/blackboard-texture.jpg"');
+    expect(result).not.toContain('data:image/svg+xml');
     expect(result).toContain('id="scene"');
   });
 
