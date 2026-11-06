@@ -11,7 +11,7 @@ import {
   type DrawDocument,
 } from "./document/document";
 import { composeBackgroundSvg, renderExportBlob, selectExportElements } from "./export/background";
-import { recolorDefaultElements } from "./export/background-recolor";
+import { recolorForBackgroundPreset } from "./export/background-recolor";
 import { saveCurrentDocument, loadCurrentDocument } from "./ui/storage";
 import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
@@ -266,7 +266,7 @@ export default function App() {
     if (!current) return;
     const color = DEFAULT_COLOR[preset];
     const viewBackgroundColor = preset === "blackboard" ? "transparent" : color;
-    const elements = recolorDefaultElements(
+    const elements = recolorForBackgroundPreset(
       current.document.elements,
       current.document.canvas.background.preset,
       preset,

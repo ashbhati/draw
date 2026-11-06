@@ -291,6 +291,7 @@ test("background changes recolor Draw defaults, preserve custom colors, and undo
       nodes: [
         { id: "default", label: "Default color", x: 100, y: 100 },
         { id: "custom", label: "Custom color", x: 340, y: 100, color: "#ff00cc" },
+        { id: "accent", label: "Yellow accent", x: 580, y: 100, color: "#f2d27a" },
       ],
       edges: [],
     },
@@ -303,9 +304,11 @@ test("background changes recolor Draw defaults, preserve custom colors, and undo
     const title = current.document.elements.find((element: any) => element.id === created.result.titleElementId);
     const defaultNode = current.document.elements.find((element: any) => element.id === created.result.nodes.default);
     const customNode = current.document.elements.find((element: any) => element.id === created.result.nodes.custom);
-    return title?.strokeColor === "#1e1e1e" && defaultNode?.strokeColor === "#1e1e1e" && defaultNode?.backgroundColor === "#ffffff" && customNode?.strokeColor === "#ff00cc";
+    const accent = current.document.elements.find((element: any) => element.id === created.result.nodes.accent);
+    return title?.strokeColor === "#1e1e1e" && defaultNode?.strokeColor === "#1e1e1e" && defaultNode?.backgroundColor === "#ffffff" && customNode?.strokeColor === "#ff00cc" && accent?.strokeColor === "#8a6418";
   }).toBe(true);
   expect(contrastRatio("#1e1e1e", "#ffffff")).toBeGreaterThanOrEqual(4.5);
+  expect(contrastRatio("#8a6418", "#ffffff")).toBeGreaterThanOrEqual(4.5);
 
   await page.getByRole("button", { name: "Undo" }).click();
   await expect.poll(async () => {
@@ -315,6 +318,10 @@ test("background changes recolor Draw defaults, preserve custom colors, and undo
   }).toBe(true);
   await page.getByRole("button", { name: "Redo" }).click();
   await expect.poll(async () => (await currentBridgeDocument(page)).document.canvas.background.preset).toBe("white");
+  await expect.poll(async () => {
+    const current = await currentBridgeDocument(page);
+    return current.document.elements.find((element: any) => element.id === created.result.nodes.accent)?.strokeColor;
+  }).toBe("#8a6418");
 
   const whiteNodeResponse = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
@@ -335,6 +342,10 @@ test("background changes recolor Draw defaults, preserve custom colors, and undo
   await page.getByRole("button", { name: "White" }).click();
   const custom = await currentBridgeDocument(page);
   expect(custom.document.elements.find((element: any) => element.id === created.result.nodes.custom)?.strokeColor).toBe("#ff00cc");
+  await expect.poll(async () => {
+    const current = await currentBridgeDocument(page);
+    return current.document.elements.find((element: any) => element.id === created.result.nodes.accent)?.strokeColor;
+  }).toBe("#8a6418");
 });
 
 test("blackboard background survives reload and is present in PNG and JPEG exports", async ({ page }) => {
@@ -480,6 +491,123 @@ test("long MCP labels fit inside ellipse and diamond outlines and reroute connec
     if (shape.type === "ellipse") expect((dx / (shape.width / 2)) ** 2 + (dy / (shape.height / 2)) ** 2).toBeCloseTo(1, 2);
     else expect(Math.abs(dx) / (shape.width / 2) + Math.abs(dy) / (shape.height / 2)).toBeCloseTo(1, 2);
   }
+});
+
+test("routes a feedback edge around the middle node and keeps its label clear after node growth", async ({ page }) => {
+  const create = await page.request.post(commandApi, { data: {
+    operation: "create_diagram",
+    input: {
+      title: "Specification → Validation",
+      nodes: [
+        { id: "spec", label: "Specification\nWhat & Why", x: 40, y: 120, width: 190, height: 82 },
+        { id: "implementation", label: "Implementation\nHow", x: 290, y: 120, width: 190, height: 82, color: "#f2d27a" },
+        { id: "validation", label: "Validation\nDid it work?", x: 540, y: 120, width: 190, height: 82 },
+      ],
+      edges: [
+        { from: "spec", to: "implementation" },
+        { from: "implementation", to: "validation" },
+        { from: "validation", to: "spec", label: "no: revise" },
+      ],
+    },
+  } });
+  expect(create.ok(), await create.text()).toBeTruthy();
+  const created = await create.json();
+  const assertBackEdgeClear = async () => {
+    const current = await freshBridgeDocument(page);
+    const arrow = current.document.elements.find((element: any) =>
+      element.type === "arrow" && element.startBinding?.elementId === created.result.nodes.validation && element.endBinding?.elementId === created.result.nodes.spec,
+    );
+    const middle = current.document.elements.find((element: any) => element.id === created.result.nodes.implementation);
+    const middleLabel = current.document.elements.find((element: any) => element.containerId === middle.id);
+    const edgeLabel = current.document.elements.find((element: any) => element.containerId === arrow.id);
+    expect(arrow.points.length).toBeGreaterThan(2);
+    const points = arrow.points.map(([x, y]: number[]) => [arrow.x + x, arrow.y + y]);
+    const bounds = { left: middle.x - 8, right: middle.x + middle.width + 8, top: middle.y - 8, bottom: middle.y + middle.height + 8 };
+    const intersects = (a: number[], b: number[]) => {
+      const dx = b[0] - a[0]; const dy = b[1] - a[1];
+      let low = 0; let high = 1;
+      for (const [p, q] of [[-dx, a[0] - bounds.left], [dx, bounds.right - a[0]], [-dy, a[1] - bounds.top], [dy, bounds.bottom - a[1]]]) {
+        if (Math.abs(p) < 0.001) { if (q < 0) return false; continue; }
+        const ratio = q / p;
+        if (p < 0) low = Math.max(low, ratio); else high = Math.min(high, ratio);
+        if (low > high) return false;
+      }
+      return true;
+    };
+    for (let index = 1; index < points.length; index += 1) expect(intersects(points[index - 1], points[index])).toBe(false);
+    const overlap = (left: number, right: number, top: number, bottom: number, other: any) =>
+      left < other.x + other.width && right > other.x && top < other.y + other.height && bottom > other.y;
+    expect(overlap(edgeLabel.x, edgeLabel.x + edgeLabel.width, edgeLabel.y, edgeLabel.y + edgeLabel.height, middle)).toBe(false);
+    expect(overlap(edgeLabel.x, edgeLabel.x + edgeLabel.width, edgeLabel.y, edgeLabel.y + edgeLabel.height, middleLabel)).toBe(false);
+    return current;
+  };
+  await assertBackEdgeClear();
+  const longUpdate = await page.request.post(commandApi, { data: {
+    operation: "update_elements",
+    input: { updates: [{ id: created.result.nodes.implementation, patch: { text: "Implementation\nHow we build and validate the intended outcome" } }] },
+  } });
+  expect(longUpdate.ok(), await longUpdate.text()).toBeTruthy();
+  await assertBackEdgeClear();
+});
+
+test("the supplied reference fixture keeps chalk, layout, and editable nodes after a .draw round trip", async ({ page }) => {
+  const reference = await readFile("tests/fixtures/specification-implementation-validation.draw");
+  page.on("dialog", (dialog) => dialog.accept());
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "specification-implementation-validation.draw",
+    mimeType: "application/vnd.draw+json",
+    buffer: reference,
+  });
+  await expect.poll(async () => (await freshBridgeDocument(page)).document.elements.filter((element: any) => ["rectangle", "ellipse", "diamond"].includes(element.type)).length).toBe(3);
+  const initial = await freshBridgeDocument(page);
+  expect(initial.document.canvas.background.preset).toBe("blackboard");
+  const nodes = initial.document.elements.filter((element: any) => ["rectangle", "ellipse", "diamond"].includes(element.type));
+  expect(nodes).toHaveLength(3);
+  const labels = initial.document.elements.filter((element: any) => element.type === "text" && nodes.some((node: any) => node.id === element.containerId));
+  expect(labels).toHaveLength(3);
+  for (const label of labels) {
+    const container = initial.document.elements.find((element: any) => element.id === label.containerId);
+    expect(label.x).toBeGreaterThanOrEqual(container.x);
+    expect(label.y).toBeGreaterThanOrEqual(container.y);
+    expect(label.x + label.width).toBeLessThanOrEqual(container.x + container.width);
+    expect(label.y + label.height).toBeLessThanOrEqual(container.y + container.height);
+    expect(contrastRatio(label.strokeColor, "#18191a")).toBeGreaterThanOrEqual(4.5);
+  }
+  for (const label of initial.document.elements.filter((element: any) => element.type === "text")) {
+    expect(contrastRatio(label.strokeColor, "#18191a")).toBeGreaterThanOrEqual(4.5);
+  }
+  const emphasizedNode = nodes.find((element: any) => element.strokeColor === "#f2d27a");
+  expect(emphasizedNode).toBeTruthy();
+  const emphasizedLabel = labels.find((element: any) => element.containerId === emphasizedNode.id);
+  expect(contrastRatio(emphasizedLabel.strokeColor, "#18191a")).toBeGreaterThanOrEqual(4.5);
+  const feedback = initial.document.elements.find((element: any) => element.type === "arrow" && element.points.length > 2);
+  expect(feedback).toBeTruthy();
+  const middle = nodes.find((element: any) => element.id !== feedback.startBinding.elementId && element.id !== feedback.endBinding.elementId);
+  const points = feedback.points.map(([x, y]: number[]) => [feedback.x + x, feedback.y + y]);
+  for (let index = 1; index < points.length; index += 1) {
+    const [x1, y1] = points[index - 1]; const [x2, y2] = points[index];
+    const crossesMiddle = Math.abs(x1 - x2) < 0.001
+      ? x1 > middle.x && x1 < middle.x + middle.width && Math.max(y1, y2) > middle.y && Math.min(y1, y2) < middle.y + middle.height
+      : Math.min(x1, x2) < middle.x + middle.width && Math.max(x1, x2) > middle.x && Math.abs(y1 - y2) < 0.001 && y1 > middle.y && y1 < middle.y + middle.height;
+    expect(crossesMiddle).toBe(false);
+  }
+
+  const downloadWait = page.waitForEvent("download");
+  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  const savedFile = await readFile(await (await downloadWait).path());
+  const saveJson = JSON.parse(savedFile.toString("utf8"));
+  await page.locator('input[type="file"]').setInputFiles({ name: "reference-roundtrip.draw", mimeType: "application/vnd.draw+json", buffer: savedFile });
+  const reopened = await freshBridgeDocument(page);
+  expect(reopened.document.canvas.background.preset).toBe("blackboard");
+  for (const node of nodes) {
+    const canvas = page.locator(".excalidraw canvas").last();
+    const bounds = await canvas.boundingBox();
+    if (!bounds) throw new Error("Could not locate the drawing canvas.");
+    await page.mouse.click(bounds.x + node.x + node.width / 2, bounds.y + node.y + node.height / 2);
+    await expect.poll(async () => (await freshBridgeDocument(page)).document.appState.selectedElementIds?.[node.id]).toBe(true);
+  }
+  expect(saveJson.document.elements.filter((element: any) => element.type === "rectangle")).toHaveLength(3);
+  expect(saveJson.document.elements.some((element: any) => element.type === "arrow" && element.points.length > 2)).toBe(true);
 });
 
 test("embedded image assets survive autosave and editable Draw save/reopen", async ({ page }) => {

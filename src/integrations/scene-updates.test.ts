@@ -102,6 +102,56 @@ describe("MCP scene updates", () => {
     expect((arrow.x ?? 0) + arrow.points![arrow.points!.length - 1][0]).toBeCloseTo(240);
   });
 
+  it("routes a back edge around an intermediate node and keeps its label clear", () => {
+    const scene = [
+      { id: "spec", type: "rectangle", x: 40, y: 120, width: 190, height: 82 },
+      { id: "spec-label", type: "text", x: 55, y: 145, width: 160, height: 32, text: "Specification", containerId: "spec" },
+      { id: "implementation", type: "rectangle", x: 290, y: 120, width: 190, height: 82 },
+      { id: "implementation-label", type: "text", x: 300, y: 145, width: 170, height: 32, text: "Implementation\nHow", containerId: "implementation" },
+      { id: "validation", type: "rectangle", x: 540, y: 120, width: 190, height: 82 },
+      { id: "validation-label", type: "text", x: 555, y: 145, width: 160, height: 32, text: "Validation", containerId: "validation" },
+      { id: "feedback", type: "arrow", x: 635, y: 161, width: 500, height: 0, points: [[0, 0], [-500, 0]], startBinding: { elementId: "validation" }, endBinding: { elementId: "spec" } },
+      { id: "feedback-label", type: "text", x: 405, y: 140, width: 100, height: 24, text: "no: revise", containerId: "feedback" },
+    ];
+
+    const routed = routeBoundArrows(scene);
+    const arrow = routed.find((element) => element.id === "feedback")!;
+    const absolutePoints = arrow.points!.map(([x, y]) => [(arrow.x ?? 0) + x, (arrow.y ?? 0) + y]);
+    const label = routed.find((element) => element.id === "feedback-label")!;
+    const middle = routed.find((element) => element.id === "implementation")!;
+    const overlaps = (a: { left: number; right: number; top: number; bottom: number }, b: { left: number; right: number; top: number; bottom: number }) =>
+      a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+    const middleBounds = { left: middle.x!, right: middle.x! + middle.width!, top: middle.y!, bottom: middle.y! + middle.height! };
+    for (let index = 1; index < absolutePoints.length; index += 1) {
+      const [x1, y1] = absolutePoints[index - 1];
+      const [x2, y2] = absolutePoints[index];
+      const crosses = Math.abs(x1 - x2) < 0.001
+        ? x1 > middleBounds.left && x1 < middleBounds.right && Math.max(y1, y2) > middleBounds.top && Math.min(y1, y2) < middleBounds.bottom
+        : Math.min(x1, x2) < middleBounds.right && Math.max(x1, x2) > middleBounds.left && Math.abs(y1 - y2) < 0.001 && y1 > middleBounds.top && y1 < middleBounds.bottom;
+      expect(crosses).toBe(false);
+    }
+    expect(overlaps(
+      { left: label.x!, right: label.x! + label.width!, top: label.y!, bottom: label.y! + label.height! },
+      { left: 300, right: 470, top: 145, bottom: 177 },
+    )).toBe(false);
+    expect(arrow.points!.length).toBeGreaterThan(2);
+  });
+
+  it("reroutes a feedback edge after update_elements changes node geometry", () => {
+    const scene = [
+      { id: "spec", type: "rectangle", x: 40, y: 120, width: 190, height: 82 },
+      { id: "implementation", type: "rectangle", x: 290, y: 120, width: 190, height: 82 },
+      { id: "validation", type: "rectangle", x: 540, y: 120, width: 190, height: 82 },
+      { id: "feedback", type: "arrow", x: 635, y: 161, width: 500, height: 0, points: [[0, 0], [-500, 0]], startBinding: { elementId: "validation" }, endBinding: { elementId: "spec" } },
+    ];
+    const result = applyElementUpdates(scene, [{ id: "implementation", patch: { height: 150 } }]);
+    const arrow = result.elements.find((element) => element.id === "feedback")!;
+    const localYValues = arrow.points!.map(([, y]) => y + (arrow.y ?? 0));
+    const implementation = result.elements.find((element) => element.id === "implementation")!;
+    expect(localYValues.some((y) => y < implementation.y! || y > implementation.y! + implementation.height!)).toBe(true);
+    expect(result.updatedIds).toContain("feedback");
+  });
+
   it("rejects points patches because linear geometry needs endpoint-aware rescaling", () => {
     const scene = [{ id: "arrow", type: "arrow", x: 0, y: 0, width: 100, height: 0, points: [[0, 0], [100, 0]] }];
     expect(() => applyElementUpdates(scene, [{ id: "arrow", patch: { points: [[0, 0], [200, 0]] } } as never])).toThrow(/points.*unsupported|unsupported.*points/i);

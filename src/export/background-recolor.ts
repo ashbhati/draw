@@ -8,9 +8,13 @@ const BACKGROUND: Record<DrawBackgroundPreset, string> = {
   blackboard: "#18191a",
   white: "#ffffff",
 };
+const ACCENTS: Record<DrawBackgroundPreset, Record<string, string>> = {
+  blackboard: { "#f2d27a": "#8a6418" },
+  white: { "#8a6418": "#f2d27a" },
+};
 
-/** Adapt only Draw's default foreground/fill colors; preserve custom colors. */
-export function recolorDefaultElements<T extends Record<string, unknown>>(
+/** Adapt Draw's defaults and its V1 yellow accent; preserve other custom colors. */
+export function recolorForBackgroundPreset<T extends Record<string, unknown>>(
   elements: readonly T[],
   from: DrawBackgroundPreset,
   to: DrawBackgroundPreset,
@@ -19,7 +23,16 @@ export function recolorDefaultElements<T extends Record<string, unknown>>(
   return elements.map((element) => {
     const next = {
       ...element,
-      ...(element.strokeColor === FOREGROUND[from] ? { strokeColor: FOREGROUND[to] } : {}),
+      ...(element.strokeColor === FOREGROUND[from]
+        ? { strokeColor: FOREGROUND[to] }
+        : typeof element.strokeColor === "string" && ACCENTS[from][element.strokeColor]
+          ? { strokeColor: ACCENTS[from][element.strokeColor] }
+          : {}),
+      ...(element.backgroundColor === FOREGROUND[from]
+        ? { backgroundColor: FOREGROUND[to] }
+        : typeof element.backgroundColor === "string" && ACCENTS[from][element.backgroundColor]
+          ? { backgroundColor: ACCENTS[from][element.backgroundColor] }
+          : {}),
       ...(element.backgroundColor === BACKGROUND[from] ? { backgroundColor: BACKGROUND[to] } : {}),
     };
     if (next.strokeColor === element.strokeColor && next.backgroundColor === element.backgroundColor) return next;

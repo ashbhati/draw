@@ -257,6 +257,128 @@ function repositionBoundArrowLabels(
   }
 }
 
+function segmentIntersectsBounds(
+  start: [number, number],
+  end: [number, number],
+  bounds: { left: number; right: number; top: number; bottom: number },
+): boolean {
+  const dx = end[0] - start[0];
+  const dy = end[1] - start[1];
+  let low = 0;
+  let high = 1;
+  const clips: Array<[number, number]> = [
+    [-dx, start[0] - bounds.left], [dx, bounds.right - start[0]],
+    [-dy, start[1] - bounds.top], [dy, bounds.bottom - start[1]],
+  ];
+  for (const [p, q] of clips) {
+    if (Math.abs(p) < 0.001) {
+      if (q < 0) return false;
+      continue;
+    }
+    const ratio = q / p;
+    if (p < 0) low = Math.max(low, ratio);
+    else high = Math.min(high, ratio);
+    if (low > high) return false;
+  }
+  return true;
+}
+
+function routeObstructedArrows(elements: EditableSceneElement[]): Set<string> {
+  const updated = new Set<string>();
+  const shapes = elements.filter((element) => !element.isDeleted && ["rectangle", "ellipse", "diamond"].includes(element.type));
+  const textObstacles = elements.filter((element) => !element.isDeleted && element.type === "text");
+  const boxesOverlap = (
+    first: { left: number; right: number; top: number; bottom: number },
+    second: { left: number; right: number; top: number; bottom: number },
+  ) => first.left < second.right && first.right > second.left && first.top < second.bottom && first.bottom > second.top;
+  const boundsFor = (element: EditableSceneElement, margin = 0) => ({
+    left: (element.x ?? 0) - margin,
+    right: (element.x ?? 0) + (element.width ?? 0) + margin,
+    top: (element.y ?? 0) - margin,
+    bottom: (element.y ?? 0) + (element.height ?? 0) + margin,
+  });
+
+  for (let arrowIndex = 0; arrowIndex < elements.length; arrowIndex += 1) {
+    const arrow = elements[arrowIndex];
+    if (arrow.type !== "arrow" || !Array.isArray(arrow.points) || arrow.points.length < 2) continue;
+    const startId = arrow.startBinding?.elementId;
+    const endId = arrow.endBinding?.elementId;
+    if (!startId || !endId) continue;
+    const startShape = shapes.find((element) => element.id === startId);
+    const endShape = shapes.find((element) => element.id === endId);
+    if (!startShape || !endShape) continue;
+    const obstacles = shapes.filter((element) => element.id !== startId && element.id !== endId);
+    const currentPoints = arrow.points.map(([x, y]) => [(arrow.x ?? 0) + x, (arrow.y ?? 0) + y] as [number, number]);
+    const isBlocked = obstacles.some((obstacle) => {
+      const bounds = boundsFor(obstacle, 8);
+      return currentPoints.slice(1).some((point, index) => segmentIntersectsBounds(currentPoints[index], point, bounds));
+    });
+    if (!isBlocked) continue;
+
+    const startCenter = center(startShape);
+    const endCenter = center(endShape);
+    const allY = shapes.flatMap((element) => [element.y ?? 0, (element.y ?? 0) + (element.height ?? 0)]);
+    const minY = Math.min(...allY);
+    const maxY = Math.max(...allY);
+    const lanes = [
+      ...[48, 72, 96, 120, 144, 168].map((offset) => minY - offset),
+      ...[48, 72, 96, 120, 144, 168].map((offset) => maxY + offset),
+    ];
+    const arrowLabel = elements.find((element) => element.containerId === arrow.id && !element.isDeleted);
+    const labelWidth = arrowLabel?.width ?? 0;
+    const labelHeight = arrowLabel?.height ?? 0;
+    const labelsToAvoid = textObstacles.filter((element) => element.id !== arrowLabel?.id);
+    const route = lanes.map((lane) => {
+      const start = getBoundaryPoint(startShape, [startCenter[0], lane]);
+      const end = getBoundaryPoint(endShape, [endCenter[0], lane]);
+      const points: [number, number][] = [start, [start[0], lane], [end[0], lane], end];
+      const pathClear = obstacles.every((obstacle) => {
+        const bounds = boundsFor(obstacle, 8);
+        return points.slice(1).every((point, index) => !segmentIntersectsBounds(points[index], point, bounds));
+      }) && textObstacles.filter((element) => element.id !== arrowLabel?.id).every((obstacle) => {
+        const bounds = boundsFor(obstacle, 4);
+        return points.slice(1).every((point, index) => !segmentIntersectsBounds(points[index], point, bounds));
+      });
+      const labelBounds = {
+        left: (start[0] + end[0]) / 2 - labelWidth / 2,
+        right: (start[0] + end[0]) / 2 + labelWidth / 2,
+        top: lane - labelHeight - 8,
+        bottom: lane - 8,
+      };
+      const labelClear = !arrowLabel || [...shapes.filter((element) => element.id !== startId && element.id !== endId), ...labelsToAvoid]
+        .every((element) => !boxesOverlap(labelBounds, boundsFor(element, 4)));
+      return { lane, points, clear: pathClear && labelClear };
+    }).find((candidate) => candidate.clear) ?? (() => {
+      const lane = minY - 96;
+      const start = getBoundaryPoint(startShape, [startCenter[0], lane]);
+      const end = getBoundaryPoint(endShape, [endCenter[0], lane]);
+      return { lane, points: [start, [start[0], lane], [end[0], lane], end] as [number, number][], clear: false };
+    })();
+
+    const minX = Math.min(...route.points.map(([x]) => x));
+    const minRouteY = Math.min(...route.points.map(([, y]) => y));
+    const maxX = Math.max(...route.points.map(([x]) => x));
+    const maxRouteY = Math.max(...route.points.map(([, y]) => y));
+    elements[arrowIndex] = touch(arrow, {
+      x: minX,
+      y: minRouteY,
+      width: maxX - minX,
+      height: maxRouteY - minRouteY,
+      points: route.points.map(([x, y]) => [x - minX, y - minRouteY]),
+    });
+    updated.add(arrow.id);
+    if (arrowLabel) {
+      const labelIndex = elements.findIndex((element) => element.id === arrowLabel.id);
+      elements[labelIndex] = touch(arrowLabel, {
+        x: (route.points[1][0] + route.points[2][0]) / 2 - labelWidth / 2,
+        y: route.lane - labelHeight - 8,
+      });
+      updated.add(arrowLabel.id);
+    }
+  }
+  return updated;
+}
+
 /** Recompute the endpoints of converted MCP arrows against their bound shapes. */
 export function routeBoundArrows(scene: readonly EditableSceneElement[]): EditableSceneElement[] {
   const elements = scene.map((element) => ({ ...element }));
@@ -271,6 +393,7 @@ export function routeBoundArrows(scene: readonly EditableSceneElement[]): Editab
       (changedShapes.has(element.startBinding?.elementId ?? "") || changedShapes.has(element.endBinding?.elementId ?? "")))
     .map((element) => element.id));
   repositionBoundArrowLabels(elements, updatedIds);
+  for (const id of routeObstructedArrows(elements)) updatedIds.add(id);
   return elements;
 }
 
@@ -338,5 +461,7 @@ export function applyElementUpdates(
     }
   }
   repositionBoundArrowLabels(elements, updatedIds);
+  const reroutedIds = routeObstructedArrows(elements);
+  for (const id of reroutedIds) updatedIds.add(id);
   return { elements, updatedIds: [...updatedIds] };
 }
