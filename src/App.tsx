@@ -42,6 +42,13 @@ function measureTextWithExcalidraw(text: string, fontSize: number, element: Edit
   return { width: measured.width as number, height: measured.height as number };
 }
 
+function renderedTextWidth(text: string, fontSize: number): number {
+  const context = document.createElement("canvas").getContext("2d");
+  if (!context) return 0;
+  context.font = `${fontSize}px Excalifont`;
+  return Math.max(...text.split("\n").map((line) => context.measureText(line).width));
+}
+
 function download(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -308,9 +315,31 @@ export default function App() {
       let result: Record<string, unknown>;
       if (event.operation === "create_diagram") {
         const built = buildDiagramSkeletons(event.input, current.document.canvas.background.preset, randomId);
+        const textSkeletons = built.skeletons.flatMap((skeleton) => {
+          const nestedLabel = skeleton.label && typeof skeleton.label === "object" ? [skeleton.label as Record<string, unknown>] : [];
+          return [skeleton, ...nestedLabel].filter((candidate) => typeof candidate.text === "string");
+        });
+        await Promise.all(textSkeletons.map((skeleton) => {
+          const fontSize = typeof skeleton.fontSize === "number" ? skeleton.fontSize : 20;
+          return document.fonts.load(`${fontSize}px Excalifont`, skeleton.text as string);
+        }));
+        await document.fonts.ready;
+        const measuredSkeletons = built.skeletons.map((skeleton) => {
+          const measured = { ...skeleton };
+          if (measured.type === "text") measured.fontFamily = FONT_FAMILY.Excalifont;
+          if (measured.label && typeof measured.label === "object") {
+            measured.label = { ...(measured.label as Record<string, unknown>), fontFamily: FONT_FAMILY.Excalifont };
+          }
+          return measured;
+        });
         // Keep the IDs minted by Draw so the MCP result can reliably map the
         // caller's node and edge IDs back to editable scene elements.
-        const created = convertToExcalidrawElements(built.skeletons as any[], { regenerateIds: false });
+        const created = convertToExcalidrawElements(measuredSkeletons as any[], { regenerateIds: false });
+        for (const element of created as any[]) {
+          if (element.type !== "text" || element.containerId || typeof element.text !== "string") continue;
+          const size = typeof element.fontSize === "number" ? element.fontSize : 20;
+          element.width = Math.max(element.width ?? 0, Math.ceil(renderedTextWidth(element.text, size)) + 2);
+        }
         const labelIds = new Map<string, string>();
         for (const element of created as any[]) {
           if (element.type === "text" && element.containerId) labelIds.set(element.containerId, element.id);

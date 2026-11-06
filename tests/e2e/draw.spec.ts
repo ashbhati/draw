@@ -179,6 +179,34 @@ test("MCP create and update stay editable through save, reload, open, and image 
   }).toBe(true);
 });
 
+test("MCP diagram titles reserve at least their live Excalifont text width", async ({ page }) => {
+  const title = "Specification → Implementation → Validation";
+  const response = await page.request.post(commandApi, { data: {
+    operation: "create_diagram",
+    input: {
+      title,
+      nodes: [
+        { id: "spec", label: "Specification\nWhat & Why", x: 280, y: 150, width: 190, height: 82 },
+        { id: "implementation", label: "Implementation\nHow", x: 530, y: 150, width: 190, height: 82, color: "#f2d27a" },
+        { id: "validation", label: "Validation\nDid it work?", x: 780, y: 150, width: 190, height: 82 },
+      ],
+      edges: [{ from: "spec", to: "implementation" }, { from: "implementation", to: "validation" }],
+    },
+  } });
+  expect(response.ok(), await response.text()).toBeTruthy();
+  const current = await freshBridgeDocument(page);
+  const titleElement = current.document.elements.find((element: any) => element.type === "text" && !element.containerId && element.text === title);
+  const renderedWidth = await page.evaluate(async (value) => {
+    await document.fonts.load("20px Excalifont", value);
+    const context = document.createElement("canvas").getContext("2d");
+    if (!context) throw new Error("Canvas text measurement is unavailable.");
+    context.font = "20px Excalifont";
+    return context.measureText(value).width;
+  }, title);
+  expect(titleElement.fontFamily).toBe(5);
+  expect(titleElement.width).toBeGreaterThanOrEqual(renderedWidth);
+});
+
 test("malformed .draw files leave the current canvas and local autosave untouched", async ({ page }) => {
   const create = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
@@ -572,6 +600,14 @@ test("the supplied reference fixture keeps chalk, layout, and editable nodes aft
     expect(label.x + label.width).toBeLessThanOrEqual(container.x + container.width);
     expect(label.y + label.height).toBeLessThanOrEqual(container.y + container.height);
     expect(contrastRatio(label.strokeColor, "#18191a")).toBeGreaterThanOrEqual(4.5);
+    const renderedWidth = await page.evaluate(async ({ text, fontSize }) => {
+      await document.fonts.load(`${fontSize}px Excalifont`, text);
+      const context = document.createElement("canvas").getContext("2d");
+      if (!context) throw new Error("Canvas text measurement is unavailable.");
+      context.font = `${fontSize}px Excalifont`;
+      return Math.max(...text.split("\n").map((line) => context.measureText(line).width));
+    }, { text: label.text, fontSize: label.fontSize });
+    expect(label.width).toBeGreaterThanOrEqual(renderedWidth);
   }
   for (const label of initial.document.elements.filter((element: any) => element.type === "text")) {
     expect(contrastRatio(label.strokeColor, "#18191a")).toBeGreaterThanOrEqual(4.5);
