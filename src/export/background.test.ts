@@ -34,6 +34,8 @@ describe("export background composition", () => {
     const result = composeBackgroundSvg(svg, "blackboard");
     expect(result.indexOf('data-draw-background="blackboard"')).toBeLessThan(result.indexOf('id="scene"'));
     expect(result).toContain("feTurbulence");
+    expect(result).toContain('tableValues="0 0.06"');
+    expect(result).toContain('opacity=".035"');
     expect(result).toContain('fill="#18191a"');
     expect(result).toContain('id="scene"');
   });
