@@ -1013,3 +1013,13 @@ test("selection-only export is disabled when nothing is selected", async ({ page
   await page.getByLabel("Export scope").selectOption("selection");
   await expect(page.getByRole("button", { name: "Export" })).toBeDisabled();
 });
+
+test("selection-only export reports an empty selection when the image format changes without downloading", async ({ page }) => {
+  await page.getByLabel("Export scope").selectOption("selection");
+  await expect(page.getByRole("button", { name: "Export" })).toBeDisabled();
+
+  const unexpectedDownload = page.waitForEvent("download", { timeout: 1200 }).then(() => true, () => false);
+  await page.getByLabel("Image export format").selectOption("image/jpeg");
+  await expect(page.getByRole("status")).toContainText("Select one or more objects to export a selection");
+  expect(await unexpectedDownload).toBe(false);
+});
