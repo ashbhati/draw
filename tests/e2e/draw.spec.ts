@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 import { readFile } from "node:fs/promises";
+import { isSameOriginURL } from "./config";
 
 const documentApi = "/__draw/api/document";
 const commandApi = "/__draw/api/commands";
@@ -676,10 +677,11 @@ test("loads fonts and exports the hand-drawn scene without network access", asyn
     const url = request.url();
     if (url.includes("/fonts/Excalifont/")) localFontRequests.push(url);
     if (url.includes("/fonts/Xiaolai/")) cjkFontRequests.push(url);
-    if (url.startsWith("http") && !url.startsWith(localOrigin)) externalRequests.push(url);
+    if (url.startsWith("http") && !isSameOriginURL(url, localOrigin)) externalRequests.push(url);
   });
   await page.route("**/*", (route) => {
-    if (route.request().url().startsWith(localOrigin)) return route.continue();
+    const requestURL = route.request().url();
+    if (requestURL.startsWith("data:") || isSameOriginURL(requestURL, localOrigin)) return route.continue();
     return route.abort();
   });
   await waitForBridge(page);
@@ -701,8 +703,8 @@ test("loads fonts and exports the hand-drawn scene without network access", asyn
   expect(await countWarmImagePixels(page, image), "the exported diagram includes visible yellow diagram pixels").toBeGreaterThan(40);
   expect(await countPixelsNear(page, image, [24, 25, 26], 8), "the export includes its charcoal board background").toBeGreaterThan(1_000);
   expect(externalRequests).toEqual([]);
-  expect(localFontRequests.every((url) => url.startsWith(`${localOrigin}/fonts/`))).toBe(true);
-  expect(cjkFontRequests.every((url) => url.startsWith(`${localOrigin}/fonts/`))).toBe(true);
+  expect(localFontRequests.every((url) => isSameOriginURL(url, localOrigin))).toBe(true);
+  expect(cjkFontRequests.every((url) => isSameOriginURL(url, localOrigin))).toBe(true);
 });
 
 test("background changes recolor Draw defaults, preserve custom colors, and undo and redo", async ({ page }) => {

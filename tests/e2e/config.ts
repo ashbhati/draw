@@ -44,6 +44,17 @@ export function createE2EServerConfig(
   };
 }
 
+export function isSameOriginURL(candidateURL: string, expectedOrigin: string): boolean {
+  try {
+    const candidate = new URL(candidateURL);
+    const expected = new URL(expectedOrigin);
+    if (candidate.protocol === "data:" || !["http:", "https:"].includes(expected.protocol)) return false;
+    return candidate.origin === expected.origin;
+  } catch {
+    return false;
+  }
+}
+
 async function findAvailablePort(): Promise<number> {
   const server = createServer();
   await new Promise<void>((resolve, reject) => {

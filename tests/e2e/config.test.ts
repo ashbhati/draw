@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createServer } from "node:net";
-import { createE2EServerConfig, resolveAndStoreE2EBaseURL, resolveE2EBaseURL } from "./config";
+import { createE2EServerConfig, isSameOriginURL, resolveAndStoreE2EBaseURL, resolveE2EBaseURL } from "./config";
 
 describe("Playwright E2E server configuration", () => {
   it("chooses an ephemeral default URL and accepts an explicit per-run loopback URL", async () => {
@@ -51,5 +51,20 @@ describe("Playwright E2E server configuration", () => {
       if (previous === undefined) delete process.env.DRAW_E2E_REUSE_SERVER;
       else process.env.DRAW_E2E_REUSE_SERVER = previous;
     }
+  });
+
+  it("matches exact parsed origins instead of port prefixes", () => {
+    const origin = "http://127.0.0.1:5197";
+    expect(isSameOriginURL(`${origin}/fonts/Excalifont/font.woff2`, origin)).toBe(true);
+    expect(isSameOriginURL("http://127.0.0.1:51970/fonts/Excalifont/font.woff2", origin)).toBe(false);
+  });
+
+  it("handles data and blob URLs without throwing or accepting foreign origins", () => {
+    const origin = "http://127.0.0.1:5197";
+    expect(isSameOriginURL("data:font/woff2;base64,AA==", origin)).toBe(false);
+    expect(isSameOriginURL("blob:http://127.0.0.1:5197/9e34", origin)).toBe(true);
+    expect(isSameOriginURL("blob:http://127.0.0.1:51970/9e34", origin)).toBe(false);
+    expect(isSameOriginURL("blob:null/9e34", origin)).toBe(false);
+    expect(isSameOriginURL("not a URL", origin)).toBe(false);
   });
 });
