@@ -147,6 +147,28 @@ function maxChannelDifference(a: readonly number[], b: readonly number[]): numbe
   return Math.max(...a.map((channel, index) => Math.abs(channel - b[index])));
 }
 
+async function inspectImagePixels(page: Page, image: Buffer, mimeType: "image/png" | "image/jpeg") {
+  return page.evaluate(async ({ bytes, type }) => {
+    const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type }));
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Could not inspect exported image pixels.");
+    context.drawImage(bitmap, 0, 0);
+    const data = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    let whiteInkPixels = 0;
+    let darkInkPixels = 0;
+    let greenAssetPixels = 0;
+    for (let index = 0; index < data.length; index += 4) {
+      if (data[index] > 205 && data[index + 1] > 195 && data[index + 2] > 180) whiteInkPixels += 1;
+      if (data[index] < 65 && data[index + 1] < 65 && data[index + 2] < 65) darkInkPixels += 1;
+      if (data[index + 1] > 170 && data[index] < 80 && data[index + 2] < 180) greenAssetPixels += 1;
+    }
+    return { width: canvas.width, height: canvas.height, whiteInkPixels, darkInkPixels, greenAssetPixels };
+  }, { bytes: Array.from(image), type: mimeType });
+}
+
 test.beforeEach(async ({ page }) => {
   await waitForBridge(page);
   await page.locator(".excalidraw canvas").first().waitFor();
@@ -486,14 +508,15 @@ test("loads fonts and exports the hand-drawn scene without network access", asyn
   const externalRequests: string[] = [];
   const localFontRequests: string[] = [];
   const cjkFontRequests: string[] = [];
+  const localOrigin = new URL(page.url()).origin;
   page.on("request", (request) => {
     const url = request.url();
     if (url.includes("/fonts/Excalifont/")) localFontRequests.push(url);
     if (url.includes("/fonts/Xiaolai/")) cjkFontRequests.push(url);
-    if (url.startsWith("http") && !url.startsWith("http://127.0.0.1:5181")) externalRequests.push(url);
+    if (url.startsWith("http") && !url.startsWith(localOrigin)) externalRequests.push(url);
   });
   await page.route("**/*", (route) => {
-    if (route.request().url().startsWith("http://127.0.0.1:5181")) return route.continue();
+    if (route.request().url().startsWith(localOrigin)) return route.continue();
     return route.abort();
   });
   await waitForBridge(page);
@@ -515,8 +538,8 @@ test("loads fonts and exports the hand-drawn scene without network access", asyn
   expect(await countWarmImagePixels(page, image), "the exported diagram includes visible yellow diagram pixels").toBeGreaterThan(40);
   expect(await countPixelsNear(page, image, [24, 25, 26], 8), "the export includes its charcoal board background").toBeGreaterThan(1_000);
   expect(externalRequests).toEqual([]);
-  expect(localFontRequests.every((url) => url.startsWith("http://127.0.0.1:5181/fonts/"))).toBe(true);
-  expect(cjkFontRequests.every((url) => url.startsWith("http://127.0.0.1:5181/fonts/"))).toBe(true);
+  expect(localFontRequests.every((url) => url.startsWith(`${localOrigin}/fonts/`))).toBe(true);
+  expect(cjkFontRequests.every((url) => url.startsWith(`${localOrigin}/fonts/`))).toBe(true);
 });
 
 test("background changes recolor Draw defaults, preserve custom colors, and undo and redo", async ({ page }) => {
@@ -949,33 +972,29 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
   // crop containing only the current selection.
   await expect.poll(async () => Object.keys((await freshBridgeDocument(page)).document.appState.selectedElementIds ?? {}).length).toBeGreaterThan(0);
 
-  for (const [mime, button] of [["image/png", "Export"], ["image/jpeg", "Export"]] as const) {
-    if (mime === "image/jpeg") await page.getByLabel("Image export format").selectOption(mime);
-    const downloadWait = page.waitForEvent("download");
-    await page.getByRole("button", { name: button }).click();
-    const image = await readFile(await (await downloadWait).path());
-    const actualMime = mime === "image/png" ? "image/png" : "image/jpeg";
-    const result = await page.evaluate(async ({ bytes, type }) => {
-      const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type }));
-      const canvas = document.createElement("canvas");
-      canvas.width = bitmap.width;
-      canvas.height = bitmap.height;
-      const context = canvas.getContext("2d");
-      if (!context) throw new Error("Could not inspect exported image pixels.");
-      context.drawImage(bitmap, 0, 0);
-      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
-      let greenImagePixels = 0;
-      let chalkPixels = 0;
-      for (let index = 0; index < pixels.length; index += 4) {
-        if (pixels[index + 1] > 170 && pixels[index] < 80 && pixels[index + 2] < 180) greenImagePixels += 1;
-        if (pixels[index] > 205 && pixels[index + 1] > 195 && pixels[index + 2] > 180) chalkPixels += 1;
+  for (const [preset, presetButton] of [["blackboard", "Blackboard Canvas"], ["white", "Whiteboard Canvas"]] as const) {
+    await page.getByRole("button", { name: presetButton }).click();
+    for (const mime of ["image/png", "image/jpeg"] as const) {
+      const formatControl = page.getByLabel("Image export format");
+      const downloadWait = page.waitForEvent("download");
+      if (await formatControl.inputValue() === mime) await page.getByRole("button", { name: "Export" }).click();
+      else await formatControl.selectOption(mime);
+      const image = await readFile(await (await downloadWait).path());
+      const sample = await inspectImagePixels(page, image, mime);
+      const corner = await sampleImagePatch(page, image, { x: 0.025, y: 0.025 }, mime);
+      expect(sample.width, `${mime} should include both distant diagram nodes`).toBeGreaterThan(700);
+      expect(sample.height).toBeGreaterThan(150);
+      expect(sample.greenAssetPixels, `${mime} should preserve the embedded image`).toBeGreaterThan(50);
+      if (preset === "blackboard") {
+        const luminance = corner[0] * 0.2126 + corner[1] * 0.7152 + corner[2] * 0.0722;
+        expect(luminance, `${mime} blackboard corner should stay charcoal`).toBeLessThanOrEqual(35);
+        expect(sample.whiteInkPixels, `${mime} should preserve text and chalk strokes`).toBeGreaterThan(100);
+      } else {
+        const tolerance = mime === "image/png" ? 1 : 12;
+        expect(corner.every((channel) => channel >= 255 - tolerance), `${mime} whiteboard corner should stay white: ${corner.join(", ")}`).toBe(true);
+        expect(sample.darkInkPixels, `${mime} should preserve text and shape strokes`).toBeGreaterThan(100);
       }
-      return { width: bitmap.width, height: bitmap.height, greenImagePixels, chalkPixels };
-    }, { bytes: Array.from(image), type: actualMime });
-    expect(result.width, `${mime} should include both distant diagram nodes`).toBeGreaterThan(700);
-    expect(result.height).toBeGreaterThan(150);
-    expect(result.greenImagePixels, `${mime} should preserve the embedded image`).toBeGreaterThan(50);
-    expect(result.chalkPixels, `${mime} should preserve text and chalk strokes`).toBeGreaterThan(100);
+    }
   }
 
   // Keep the original selection-export feature available as an explicit scope.
@@ -988,4 +1007,9 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
     return bitmap.width;
   }, Array.from(selectionImage));
   expect(selectionWidth, "selection export should remain limited to the current selection").toBeLessThan(500);
+});
+
+test("selection-only export is disabled when nothing is selected", async ({ page }) => {
+  await page.getByLabel("Export scope").selectOption("selection");
+  await expect(page.getByRole("button", { name: "Export" })).toBeDisabled();
 });

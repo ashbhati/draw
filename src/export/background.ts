@@ -17,6 +17,15 @@ export function selectExportElements<T extends { id: string; isDeleted?: boolean
 
 const BLACKBOARD_BG = `<image data-draw-background="blackboard" x="0" y="0" width="100%" height="100%" preserveAspectRatio="none" href="data:image/svg+xml,${encodeURIComponent(blackboardTexture)}" />`;
 
+export function hasSelectedExportElements<T extends { id: string; isDeleted?: boolean }>(
+  elements: readonly T[],
+  selectedElementIds: Record<string, boolean> | undefined,
+): boolean {
+  return Boolean(selectedElementIds && elements.some(
+    (element) => element.isDeleted !== true && selectedElementIds[element.id] === true,
+  ));
+}
+
 function backgroundLayer(preset: "blackboard" | "white"): string {
   if (preset === "white") {
     return '<rect data-draw-background="white" x="0" y="0" width="100%" height="100%" fill="#ffffff" />';

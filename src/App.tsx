@@ -10,7 +10,7 @@ import {
   type DrawBackgroundPreset,
   type DrawDocument,
 } from "./document/document";
-import { composeBackgroundSvg, renderExportBlob, selectExportElements } from "./export/background";
+import { composeBackgroundSvg, hasSelectedExportElements, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorForBackgroundPreset } from "./export/background-recolor";
 import { saveCurrentDocument, loadCurrentDocument } from "./ui/storage";
 import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
@@ -280,6 +280,10 @@ export default function App() {
       const selectedElementIds = exportScope === "selection"
         ? appState.selectedElementIds as Record<string, boolean> | undefined
         : undefined;
+      if (exportScope === "selection" && !hasSelectedExportElements(allElements, selectedElementIds)) {
+        setMessage("Select one or more objects to export a selection.");
+        return;
+      }
       const elements = selectExportElements(allElements, selectedElementIds);
       const files = apiRef.current.getFiles();
       const svg = await exportToSvg({ elements, appState: { ...appState, exportBackground: false }, files, exportPadding: 32 });
@@ -504,6 +508,8 @@ export default function App() {
   }, [doc?.document.id, editorKey]);
   if (!doc || status === "loading") return <main className="loading-screen"><div className="brand-mark">D</div><p>Preparing your canvas…</p></main>;
   const background = doc.document.canvas.background.preset;
+  const savedSelection = doc.document.appState.selectedElementIds as Record<string, boolean> | undefined;
+  const selectionAvailable = hasSelectedExportElements(doc.document.elements, savedSelection);
   const statusText = !canWrite ? "Read-only in this tab" : status === "saving" ? "Saving locally…" : status === "saved" ? "Saved on this device" : status === "error" ? "Save issue" : "All changes saved";
 
   return <main className={`draw-app bg-${background}`}>
@@ -521,7 +527,7 @@ export default function App() {
         <button className="button button-quiet" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open editable .draw file" : "Close the other Draw tab to open files here"}>Open</button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
         <button className="button button-primary" onClick={saveFile} title="Save the complete editable Draw file"><span className="button-icon">↓</span>Save .draw</button>
-        <div className="export-group"><button className="button button-quiet export-main" onClick={() => void exportImage("image/png")}>Export</button><select aria-label="Export scope" value={exportScope} onChange={(event) => setExportScope(event.target.value as "canvas" | "selection")}><option value="canvas">Whole drawing</option><option value="selection">Selection only</option></select><select aria-label="Image export format" value="image/png" onChange={(event) => void exportImage(event.target.value as "image/png" | "image/jpeg")}><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option></select></div>
+        <div className="export-group"><button className="button button-quiet export-main" disabled={exportScope === "selection" && !selectionAvailable} title={exportScope === "selection" && !selectionAvailable ? "Select one or more objects to export a selection" : undefined} onClick={() => void exportImage("image/png")}>Export</button><select aria-label="Export scope" value={exportScope} onChange={(event) => setExportScope(event.target.value as "canvas" | "selection")}><option value="canvas">Whole drawing</option><option value="selection">Selection only</option></select><select aria-label="Image export format" value="image/png" onChange={(event) => void exportImage(event.target.value as "image/png" | "image/jpeg")}><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option></select></div>
       </div>
     </header>
     <div className="workspace">
