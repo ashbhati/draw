@@ -15,7 +15,8 @@ export function selectExportElements<T extends { id: string; isDeleted?: boolean
   return live.filter((element) => selectedIds.has(element.id) || (element.containerId != null && selectedIds.has(element.containerId)));
 }
 
-const BLACKBOARD_BG = `<image data-draw-background="blackboard" x="0" y="0" width="100%" height="100%" preserveAspectRatio="none" href="data:image/svg+xml,${encodeURIComponent(blackboardTexture)}" />`;
+const BLACKBOARD_TEXTURE_SIZE = { width: 2000, height: 1200 } as const;
+const BLACKBOARD_BG = `<defs><pattern id="draw-blackboard-texture" width="${BLACKBOARD_TEXTURE_SIZE.width}" height="${BLACKBOARD_TEXTURE_SIZE.height}" patternUnits="userSpaceOnUse"><image x="0" y="0" width="${BLACKBOARD_TEXTURE_SIZE.width}" height="${BLACKBOARD_TEXTURE_SIZE.height}" preserveAspectRatio="none" href="data:image/svg+xml,${encodeURIComponent(blackboardTexture)}" /></pattern></defs><rect data-draw-background="blackboard" x="0" y="0" width="100%" height="100%" fill="url(#draw-blackboard-texture)" />`;
 
 export function hasSelectedExportElements<T extends { id: string; isDeleted?: boolean }>(
   elements: readonly T[],

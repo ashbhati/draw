@@ -40,8 +40,9 @@ describe("export background composition", () => {
   it("embeds the shared charcoal texture behind the scene without flattening it", () => {
     const result = composeBackgroundSvg(svg, "blackboard");
     expect(result.indexOf('data-draw-background="blackboard"')).toBeLessThan(result.indexOf('id="scene"'));
+    expect(result).toContain('<pattern id="draw-blackboard-texture" width="2000" height="1200" patternUnits="userSpaceOnUse">');
     expect(result).toContain('href="data:image/svg+xml,');
-    expect(result).toContain("preserveAspectRatio=\"none\"");
+    expect(result).toContain('fill="url(#draw-blackboard-texture)"');
     expect(result).toContain('id="scene"');
   });
 

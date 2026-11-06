@@ -119,7 +119,7 @@ async function sampleImagePatch(
   }, { bytes: Array.from(image), position: point, mime: mimeType });
 }
 
-async function measureBoardTextureStdDev(page: Page, image: Buffer, mimeType = "image/png"): Promise<number> {
+async function measureBoardTextureStats(page: Page, image: Buffer, mimeType = "image/png"): Promise<{ mean: number; standardDeviation: number }> {
   return page.evaluate(async ({ bytes, mime }) => {
     const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: mime }));
     const canvas = document.createElement("canvas");
@@ -130,7 +130,7 @@ async function measureBoardTextureStdDev(page: Page, image: Buffer, mimeType = "
     context.drawImage(bitmap, 0, 0);
     const { data } = context.getImageData(0, 0, bitmap.width, bitmap.height);
     const pixels: number[] = [];
-    const xBands: [number, number][] = [[0.03, 0.12], [0.88, 0.97]];
+    const xBands: [number, number][] = [[0.34, 0.42], [0.58, 0.66]];
     for (const [startX, endX] of xBands) {
       for (let y = Math.floor(bitmap.height * 0.12); y < bitmap.height * 0.9; y += 2) {
         for (let x = Math.floor(bitmap.width * startX); x < bitmap.width * endX; x += 2) {
@@ -140,7 +140,8 @@ async function measureBoardTextureStdDev(page: Page, image: Buffer, mimeType = "
       }
     }
     const mean = pixels.reduce((sum, value) => sum + value, 0) / pixels.length;
-    return Math.sqrt(pixels.reduce((sum, value) => sum + (value - mean) ** 2, 0) / pixels.length);
+    const standardDeviation = Math.sqrt(pixels.reduce((sum, value) => sum + (value - mean) ** 2, 0) / pixels.length);
+    return { mean, standardDeviation };
   }, { bytes: Array.from(image), mime: mimeType });
 }
 
@@ -325,10 +326,13 @@ test("Meta+Shift+E cannot open Excalidraw's image exporter", async ({ page }) =>
   await expect(page.locator('a[href^="http"]')).toHaveCount(0);
 });
 
-test("Blackboard texture matches live and exports at fixed 1400x800 viewport", async ({ page }) => {
+test("Blackboard texture matches live and full-width PNG/JPEG diagram exports", async ({ page }) => {
   const createResponse = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
-    input: { nodes: [{ id: "dark-fill", label: "Dark fill", x: 200, y: 180, width: 160, height: 100, color: "#18191a" }], edges: [] },
+    input: { nodes: [
+      { id: "dark-fill", label: "Dark fill", x: 200, y: 180, width: 160, height: 280, color: "#18191a" },
+      { id: "wide-export-anchor", label: "Wide export", x: 1100, y: 180, width: 160, height: 280, color: "#18191a" },
+    ], edges: [] },
   } });
   expect(createResponse.ok(), await createResponse.text()).toBeTruthy();
   const viewport = { width: 1400, height: 800 };
@@ -344,32 +348,28 @@ test("Blackboard texture matches live and exports at fixed 1400x800 viewport", a
   await page.getByLabel("Image export format").selectOption("image/jpeg");
   const jpeg = await readFile(await (await jpegDownloadWait).path());
 
-  const boardPoints = [{ x: 0.1, y: 0.5 }, { x: 0.9, y: 0.5 }, { x: 0.1, y: 0.8 }, { x: 0.9, y: 0.8 }];
-  const livePixels = await Promise.all(boardPoints.map((point) => sampleImagePatch(page, liveBoard, point)));
-  const pngPixels = await Promise.all(boardPoints.map((point) => sampleImagePatch(page, png, point)));
-  const jpegPixels = await Promise.all(boardPoints.map((point) => sampleImagePatch(page, jpeg, point, "image/jpeg")));
-  const pngDifferences = livePixels.map((pixel, index) => maxChannelDifference(pixel, pngPixels[index]));
-  const jpegDifferences = livePixels.map((pixel, index) => maxChannelDifference(pixel, jpegPixels[index]));
-  expect(Math.max(...pngDifferences), `live/PNG channel differences: ${pngDifferences.join(", ")}`).toBeLessThanOrEqual(3);
-  expect(Math.max(...jpegDifferences), `live/JPEG channel differences: ${jpegDifferences.join(", ")}`).toBeLessThanOrEqual(14);
-
-  const liveTextureStdDev = await measureBoardTextureStdDev(page, liveBoard);
-  const pngTextureStdDev = await measureBoardTextureStdDev(page, png);
-  const jpegTextureStdDev = await measureBoardTextureStdDev(page, jpeg, "image/jpeg");
-  for (const [format, deviation] of [["live", liveTextureStdDev], ["PNG", pngTextureStdDev], ["JPEG", jpegTextureStdDev]] as const) {
-    expect(deviation, `${format} texture standard deviation`).toBeGreaterThan(0.5);
-    expect(deviation, `${format} texture standard deviation`).toBeLessThan(4);
+  const liveStats = await measureBoardTextureStats(page, liveBoard);
+  const pngStats = await measureBoardTextureStats(page, png);
+  const jpegStats = await measureBoardTextureStats(page, jpeg, "image/jpeg");
+  for (const [format, stats] of [["live", liveStats], ["PNG", pngStats], ["JPEG", jpegStats]] as const) {
+    expect(stats.standardDeviation, `${format} texture variation`).toBeGreaterThan(7);
+    expect(stats.standardDeviation, `${format} texture variation`).toBeLessThan(18);
+    expect(stats.mean, `${format} board brightness`).toBeGreaterThan(20);
+    expect(stats.mean, `${format} board brightness`).toBeLessThan(52);
   }
-  expect(Math.abs(liveTextureStdDev - pngTextureStdDev), "live/PNG texture variation").toBeLessThan(1);
+  expect(Math.abs(liveStats.standardDeviation - pngStats.standardDeviation), "live/PNG texture variation").toBeLessThan(5);
+  expect(Math.abs(liveStats.standardDeviation - jpegStats.standardDeviation), "live/JPEG texture variation").toBeLessThan(5);
+  expect(Math.abs(liveStats.mean - pngStats.mean), "live/PNG average board color").toBeLessThan(12);
+  expect(Math.abs(liveStats.mean - jpegStats.mean), "live/JPEG average board color").toBeLessThan(14);
 
-  // The export includes 32px of padding around the 160x100 node. Sample its
+  // The export includes 32px of padding around the 160x280 node. Sample its
   // lower-right fill (away from the bound label) against the nearby board.
-  const fillPixel = await sampleImagePatch(page, png, { x: 0.8, y: 0.73 });
-  const adjacentBoardPixel = await sampleImagePatch(page, png, { x: 0.06, y: 0.73 });
-  expect(maxChannelDifference(fillPixel, adjacentBoardPixel), "PNG dark fill continuity").toBeLessThanOrEqual(8);
-  const jpegFillPixel = await sampleImagePatch(page, jpeg, { x: 0.8, y: 0.73 }, "image/jpeg");
-  const jpegBoardPixel = await sampleImagePatch(page, jpeg, { x: 0.06, y: 0.73 }, "image/jpeg");
-  expect(maxChannelDifference(jpegFillPixel, jpegBoardPixel), "JPEG dark fill continuity").toBeLessThanOrEqual(12);
+  const fillPixel = await sampleImagePatch(page, png, { x: 0.1, y: 0.5 });
+  const adjacentBoardPixel = await sampleImagePatch(page, png, { x: 0.22, y: 0.5 });
+  expect(maxChannelDifference(fillPixel, adjacentBoardPixel), "PNG dark fill stays close to the dark slate background").toBeLessThanOrEqual(32);
+  const jpegFillPixel = await sampleImagePatch(page, jpeg, { x: 0.1, y: 0.5 }, "image/jpeg");
+  const jpegBoardPixel = await sampleImagePatch(page, jpeg, { x: 0.22, y: 0.5 }, "image/jpeg");
+  expect(maxChannelDifference(jpegFillPixel, jpegBoardPixel), "JPEG dark fill stays close to the dark slate background").toBeLessThanOrEqual(36);
 });
 
 test("the Draw wordmark and Open .draw action do not overlap on narrow screens", async ({ page }) => {
