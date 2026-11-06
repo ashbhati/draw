@@ -29,10 +29,7 @@ const EDITOR_UI_OPTIONS = {
 } as const;
 const DRAW_MENU = (
   <MainMenu>
-    <MainMenu.DefaultItems.SaveAsImage />
     <MainMenu.DefaultItems.SearchMenu />
-    <MainMenu.DefaultItems.Help />
-    <MainMenu.DefaultItems.ClearCanvas />
   </MainMenu>
 );
 const randomId = () => globalThis.crypto?.randomUUID?.() ?? `el-${Date.now()}-${Math.random().toString(36).slice(2)}`;
