@@ -7,7 +7,7 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "test": "vitest run src",
+    "test": "vitest run src tests/e2e/config.test.ts",
     "test:watch": "vitest",
     "mcp": "tsx src/integrations/mcp-server.ts",
     "test:e2e": "playwright test"

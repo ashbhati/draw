@@ -666,11 +666,12 @@ test("coalesces a pointer drag to a bounded number of whole-document bridge writ
   expect(clientPuts).toHaveLength(0);
 });
 
-test("loads fonts and exports the hand-drawn scene without network access", async ({ page }) => {
+test("loads fonts and exports the hand-drawn scene without network access", async ({ page, baseURL }) => {
   const externalRequests: string[] = [];
   const localFontRequests: string[] = [];
   const cjkFontRequests: string[] = [];
-  const localOrigin = new URL(page.url()).origin;
+  if (!baseURL) throw new Error("Playwright did not provide the configured base URL.");
+  const localOrigin = new URL(baseURL).origin;
   page.on("request", (request) => {
     const url = request.url();
     if (url.includes("/fonts/Excalifont/")) localFontRequests.push(url);
