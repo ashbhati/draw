@@ -481,6 +481,10 @@ export default function App() {
         bridgeAutosave.schedule(next);
       }} /></span></div>
       <div className="toolbar-actions">
+        <div className="background-picker toolbar-background-picker" role="group" aria-label="Canvas background">
+          <button aria-label="Blackboard Canvas" disabled={!canWrite} className={`background-option toolbar-background-option ${background === "blackboard" ? "active" : ""}`} onClick={() => selectBackground("blackboard")} aria-pressed={background === "blackboard"}><span className="swatch swatch-chalk"><b>✳</b></span><span>Blackboard</span></button>
+          <button aria-label="Whiteboard Canvas" disabled={!canWrite} className={`background-option toolbar-background-option ${background === "white" ? "active" : ""}`} onClick={() => selectBackground("white")} aria-pressed={background === "white"}><span className="swatch swatch-paper"><b>◌</b></span><span>Whiteboard</span></button>
+        </div>
         <span className={`save-indicator ${status}`}><i />{statusText}</span>
         <button className="button button-quiet" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open editable .draw file" : "Close the other Draw tab to open files here"}>Open</button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
@@ -489,20 +493,8 @@ export default function App() {
       </div>
     </header>
     <div className="workspace">
-      <aside className="side-rail">
-        <div className="rail-label">CANVAS</div>
-        <div className="background-picker" role="group" aria-label="Canvas background">
-          <button disabled={!canWrite} className={`background-option ${background === "blackboard" ? "active" : ""}`} onClick={() => selectBackground("blackboard")} aria-pressed={background === "blackboard"}><span className="swatch swatch-chalk"><b>✳</b></span><span>Blackboard</span></button>
-          <button disabled={!canWrite} className={`background-option ${background === "white" ? "active" : ""}`} onClick={() => selectBackground("white")} aria-pressed={background === "white"}><span className="swatch swatch-paper"><b>◌</b></span><span>White</span></button>
-        </div>
-        <div className="rail-separator" />
-        <div className="rail-label">QUICK START</div>
-        <p className="rail-copy">Sketch freely on the infinite canvas. Pick a tool, draw, and connect ideas.</p>
-        <div className="shortcut"><kbd>V</kbd><span>Select</span></div><div className="shortcut"><kbd>R</kbd><span>Rectangle</span></div><div className="shortcut"><kbd>A</kbd><span>Arrow</span></div><div className="shortcut"><kbd>P</kbd><span>Draw</span></div>
-        <div className="rail-bottom"><span className="local-icon">⌂</span><span>Stored locally<br/><small>Your work stays on this device</small></span></div>
-      </aside>
       <section className="canvas-area" aria-label="Drawing canvas">
-        <div className="canvas-label"><span className="canvas-live"/>Infinite canvas <span className="dot-separator">·</span> {background === "blackboard" ? "Chalkboard" : "White"}</div>
+        <div className="canvas-label"><span className="canvas-live"/>Infinite canvas <span className="dot-separator">·</span> {background === "blackboard" ? "Blackboard Canvas" : "Whiteboard Canvas"}</div>
     <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onChange} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS} /></div>
       </section>
     </div>

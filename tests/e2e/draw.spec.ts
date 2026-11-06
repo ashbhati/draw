@@ -92,7 +92,22 @@ async function countWarmImagePixels(page: Page, image: Buffer): Promise<number> 
 test.beforeEach(async ({ page }) => {
   await waitForBridge(page);
   await page.locator(".excalidraw canvas").first().waitFor();
-  await expect(page.getByRole("button", { name: "Blackboard" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Blackboard Canvas" })).toBeEnabled();
+});
+
+test("canvas choices are in the main toolbar and replace the quick-start rail", async ({ page }) => {
+  const toolbar = page.getByRole("group", { name: "Canvas background" });
+  await expect(toolbar).toBeVisible();
+  await expect(toolbar.getByRole("button", { name: "Blackboard Canvas" })).toBeVisible();
+  await expect(toolbar.getByRole("button", { name: "Whiteboard Canvas" })).toBeVisible();
+  await expect(page.locator(".side-rail")).toHaveCount(0);
+  await expect(page.getByText("QUICK START")).toHaveCount(0);
+
+  await toolbar.getByRole("button", { name: "Whiteboard Canvas" }).click();
+  await expect(toolbar.getByRole("button", { name: "Whiteboard Canvas" })).toHaveAttribute("aria-pressed", "true");
+  await expect.poll(async () => (await currentBridgeDocument(page)).document.canvas.background.preset).toBe("white");
+  await toolbar.getByRole("button", { name: "Blackboard Canvas" }).click();
+  await expect(toolbar.getByRole("button", { name: "Blackboard Canvas" })).toHaveAttribute("aria-pressed", "true");
 });
 
 test("MCP create and update stay editable through save, reload, open, and image export", async ({ page }) => {
@@ -124,7 +139,7 @@ test("MCP create and update stay editable through save, reload, open, and image 
   }).toBe(true);
 
   await page.getByRole("button", { name: "Redo" }).click();
-  await page.getByRole("button", { name: "White" }).click();
+  await page.getByRole("button", { name: "Whiteboard Canvas" }).click();
   await expect(page.locator(".canvas-label")).toContainText("White");
 
   const editedElementId = created.result.nodes.spec;
@@ -235,7 +250,7 @@ test("a second tab is read-only while the first tab owns local autosave", async 
 
   await expect(secondTab.getByText(/reload this tab to edit/i)).toBeVisible();
   await expect(secondTab.getByLabel("Drawing title")).toBeDisabled();
-  await expect(secondTab.getByRole("button", { name: "White" })).toBeDisabled();
+  await expect(secondTab.getByRole("button", { name: "Whiteboard Canvas" })).toBeDisabled();
 });
 
 test("title edits flush to IndexedDB on pagehide and survive reload", async ({ page }) => {
