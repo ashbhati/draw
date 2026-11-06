@@ -539,12 +539,15 @@ test("Open .draw restores a downloaded file that remains editable through a seco
   expect(Object.values(firstFile.document.assets).length).toBeGreaterThan(0);
   expect(firstFile.document.elements.filter((element: any) => element.type === "image")).toHaveLength(1);
 
-  await page.evaluate(() => new Promise<void>((resolve, reject) => {
-    const request = indexedDB.deleteDatabase("draw-local");
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
-    request.onblocked = () => reject(new Error("Draw autosave database deletion was blocked."));
-  }));
+  await page.getByLabel("Drawing title").fill("Changed before opening saved file");
+  await page.getByRole("button", { name: "Blackboard Canvas" }).click();
+  await page.getByRole("button", { name: "Zoom out" }).click();
+  const changedBeforeOpen = await freshBridgeDocument(page);
+  expect(changedBeforeOpen.document.title).toBe("Changed before opening saved file");
+  expect(changedBeforeOpen.document.canvas.background.preset).toBe("blackboard");
+  expect(changedBeforeOpen.document.canvas.viewport).not.toEqual(firstFile.document.canvas.viewport);
+  expect(changedBeforeOpen.document.elements.some((element: any) => element.id === created.result.nodes.roundtrip)).toBe(true);
+
   page.once("dialog", (dialog) => dialog.accept());
   const firstChooserWait = page.waitForEvent("filechooser");
   await page.getByRole("button", { name: "Open .draw" }).click();
