@@ -181,11 +181,23 @@ async function inspectBlackboardImage(page: Page, image: Buffer, mimeType: "imag
     }
     const boardMean = boardSamples.reduce((sum, value) => sum + value, 0) / boardSamples.length;
     const boardStandardDeviation = Math.sqrt(boardSamples.reduce((sum, value) => sum + (value - boardMean) ** 2, 0) / boardSamples.length);
-    const nodeInterior = regionStats(0.04, 0.055, 0.1, 0.125);
+    let horizontalGrain = 0;
+    let verticalGrain = 0;
+    for (const [startX, endX] of [[0.34, 0.42], [0.58, 0.66]] as const) {
+      for (let y = Math.floor(bitmap.height * 0.3); y < Math.floor(bitmap.height * 0.7) - 1; y += 2) {
+        for (let x = Math.floor(bitmap.width * startX); x < Math.floor(bitmap.width * endX) - 1; x += 2) {
+          horizontalGrain += Math.abs(luma(x + 1, y) - luma(x, y));
+          verticalGrain += Math.abs(luma(x, y + 1) - luma(x, y));
+        }
+      }
+    }
+    const grainRatio = verticalGrain / horizontalGrain;
+    const nodeInterior = regionStats(0.04, 0.055, 0.27, 0.32);
     return {
       width: bitmap.width,
       height: bitmap.height,
       board: { mean: boardMean, standardDeviation: boardStandardDeviation },
+      grainRatio,
       edges: {
         left: regionStats(0.005, 0.02, 0.25, 0.75),
         leftAdjacent: regionStats(0.03, 0.045, 0.25, 0.75),
@@ -384,8 +396,8 @@ test("Blackboard texture is seam-safe across large live/PNG/JPEG canvases and sh
   const createResponse = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
     input: { nodes: [
-      { id: "dark-fill", label: "Readable node", x: 200, y: 180, width: 160, height: 280 },
-      { id: "wide-export-anchor", label: "Wide export", x: 2400, y: 700, width: 160, height: 160 },
+      { id: "dark-fill", label: "Readable node", x: 200, y: 180, width: 160, height: 72 },
+      { id: "wide-export-anchor", label: "Wide export", x: 2400, y: 180, width: 160, height: 72 },
     ], edges: [] },
   } });
   expect(createResponse.ok(), await createResponse.text()).toBeTruthy();
@@ -414,8 +426,8 @@ test("Blackboard texture is seam-safe across large live/PNG/JPEG canvases and sh
   ]);
   for (const [format, pixels] of [["live", livePixels], ["PNG", pngPixels], ["JPEG", jpegPixels]] as const) {
     expect(pixels.width, `${format} width includes the x=2000 boundary`).toBeGreaterThan(2100);
-    expect(pixels.height, `${format} keeps the full board image`).toBeGreaterThan(format === "live" ? 1200 : 700);
-    expect(pixels.board.standardDeviation, `${format} texture variation`).toBeGreaterThan(7);
+    expect(pixels.height, `${format} keeps the full board image`).toBeGreaterThan(format === "live" ? 1200 : 120);
+    expect(pixels.board.standardDeviation, `${format} texture variation`).toBeGreaterThan(6);
     expect(pixels.board.standardDeviation, `${format} texture variation`).toBeLessThan(18);
     expect(pixels.board.mean, `${format} board brightness`).toBeGreaterThan(20);
     expect(pixels.board.mean, `${format} board brightness`).toBeLessThan(52);
@@ -432,6 +444,12 @@ test("Blackboard texture is seam-safe across large live/PNG/JPEG canvases and sh
   expect(Math.abs(livePixels.board.standardDeviation - jpegPixels.board.standardDeviation), "live/JPEG texture variation").toBeLessThan(5);
   expect(Math.abs(livePixels.board.mean - pngPixels.board.mean), "live/PNG average board color").toBeLessThan(12);
   expect(Math.abs(livePixels.board.mean - jpegPixels.board.mean), "live/JPEG average board color").toBeLessThan(14);
+  expect(pngPixels.width / pngPixels.height, "PNG is a wide-short export").toBeGreaterThanOrEqual(6);
+  expect(jpegPixels.width / jpegPixels.height, "JPEG is a wide-short export").toBeGreaterThanOrEqual(6);
+  for (const [format, pixels] of [["PNG", pngPixels], ["JPEG", jpegPixels]] as const) {
+    expect(Math.abs(pixels.grainRatio / livePixels.grainRatio), `${format}/live grain scale ratio`).toBeLessThan(1.3);
+    expect(Math.abs(pixels.grainRatio / livePixels.grainRatio), `${format}/live grain scale ratio`).toBeGreaterThan(1 / 1.3);
+  }
 
   // Sample the top-right inside the first node, away from its label and border.
   // A flat filled slab has almost no pixel variation; a transparent node keeps
