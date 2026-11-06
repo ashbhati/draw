@@ -1,9 +1,11 @@
 import { defineConfig, devices } from "@playwright/test";
+import { createE2EServerConfig, resolveAndStoreE2EBaseURL } from "./tests/e2e/config";
 
-const baseURL = "http://127.0.0.1:5181";
+const baseURL = await resolveAndStoreE2EBaseURL();
 
 export default defineConfig({
   testDir: "./tests/e2e",
+  testIgnore: "**/*.test.ts",
   fullyParallel: false,
   retries: 0,
   reporter: "list",
@@ -14,10 +16,5 @@ export default defineConfig({
     headless: true,
     trace: "retain-on-failure",
   },
-  webServer: {
-    command: "npm run dev -- --port 5181",
-    url: `${baseURL}/__draw/api/health`,
-    reuseExistingServer: !process.env.CI,
-    timeout: 30_000,
-  },
+  webServer: createE2EServerConfig(baseURL),
 });

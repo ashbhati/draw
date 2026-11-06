@@ -22,7 +22,7 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
-The e2e suite runs the app locally in Chromium. Playwright downloads its browser separately; on managed systems where its default browser cache is unavailable, set `PLAYWRIGHT_BROWSERS_PATH` to a writable directory when installing and running the suite.
+The e2e suite runs the app locally in Chromium and selects an available loopback port for each run. To pin a run to a specific port, set `DRAW_E2E_BASE_URL`, for example `DRAW_E2E_BASE_URL=http://127.0.0.1:5197 npm run test:e2e`. It starts its own strict-port server and does not reuse an existing server by default. Set `DRAW_E2E_REUSE_SERVER=1` only when intentionally reusing the server at that URL. Playwright downloads its browser separately; on managed systems where its default browser cache is unavailable, set `PLAYWRIGHT_BROWSERS_PATH` to a writable directory when installing and running the suite.
 
 ## Connect an MCP client
 
