@@ -24,6 +24,54 @@ describe("MCP tool input contract", () => {
     expect(summary.elementCount).toBe(3);
     expect(summary.elements.map((element) => element.id)).toEqual(["new-1", "new-2"]);
     expect(summary.truncated).toBe(true);
+    expect(summary.offset).toBe(1);
+    expect(summary.hasMore).toBe(false);
+    expect(summary.nextOffset).toBeNull();
+  });
+
+  it("paginates canvas elements from the beginning and includes edit context", () => {
+    const elements = [
+      { id: "container", type: "rectangle", x: 12, y: 24, width: 180, height: 80, containerId: null, boundElements: [{ id: "label", type: "text" }], strokeColor: "#123456", backgroundColor: "#ffffff" },
+      { id: "label", type: "text", text: "Node label", containerId: "container", x: 24, y: 44, width: 100, height: 20, strokeColor: "#654321", backgroundColor: "transparent" },
+      { id: "third", type: "ellipse", x: 320, y: 40, width: 80, height: 60 },
+    ];
+    const document = {
+      format: "draw" as const,
+      formatVersion: 1 as const,
+      document: {
+        id: "doc-1", title: "Flow",
+        canvas: { infinite: true as const, background: { preset: "white" as const, styleVersion: 1 }, viewport: { x: 0, y: 0, zoom: 1 } },
+        elements, appState: {}, assets: {},
+      },
+    };
+
+    const firstPage = summarizeCurrentCanvas(document, { offset: 0, limit: 2 });
+    expect(firstPage.elements).toEqual([
+      expect.objectContaining({
+        id: "container", containerId: null,
+        boundElements: [{ id: "label", type: "text" }],
+        strokeColor: "#123456", backgroundColor: "#ffffff",
+      }),
+      expect.objectContaining({ id: "label", containerId: "container", strokeColor: "#654321", backgroundColor: "transparent" }),
+    ]);
+    expect(firstPage).toMatchObject({ offset: 0, limit: 2, nextOffset: 2, hasMore: true });
+
+    const secondPage = summarizeCurrentCanvas(document, { offset: 2, limit: 2 });
+    expect(secondPage.elements.map((element) => element.id)).toEqual(["third"]);
+    expect(secondPage).toMatchObject({ offset: 2, limit: 2, nextOffset: null, hasMore: false });
+  });
+
+  it("rejects out-of-range canvas pagination options", () => {
+    const document = {
+      format: "draw" as const, formatVersion: 1 as const,
+      document: {
+        id: "doc-1", title: "Empty",
+        canvas: { infinite: true as const, background: { preset: "white" as const, styleVersion: 1 }, viewport: { x: 0, y: 0, zoom: 1 } },
+        elements: [], appState: {}, assets: {},
+      },
+    };
+    expect(() => summarizeCurrentCanvas(document, { offset: -1, limit: 10 })).toThrow(/offset/i);
+    expect(() => summarizeCurrentCanvas(document, { offset: 0, limit: 251 })).toThrow(/limit/i);
   });
 
   it("accepts an editable node-and-edge diagram specification", () => {

@@ -1,4 +1,4 @@
-import { Excalidraw, convertToExcalidrawElements, exportToSvg } from "@excalidraw/excalidraw";
+import { CaptureUpdateAction, Excalidraw, FONT_FAMILY, convertToExcalidrawElements, exportToSvg } from "@excalidraw/excalidraw";
 import type { ExcalidrawImperativeAPI, ExcalidrawInitialDataState } from "@excalidraw/excalidraw/types";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -11,16 +11,43 @@ import {
   type DrawDocument,
 } from "./document/document";
 import { composeBackgroundSvg, renderExportBlob, selectExportElements } from "./export/background";
+import { recolorForBackgroundPreset } from "./export/background-recolor";
 import { saveCurrentDocument, loadCurrentDocument } from "./ui/storage";
-import { applyElementUpdates } from "./integrations/scene-updates";
+import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
+import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
+import { createDebouncedSaver } from "./ui/autosave";
+import { buildDiagramSkeletons } from "./integrations/diagram-builder";
+import { persistAppliedDocument } from "./integrations/command-persistence";
+import { createBridgeSynchronizer } from "./integrations/bridge-sync";
 
 type Status = "loading" | "ready" | "saving" | "saved" | "error";
 type BridgeCommand = { id: string; clientId: string; operation: "create_diagram" | "update_elements"; input: any };
+type BridgeFlush = { id: string; clientId: string };
 const DEFAULT_COLOR: Record<DrawBackgroundPreset, string> = { blackboard: "#18191a", white: "#ffffff" };
 const EDITOR_UI_OPTIONS = {
   canvasActions: { loadScene: false, saveToActiveFile: false, export: false, toggleTheme: false, changeViewBackgroundColor: false },
 } as const;
 const randomId = () => globalThis.crypto?.randomUUID?.() ?? `el-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+function measureTextWithExcalidraw(text: string, fontSize: number, element: EditableSceneElement) {
+  const skeleton: Record<string, unknown> = {
+    id: "draw-text-measurement",
+    type: "text",
+    text,
+    fontSize,
+    fontFamily: element.fontFamily ?? FONT_FAMILY.Virgil,
+  };
+  if (typeof element.lineHeight === "number") skeleton.lineHeight = element.lineHeight;
+  const [measured] = convertToExcalidrawElements([skeleton] as any[], { regenerateIds: false }) as any[];
+  return { width: measured.width as number, height: measured.height as number };
+}
+
+function renderedTextWidth(text: string, fontSize: number): number {
+  const context = document.createElement("canvas").getContext("2d");
+  if (!context) return 0;
+  context.font = `${fontSize}px Excalifont`;
+  return Math.max(...text.split("\n").map((line) => context.measureText(line).width));
+}
 
 function download(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
@@ -41,11 +68,13 @@ export default function App() {
   const [status, setStatus] = useState<Status>("loading");
   const [message, setMessage] = useState("");
   const [autosaveBlocked, setAutosaveBlocked] = useState(false);
+  const [canWrite, setCanWrite] = useState(false);
   const [editorKey, setEditorKey] = useState(0);
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
   const docRef = useRef<DrawDocument | null>(null);
   const clientId = useRef(randomId());
-  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bridgeSync = useMemo(() => createBridgeSynchronizer(clientId.current), []);
+  const writerOwned = useRef(false);
   const titleInput = useRef<HTMLInputElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const onEditorReady = useCallback((api: ExcalidrawImperativeAPI) => { apiRef.current = api; }, []);
@@ -55,35 +84,93 @@ export default function App() {
     setDoc(next);
   }, []);
 
-  useEffect(() => {
-    let live = true;
-    loadCurrentDocument().then((stored) => {
-      if (!live) return;
-      setDocument(stored ?? createEmptyDocument());
-      setStatus("ready");
-    }).catch((error: unknown) => {
-      if (!live) return;
-      setAutosaveBlocked(true);
-      setDocument(createEmptyDocument());
-      setStatus("error");
-      setMessage(`Local autosave could not be loaded, so Draw will not overwrite it. Save a portable .draw file to keep new edits. ${error instanceof Error ? error.message : String(error)}`);
-    });
-    return () => { live = false; };
-  }, [setDocument]);
+  const autosave = useMemo(() => createDebouncedSaver<DrawDocument>(async (value) => {
+    if (!writerOwned.current) return;
+    await saveCurrentDocument(value);
+    setStatus("saved");
+  }, 350, (error) => {
+    setStatus("error");
+    setMessage(`Autosave failed: ${error instanceof Error ? error.message : String(error)}`);
+  }), []);
 
   const syncBridgeDocument = useCallback(async (value: DrawDocument) => {
     if (!import.meta.env.DEV) return;
-    const response = await fetch("/__draw/api/document", {
-      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(value),
-    });
-    if (!response.ok) throw new Error(`Draw bridge rejected document sync (HTTP ${response.status}).`);
-  }, []);
+    if (!writerOwned.current) throw new Error("This tab does not own the active Draw canvas.");
+    await bridgeSync(value);
+  }, [bridgeSync]);
+
+  const bridgeAutosave = useMemo(() => createDebouncedSaver<DrawDocument>(syncBridgeDocument, 350, (error) => {
+    setStatus("error");
+    setMessage(`MCP bridge sync failed: ${error instanceof Error ? error.message : String(error)}`);
+  }), [syncBridgeDocument]);
+
+  useEffect(() => {
+    let live = true;
+    let lock: WriterLock | null = null;
+    const initialize = async () => {
+      try {
+        lock = await acquireWriterLock();
+        if (!live) { lock.release(); return; }
+        writerOwned.current = lock.acquired;
+        setCanWrite(lock.acquired);
+        if (!lock.acquired) {
+          setAutosaveBlocked(true);
+          setMessage(lock.supported
+            ? "Draw is already open in another tab. Close that tab, then reload this tab to edit."
+            : "This browser cannot coordinate Draw tabs safely. This tab is read-only to protect your autosave.");
+        }
+        try {
+          const stored = await loadCurrentDocument();
+          if (!live) return;
+          setDocument(stored ?? createEmptyDocument());
+          setStatus(lock.acquired ? "ready" : "error");
+        } catch (error) {
+          if (!live) return;
+          setAutosaveBlocked(true);
+          setDocument(createEmptyDocument());
+          setStatus("error");
+          setMessage(`Local autosave could not be loaded, so Draw will not overwrite it. Save a portable .draw file to keep new edits. ${error instanceof Error ? error.message : String(error)}`);
+        }
+      } catch (error) {
+        if (!live) return;
+        setAutosaveBlocked(true);
+        setCanWrite(false);
+        setDocument(createEmptyDocument());
+        setStatus("error");
+        setMessage(`Could not secure the single-tab editing lock; this tab is read-only. ${error instanceof Error ? error.message : String(error)}`);
+      }
+    };
+    // React Strict Mode replays effects in development. Defer lock acquisition
+    // one task so the discarded setup can cancel before it claims the tab lock.
+    const initializeTimer = window.setTimeout(() => { void initialize(); }, 0);
+    return () => {
+      live = false;
+      window.clearTimeout(initializeTimer);
+      const release = () => {
+        writerOwned.current = false;
+        lock?.release();
+      };
+      if (autosave.isBusy() || bridgeAutosave.isBusy()) {
+        void Promise.all([autosave.flush(), bridgeAutosave.flush()])
+          .catch((error: unknown) => console.error("Could not flush Draw before closing:", error))
+          .finally(release);
+      } else release();
+    };
+  }, [autosave, bridgeAutosave, setDocument]);
 
   const onChange = useCallback((elements: readonly any[], appState: any, files: any) => {
+    if (!writerOwned.current) return;
     const current = docRef.current;
     if (!current) return;
     const state = appState as Record<string, unknown> & { scrollX?: number; scrollY?: number; zoom?: { value?: number } };
-    const background = current.document.canvas.background;
+    const backgroundPreset = state.viewBackgroundColor === "transparent"
+      ? "blackboard"
+      : state.viewBackgroundColor === DEFAULT_COLOR.white
+        ? "white"
+        : current.document.canvas.background.preset;
+    const background = backgroundPreset === "blackboard"
+      ? { preset: "blackboard" as const, styleVersion: 1, color: DEFAULT_COLOR.blackboard, texture: "chalk-smudge-v1" }
+      : { preset: "white" as const, styleVersion: 1, color: DEFAULT_COLOR.white };
     const next = fromExcalidrawScene({ elements, appState, files }, {
       id: current.document.id,
       title: current.document.title,
@@ -100,31 +187,52 @@ export default function App() {
       return;
     }
     setStatus("saving");
-    if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => {
-      void saveCurrentDocument(next).then(() => setStatus("saved")).catch((error: unknown) => {
-        setStatus("error"); setMessage(`Autosave failed: ${error instanceof Error ? error.message : String(error)}`);
-      });
-      void syncBridgeDocument(next).catch((error: unknown) => {
-        setStatus("error"); setMessage(error instanceof Error ? error.message : "Could not sync Draw with MCP.");
-      });
-    }, 350);
-  }, [autosaveBlocked, setDocument, syncBridgeDocument]);
+    autosave.schedule(next);
+    bridgeAutosave.schedule(next);
+  }, [autosave, autosaveBlocked, bridgeAutosave, setDocument]);
 
   useEffect(() => {
-    if (!doc || !import.meta.env.DEV) return;
-    const id = clientId.current;
-    void fetch("/__draw/api/client", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ clientId: id }) }).catch(() => undefined);
-    void syncBridgeDocument(doc).catch(() => undefined);
-  }, [doc?.document.id, doc ? editorKey : -1, syncBridgeDocument]);
+    if (!doc || !canWrite || !import.meta.env.DEV) return;
+    bridgeAutosave.schedule(doc);
+  }, [bridgeAutosave, canWrite, doc?.document.id, doc ? editorKey : -1]);
 
-  const loadDocument = useCallback((next: DrawDocument) => {
-    setAutosaveBlocked(false);
+  useEffect(() => {
+    const flushPending = () => {
+      if (!writerOwned.current || (!autosave.isBusy() && !bridgeAutosave.isBusy())) return;
+      void Promise.all([autosave.flush(), bridgeAutosave.flush()]).catch((error: unknown) => {
+        setStatus("error");
+        setMessage(`Could not flush the last local save: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    };
+    const flushWhenHidden = () => { if (document.visibilityState === "hidden") flushPending(); };
+    window.addEventListener("pagehide", flushPending);
+    document.addEventListener("visibilitychange", flushWhenHidden);
+    return () => {
+      window.removeEventListener("pagehide", flushPending);
+      document.removeEventListener("visibilitychange", flushWhenHidden);
+    };
+  }, [autosave, bridgeAutosave]);
+
+  const loadDocument = useCallback(async (next: DrawDocument) => {
+    if (!writerOwned.current) {
+      setMessage("This tab is read-only because another Draw tab owns autosave.");
+      return;
+    }
+    if (autosave.isBusy()) await autosave.flush();
+    if (bridgeAutosave.isBusy()) await bridgeAutosave.flush();
     setDocument(next);
     setStatus("ready"); setMessage(""); setEditorKey((key) => key + 1);
-    void saveCurrentDocument(next).then(() => setStatus("saved")).catch(() => setStatus("error"));
-    void syncBridgeDocument(next).catch(() => undefined);
-  }, [setDocument, syncBridgeDocument]);
+    setAutosaveBlocked(false);
+    try {
+      await saveCurrentDocument(next);
+      setStatus("saved");
+      await syncBridgeDocument(next);
+    } catch (error) {
+      setAutosaveBlocked(true);
+      setStatus("error");
+      setMessage(`The file opened, but local autosave failed: ${error instanceof Error ? error.message : String(error)}. Use Save .draw to preserve it.`);
+    }
+  }, [autosave, bridgeAutosave, setDocument, syncBridgeDocument]);
 
   const openFile = async (file?: File) => {
     if (!file) return;
@@ -133,7 +241,7 @@ export default function App() {
       if (fileInput.current) fileInput.current.value = "";
       return;
     }
-    try { loadDocument(await parseDrawFile(await file.text())); }
+    try { await loadDocument(await parseDrawFile(await file.text())); }
     catch (error) { setMessage(error instanceof Error ? error.message : "Could not open this Draw file."); }
     finally { if (fileInput.current) fileInput.current.value = ""; }
   };
@@ -160,77 +268,139 @@ export default function App() {
   };
 
   const selectBackground = (preset: DrawBackgroundPreset) => {
+    if (!writerOwned.current) return;
     const current = docRef.current;
     if (!current) return;
     const color = DEFAULT_COLOR[preset];
+    const viewBackgroundColor = preset === "blackboard" ? "transparent" : color;
+    const elements = recolorForBackgroundPreset(
+      current.document.elements,
+      current.document.canvas.background.preset,
+      preset,
+    );
     const next: DrawDocument = {
       ...current,
       document: {
         ...current.document,
+        elements,
         canvas: { ...current.document.canvas, background: { preset, styleVersion: 1, color, ...(preset === "blackboard" ? { texture: "chalk-smudge-v1" } : {}) } },
-        appState: { ...current.document.appState, viewBackgroundColor: color, currentItemStrokeColor: preset === "blackboard" ? "#f6f2e9" : "#1e1e1e" },
+        appState: { ...current.document.appState, viewBackgroundColor, currentItemStrokeColor: preset === "blackboard" ? "#f6f2e9" : "#1e1e1e" },
       },
     };
     setDocument(next);
-    apiRef.current?.updateScene({ appState: { viewBackgroundColor: color, currentItemStrokeColor: preset === "blackboard" ? "#f6f2e9" : "#1e1e1e" } });
+    apiRef.current?.updateScene({
+      elements: elements as any,
+      appState: { viewBackgroundColor, currentItemStrokeColor: preset === "blackboard" ? "#f6f2e9" : "#1e1e1e" },
+      captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+    });
     if (autosaveBlocked) {
       setStatus("error");
       setMessage("Local autosave is unavailable. Save a portable .draw file to keep this change.");
       return;
     }
-    void saveCurrentDocument(next).then(() => setStatus("saved")).catch(() => setStatus("error"));
-    void syncBridgeDocument(next).catch(() => undefined);
+    setStatus("saving");
+    autosave.schedule(next);
+    bridgeAutosave.schedule(next);
   };
 
   const handleMcpCommand = useCallback(async (event: BridgeCommand) => {
     const api = apiRef.current;
     const current = docRef.current;
     if (!api || !current || event.clientId !== clientId.current) return;
+    let applied: { document: DrawDocument; result: Record<string, unknown> } | null = null;
     try {
+      if (!writerOwned.current) throw new Error("This Draw tab is read-only because another tab owns the autosave lock.");
       if (autosaveBlocked) throw new Error("Local autosave is unavailable; open a saved .draw file before using MCP edits.");
       let elements = [...api.getSceneElementsIncludingDeleted()] as any[];
-      let affected: string[] = [];
+      let result: Record<string, unknown>;
       if (event.operation === "create_diagram") {
-        const { nodes, edges } = event.input;
-        const onBlackboard = current.document.canvas.background.preset === "blackboard";
-        const defaultStroke = onBlackboard ? "#f2d27a" : "#546271";
-        const ids = new Map<string, string>();
-        const skeletons: any[] = nodes.map((node: any) => {
-          const id = randomId(); ids.set(node.id, id);
-          return { id, type: node.shape === "ellipse" ? "ellipse" : node.shape === "diamond" ? "diamond" : "rectangle", x: node.x, y: node.y, width: node.width ?? 180, height: node.height ?? 72, strokeColor: node.color ?? defaultStroke, backgroundColor: onBlackboard ? "#18191a" : "#ffffff", fillStyle: "solid", strokeWidth: 2, roughness: 1, label: { text: node.label, fontSize: 20, strokeColor: node.color ?? defaultStroke } };
+        const built = buildDiagramSkeletons(event.input, current.document.canvas.background.preset, randomId);
+        const textSkeletons = built.skeletons.flatMap((skeleton) => {
+          const nestedLabel = skeleton.label && typeof skeleton.label === "object" ? [skeleton.label as Record<string, unknown>] : [];
+          return [skeleton, ...nestedLabel].filter((candidate) => typeof candidate.text === "string");
         });
-        if (event.input.title) skeletons.unshift({ type: "text", x: Math.min(...nodes.map((node: any) => node.x)), y: Math.min(...nodes.map((node: any) => node.y)) - 56, text: event.input.title, fontSize: 28, strokeColor: onBlackboard ? "#f6f2e9" : "#1e1e1e", roughness: 1 });
-        for (const edge of edges) {
-          const from = nodes.find((node: any) => node.id === edge.from), to = nodes.find((node: any) => node.id === edge.to);
-          if (!from || !to) continue;
-          const sx = from.x + (from.width ?? 180) / 2, sy = from.y + (from.height ?? 72) / 2;
-          const ex = to.x + (to.width ?? 180) / 2, ey = to.y + (to.height ?? 72) / 2;
-          skeletons.push({ type: "arrow", x: sx, y: sy, points: [[0, 0], [ex - sx, ey - sy]], start: { id: ids.get(edge.from) }, end: { id: ids.get(edge.to) }, endArrowhead: "arrow", strokeColor: edge.color ?? defaultStroke, label: edge.label ? { text: edge.label, fontSize: 16, strokeColor: edge.color ?? defaultStroke } : undefined });
+        await Promise.all(textSkeletons.map((skeleton) => {
+          const fontSize = typeof skeleton.fontSize === "number" ? skeleton.fontSize : 20;
+          return document.fonts.load(`${fontSize}px Excalifont`, skeleton.text as string);
+        }));
+        await document.fonts.ready;
+        const measuredSkeletons = built.skeletons.map((skeleton) => {
+          const measured = { ...skeleton };
+          if (measured.type === "text") measured.fontFamily = FONT_FAMILY.Excalifont;
+          if (measured.label && typeof measured.label === "object") {
+            measured.label = { ...(measured.label as Record<string, unknown>), fontFamily: FONT_FAMILY.Excalifont };
+          }
+          return measured;
+        });
+        // Keep the IDs minted by Draw so the MCP result can reliably map the
+        // caller's node and edge IDs back to editable scene elements.
+        const created = convertToExcalidrawElements(measuredSkeletons as any[], { regenerateIds: false });
+        for (const element of created as any[]) {
+          if (element.type !== "text" || element.containerId || typeof element.text !== "string") continue;
+          const size = typeof element.fontSize === "number" ? element.fontSize : 20;
+          element.width = Math.max(element.width ?? 0, Math.ceil(renderedTextWidth(element.text, size)) + 2);
         }
-        const created = convertToExcalidrawElements(skeletons);
-        affected = created.map((element: any) => element.id);
-        elements = [...elements, ...created as any[]];
+        const labelIds = new Map<string, string>();
+        for (const element of created as any[]) {
+          if (element.type === "text" && element.containerId) labelIds.set(element.containerId, element.id);
+        }
+        const routedCreated = routeBoundArrows(created as any[]);
+        const nodes = Object.fromEntries(Object.entries(built.nodeElementIds).map(([inputId, elementId]) => [inputId, elementId]));
+        const nodeLabels = Object.fromEntries(Object.entries(built.nodeElementIds).flatMap(([inputId, elementId]) => {
+          const labelId = labelIds.get(elementId);
+          return labelId ? [[inputId, labelId]] : [];
+        }));
+        const edges = built.edgeElementIds.map((elementId, index) => ({
+          elementId,
+          ...(labelIds.has(elementId) ? { labelElementId: labelIds.get(elementId) } : {}),
+          inputIndex: index,
+        }));
+        const titleElement = event.input.title && (created as any[]).find((element) => element.type === "text" && !element.containerId && element.text === event.input.title);
+        elements = [...elements, ...routedCreated as any[]];
+        result = {
+          addedElementIds: created.map((element: any) => element.id),
+          nodes, nodeLabels, edges,
+          ...(titleElement ? { titleElementId: titleElement.id } : {}),
+        };
       } else {
-        const result = applyElementUpdates(elements, event.input.updates);
-        elements = result.elements;
-        affected = result.updatedIds;
+        const update = applyElementUpdates(elements, event.input.updates, measureTextWithExcalidraw);
+        elements = update.elements;
+        result = { updatedElementIds: update.updatedIds };
       }
-      api.updateScene({ elements });
       const state = api.getAppState() as any;
       const next = fromExcalidrawScene({ elements, appState: state, files: api.getFiles() }, {
         id: current.document.id, title: current.document.title,
         background: current.document.canvas.background,
         viewport: current.document.canvas.viewport,
       });
+      api.updateScene({ elements, captureUpdate: CaptureUpdateAction.IMMEDIATELY });
       setDocument(next);
-      await saveCurrentDocument(next);
-      await syncBridgeDocument(next);
+      applied = { document: next, result };
+      const warning = await persistAppliedDocument(
+        next,
+        saveCurrentDocument,
+        syncBridgeDocument,
+      );
+      if (warning) {
+        setStatus("error");
+        setMessage(warning);
+      } else setStatus("saved");
       const acknowledgement = await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ id: event.id, clientId: clientId.current, result: event.operation === "create_diagram" ? { addedElementIds: affected } : { updatedElementIds: affected } }),
+        body: JSON.stringify({ id: event.id, clientId: clientId.current, document: next, result, ...(warning ? { warning } : {}) }),
       });
       if (!acknowledgement.ok) throw new Error(`Draw MCP bridge rejected the command acknowledgement (HTTP ${acknowledgement.status}).`);
     } catch (error) {
+      if (applied) {
+        const warning = `The edit was applied but the MCP acknowledgement failed: ${error instanceof Error ? error.message : String(error)}. Call get_current_canvas before retrying.`;
+        setStatus("error");
+        setMessage(warning);
+        await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ id: event.id, clientId: clientId.current, document: applied.document, result: applied.result, warning }),
+        }).catch(() => undefined);
+        return;
+      }
       await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ id: event.id, clientId: clientId.current, error: error instanceof Error ? error.message : String(error) }),
@@ -238,11 +408,53 @@ export default function App() {
     }
   }, [autosaveBlocked, setDocument, syncBridgeDocument]);
 
+  const handleBridgeFlush = useCallback(async (event: BridgeFlush) => {
+    const api = apiRef.current;
+    const current = docRef.current;
+    if (!api || !current || event.clientId !== clientId.current || !writerOwned.current) return;
+    try {
+      const state = api.getAppState() as any;
+      const next = fromExcalidrawScene({
+        elements: api.getSceneElementsIncludingDeleted() as any[],
+        appState: state,
+        files: api.getFiles(),
+      }, {
+        id: current.document.id,
+        title: current.document.title,
+        background: current.document.canvas.background,
+        viewport: {
+          x: typeof state.scrollX === "number" ? state.scrollX : current.document.canvas.viewport.x,
+          y: typeof state.scrollY === "number" ? state.scrollY : current.document.canvas.viewport.y,
+          zoom: typeof state.zoom?.value === "number" ? state.zoom.value : current.document.canvas.viewport.zoom,
+        },
+      });
+      setDocument(next);
+      if (!autosaveBlocked) {
+        autosave.schedule(next);
+        bridgeAutosave.schedule(next);
+        await Promise.all([autosave.flush(), bridgeAutosave.flush()]);
+      } else await syncBridgeDocument(next);
+      await fetch(`/__draw/api/document/flush/${encodeURIComponent(event.id)}`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: event.id, clientId: clientId.current, document: next }),
+      });
+    } catch (error) {
+      await fetch(`/__draw/api/document/flush/${encodeURIComponent(event.id)}`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: event.id, clientId: clientId.current, error: error instanceof Error ? error.message : String(error) }),
+      }).catch(() => undefined);
+    }
+  }, [autosave, autosaveBlocked, bridgeAutosave, setDocument, syncBridgeDocument]);
+
   useEffect(() => {
     if (!import.meta.hot) return;
     import.meta.hot.on("draw:mcp-command", handleMcpCommand);
-    return () => import.meta.hot?.off("draw:mcp-command", handleMcpCommand);
-  }, [handleMcpCommand]);
+    import.meta.hot.on("draw:flush-document", handleBridgeFlush);
+    return () => {
+      import.meta.hot?.off("draw:mcp-command", handleMcpCommand);
+      import.meta.hot?.off("draw:flush-document", handleBridgeFlush);
+    };
+  }, [handleBridgeFlush, handleMcpCommand]);
 
   const initialData = useMemo(() => {
     if (!doc) return undefined;
@@ -256,17 +468,21 @@ export default function App() {
   }, [doc?.document.id, editorKey]);
   if (!doc || status === "loading") return <main className="loading-screen"><div className="brand-mark">D</div><p>Preparing your canvas…</p></main>;
   const background = doc.document.canvas.background.preset;
-  const statusText = status === "saving" ? "Saving locally…" : status === "saved" ? "Saved on this device" : status === "error" ? "Save issue" : "All changes saved";
+  const statusText = !canWrite ? "Read-only in this tab" : status === "saving" ? "Saving locally…" : status === "saved" ? "Saved on this device" : status === "error" ? "Save issue" : "All changes saved";
 
   return <main className={`draw-app bg-${background}`}>
     <header className="topbar">
-      <div className="brand"><span className="brand-mark">D</span><span className="brand-name">draw</span><span className="brand-divider"/><span className="doc-title"><input ref={titleInput} aria-label="Drawing title" value={doc.document.title} onChange={(event) => {
+      <div className="brand"><span className="brand-mark">D</span><span className="brand-name">draw</span><span className="brand-divider"/><span className="doc-title"><input ref={titleInput} aria-label="Drawing title" disabled={!canWrite} value={doc.document.title} onChange={(event) => {
         const next = { ...doc, document: { ...doc.document, title: event.target.value } };
-        setDocument(next); void syncBridgeDocument(next).catch(() => undefined);
-      }} onBlur={() => { if (!autosaveBlocked && docRef.current) void saveCurrentDocument(docRef.current); }} /></span></div>
+        setDocument(next);
+        if (autosaveBlocked) { setStatus("error"); return; }
+        setStatus("saving");
+        autosave.schedule(next);
+        bridgeAutosave.schedule(next);
+      }} /></span></div>
       <div className="toolbar-actions">
         <span className={`save-indicator ${status}`}><i />{statusText}</span>
-        <button className="button button-quiet" onClick={() => fileInput.current?.click()} title="Open editable .draw file">Open</button>
+        <button className="button button-quiet" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open editable .draw file" : "Close the other Draw tab to open files here"}>Open</button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
         <button className="button button-primary" onClick={saveFile} title="Save the complete editable Draw file"><span className="button-icon">↓</span>Save .draw</button>
         <div className="export-group"><button className="button button-quiet export-main" onClick={() => void exportImage("image/png")}>Export</button><select aria-label="Image export format" value="image/png" onChange={(event) => void exportImage(event.target.value as "image/png" | "image/jpeg")}><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option></select></div>
@@ -276,8 +492,8 @@ export default function App() {
       <aside className="side-rail">
         <div className="rail-label">CANVAS</div>
         <div className="background-picker" role="group" aria-label="Canvas background">
-          <button className={`background-option ${background === "blackboard" ? "active" : ""}`} onClick={() => selectBackground("blackboard")} aria-pressed={background === "blackboard"}><span className="swatch swatch-chalk"><b>✳</b></span><span>Blackboard</span></button>
-          <button className={`background-option ${background === "white" ? "active" : ""}`} onClick={() => selectBackground("white")} aria-pressed={background === "white"}><span className="swatch swatch-paper"><b>◌</b></span><span>White</span></button>
+          <button disabled={!canWrite} className={`background-option ${background === "blackboard" ? "active" : ""}`} onClick={() => selectBackground("blackboard")} aria-pressed={background === "blackboard"}><span className="swatch swatch-chalk"><b>✳</b></span><span>Blackboard</span></button>
+          <button disabled={!canWrite} className={`background-option ${background === "white" ? "active" : ""}`} onClick={() => selectBackground("white")} aria-pressed={background === "white"}><span className="swatch swatch-paper"><b>◌</b></span><span>White</span></button>
         </div>
         <div className="rail-separator" />
         <div className="rail-label">QUICK START</div>
@@ -287,7 +503,7 @@ export default function App() {
       </aside>
       <section className="canvas-area" aria-label="Drawing canvas">
         <div className="canvas-label"><span className="canvas-live"/>Infinite canvas <span className="dot-separator">·</span> {background === "blackboard" ? "Chalkboard" : "White"}</div>
-    <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onChange} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS} /></div>
+    <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onChange} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS} /></div>
       </section>
     </div>
     {message && <div className="toast" role="status"><span>{message}</span><button onClick={() => setMessage("")} aria-label="Dismiss message">×</button></div>}

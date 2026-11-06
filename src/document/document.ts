@@ -110,8 +110,9 @@ const copyJsonValue = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
 const defaultAppState = (background: DrawBackground, viewport: DrawViewport) => ({
   viewBackgroundColor:
-    background.color ??
-    (background.preset === "white" ? DEFAULT_WHITE_COLOR : DEFAULT_BLACKBOARD_COLOR),
+    background.preset === "blackboard"
+      ? "transparent"
+      : background.color ?? DEFAULT_WHITE_COLOR,
   scrollX: viewport.x,
   scrollY: viewport.y,
   zoom: { value: viewport.zoom },
@@ -329,7 +330,7 @@ export function toExcalidrawScene(doc: DrawDocument): {
     (doc.document.canvas.background.preset === "white" ? DEFAULT_WHITE_COLOR : DEFAULT_BLACKBOARD_COLOR);
   const appState = {
     ...copyJsonValue(doc.document.appState),
-    viewBackgroundColor: backgroundColor,
+    viewBackgroundColor: doc.document.canvas.background.preset === "blackboard" ? "transparent" : backgroundColor,
     scrollX: doc.document.canvas.viewport.x,
     scrollY: doc.document.canvas.viewport.y,
     zoom: { value: doc.document.canvas.viewport.zoom },
@@ -395,29 +396,58 @@ export function normalizeLegacyDraw(raw: unknown): DrawDocument {
 function normalizeVersionOneDocument(raw: Record<string, unknown>): DrawDocument {
   if (!isRecord(raw.document)) throw new DrawDocumentError("Draw document is missing its document data.");
   const source = raw.document;
-  if (!isRecord(source.canvas)) throw new DrawDocumentError("Canvas data is missing.");
+  if (typeof source.id !== "string" || source.id.length === 0) {
+    throw new DrawDocumentError("Document id must be a non-empty string.");
+  }
+  if (typeof source.title !== "string") {
+    throw new DrawDocumentError("Document title must be a string.");
+  }
+  if (!isRecord(source.canvas) || source.canvas.infinite !== true) {
+    throw new DrawDocumentError("Canvas must be an infinite Draw canvas.");
+  }
   const canvas = source.canvas;
-  const background = isRecord(canvas.background)
-    ? ({ ...canvas.background } as unknown as DrawBackground)
-    : { ...DEFAULT_BACKGROUND };
-  const viewport = normalizeViewport(canvas.viewport);
-  const assets = normalizeLegacyAssets(source.assets);
-  const sceneElements = Array.isArray(source.elements) ? source.elements : [];
-  const appState = isRecord(source.appState)
-    ? copyJsonValue(source.appState)
-    : defaultAppState(background, viewport);
+  if (!isRecord(canvas.background)) {
+    throw new DrawDocumentError("Canvas background must be an object.");
+  }
+  if (!isRecord(canvas.viewport)) {
+    throw new DrawDocumentError("Canvas viewport must be an object.");
+  }
+  if (
+    !finite(canvas.viewport.x) ||
+    !finite(canvas.viewport.y) ||
+    !finite(canvas.viewport.zoom) ||
+    canvas.viewport.zoom <= 0
+  ) {
+    throw new DrawDocumentError("Canvas viewport must contain finite x/y coordinates and positive zoom.");
+  }
+  if (!Array.isArray(source.elements)) {
+    throw new DrawDocumentError("Document elements must be an array.");
+  }
+  if (!isRecord(source.appState)) {
+    throw new DrawDocumentError("Document appState must be an object.");
+  }
+  if (!isRecord(source.assets)) {
+    throw new DrawDocumentError("Document assets must be an object map.");
+  }
+  const background = { ...canvas.background } as unknown as DrawBackground;
+  const viewport = { ...canvas.viewport } as unknown as DrawViewport;
+  const assets = copyJsonValue(source.assets) as Record<string, DrawAsset>;
+  const sceneElements = source.elements;
+  const appState = copyJsonValue(source.appState);
 
   return {
     format: "draw",
     formatVersion: FORMAT_VERSION,
     document: {
-      id: typeof source.id === "string" && source.id ? source.id : makeId(),
-      title: typeof source.title === "string" ? source.title : "Untitled drawing",
+      id: source.id,
+      title: source.title,
       canvas: {
         infinite: true,
         background,
         viewport,
-        ...(isRecord(canvas.previewBounds) ? { previewBounds: canvas.previewBounds as DrawDocument["document"]["canvas"]["previewBounds"] } : {}),
+        ...(canvas.previewBounds !== undefined
+          ? { previewBounds: canvas.previewBounds as DrawDocument["document"]["canvas"]["previewBounds"] }
+          : {}),
       },
       elements: copyJsonValue(sceneElements) as DrawElement[],
       appState,

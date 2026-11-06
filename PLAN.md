@@ -83,13 +83,19 @@ Connect Codex to the open document for diagram creation and targeted edits. Veri
 
 ## First-release acceptance checks
 
-- Create more than one diagram on the same infinite canvas; pan and zoom between them.
-- Switch between Blackboard and White and confirm the choice persists after reopening.
-- Create text, freehand strokes, shapes, arrows, and embedded assets; save as `.draw`, close, and reopen.
-- Confirm every saved object is still individually selectable and editable, with geometry, colors, text, relationships, assets, background, and viewport restored.
-- Export PNG and JPEG and confirm they include the selected background while the `.draw` file remains the editable source.
-- Create a diagram through MCP, edit it manually, save/reopen it, and confirm the result remains intact.
-- Use the supplied Specification → Implementation → Validation example as a visual check for layout, chalk contrast, yellow emphasis, and editability.
+- Create more than one diagram on the same infinite canvas; pan and zoom between them. **[Status: covered]**
+- Switch between Blackboard and White and confirm the choice persists after reopening. **[Status: covered]**
+- Create text, freehand strokes, shapes, arrows, and embedded assets; save as `.draw`, close, and reopen. **[Status: covered in Chrome E2E]**
+- Confirm every saved object is still individually selectable and editable, with geometry, colors, text, relationships, assets, background, and viewport restored. **[Status: covered in Chrome E2E]**
+- Export PNG and JPEG and confirm they include the selected background while the `.draw` file remains the editable source. **[Status: covered]**
+- Create a diagram through MCP, edit it manually, save/reopen it, and confirm the result remains intact. **[Status: covered in Chrome E2E]**
+- Use the supplied Specification → Implementation → Validation example as a visual check for layout, chalk contrast, yellow emphasis, and editability. **[Status: covered in Chrome E2E using the committed top-row reconstruction; lower human/machine illustrations remain visual guidance]**
+
+## V1 implementation status
+
+The core local-first V1 is implemented: one infinite canvas, Blackboard/White presets, editable `.draw` save/open, browser-local autosave, flattened PNG/JPEG export, and MCP creation/targeted edits. All listed acceptance flows are covered in automated Chrome E2E, including pan/zoom, manual drawing, both backgrounds, editable save/reopen, assets, image exports, reference flow, and MCP edits. Safari and Firefox have not been checked. The MCP bridge currently requires the Vite development server and an open Draw tab; a packaged production/desktop host is outside the current local development workflow and still needs explicit scope for release.
+
+Estimate: after the current review fixes, the remaining acceptance and visual-polish work is roughly **2–4 hours**, assuming the local Vite workflow is acceptable for V1. A standalone production app and MCP host would be additional work, likely **a few days**, depending on the packaging target.
 
 ## Revisit after the first release
 

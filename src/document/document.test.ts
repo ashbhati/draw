@@ -89,7 +89,7 @@ describe("Draw document contract", () => {
   it("round-trips an Excalidraw scene through the document adapters without losing engine fields", () => {
     const scene = {
       elements: [exampleElement],
-      appState: { viewBackgroundColor: "#18191a", scrollX: 12, scrollY: -7, zoom: { value: 2 } },
+      appState: { viewBackgroundColor: "transparent", scrollX: 12, scrollY: -7, zoom: { value: 2 } },
       files: {
         "image-1": {
           id: "image-1",
@@ -204,6 +204,27 @@ describe("Draw document contract", () => {
     const doc = createEmptyDocument();
     doc.document.canvas.viewport.x = Number.NaN;
     expect(() => validateDrawDocument(doc)).toThrow(/viewport/i);
+  });
+
+  it.each([
+    ["missing elements", (raw: Record<string, any>) => { delete raw.document.elements; }],
+    ["misspelled elements", (raw: Record<string, any>) => { raw.document.elments = raw.document.elements; delete raw.document.elements; }],
+    ["non-array elements", (raw: Record<string, any>) => { raw.document.elements = {}; }],
+    ["non-object background", (raw: Record<string, any>) => { raw.document.canvas.background = "blackboard"; }],
+    ["non-finite viewport", (raw: Record<string, any>) => { raw.document.canvas.viewport.x = Infinity; }],
+    ["non-finite zoom", (raw: Record<string, any>) => { raw.document.canvas.viewport.zoom = NaN; }],
+    ["non-positive zoom", (raw: Record<string, any>) => { raw.document.canvas.viewport.zoom = 0; }],
+  ])("rejects malformed V1 structure (%s) as INVALID_DOCUMENT", (_name, corrupt) => {
+    const raw = JSON.parse(serializeDrawFile(createEmptyDocument()));
+    corrupt(raw);
+
+    try {
+      parseDrawFile(raw);
+      throw new Error("Expected invalid document to be rejected");
+    } catch (error) {
+      expect(error).toBeInstanceOf(DrawDocumentError);
+      expect((error as DrawDocumentError).code).toBe("INVALID_DOCUMENT");
+    }
   });
 
   it("refuses values that JSON would silently discard from an editable document", () => {

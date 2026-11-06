@@ -11,6 +11,7 @@ function createBridgeHarness(plugin: Plugin) {
   let middleware: Middleware | undefined;
   const events: Array<{ event: string; data: any }> = [];
   const server = {
+    config: { server: { port: 5173 } },
     middlewares: { use: (fn: Middleware) => (middleware = fn) },
     ws: { send: (event: string, data: unknown) => events.push({ event, data }) },
   } as unknown as ViteDevServer;
@@ -62,11 +63,22 @@ describe("Draw MCP Vite bridge", () => {
     expect(wrongType.status).toBe(415);
   });
 
+  it("rejects matching attacker-controlled Host and Origin values", async () => {
+    const bridge = createBridgeHarness(createDrawMcpPlugin());
+    const response = await bridge.request("GET", "/__draw/api/health", undefined, "127.0.0.1", {
+      host: "evil.example:5173",
+      origin: "http://evil.example:5173",
+    });
+
+    expect(response.status).toBe(403);
+    expect(response.body.error).toMatch(/configured loopback host/i);
+  });
+
   it("delivers a command to the active canvas and stores its acknowledged scene", async () => {
     const bridge = createBridgeHarness(createDrawMcpPlugin({ commandTimeoutMs: 1_000 }));
     const document = createEmptyDocument("MCP test");
     expect((await bridge.request("PUT", "/__draw/api/client", { clientId: "tab-1" })).status).toBe(200);
-    expect((await bridge.request("PUT", "/__draw/api/document", document)).status).toBe(200);
+    expect((await bridge.request("PUT", "/__draw/api/document", { clientId: "tab-1", document })).status).toBe(200);
 
     const commandResponse = bridge.request("POST", "/__draw/api/commands", {
       operation: "create_diagram",
@@ -87,7 +99,7 @@ describe("Draw MCP Vite bridge", () => {
 
     const updated = structuredClone(document);
     updated.document.elements.push({ id: "one", type: "rectangle", x: 0, y: 0 });
-    const documentSync = await bridge.request("PUT", "/__draw/api/document", updated);
+    const documentSync = await bridge.request("PUT", "/__draw/api/document", { clientId: "tab-1", document: updated });
     expect(documentSync.status).toBe(200);
     const ack = await bridge.request("POST", `/__draw/api/commands/${message.id}/ack`, {
       id: message.id,
@@ -102,6 +114,70 @@ describe("Draw MCP Vite bridge", () => {
     const current = await bridge.request("GET", "/__draw/api/document");
     expect(current.body.document.elements).toHaveLength(1);
     expect(current.body.document.elements[0].id).toBe("one");
+  });
+
+  it("rejects document syncs from tabs that do not own the active canvas", async () => {
+    const bridge = createBridgeHarness(createDrawMcpPlugin());
+    const active = createEmptyDocument("Active tab");
+    const stale = createEmptyDocument("Stale tab");
+    await bridge.request("PUT", "/__draw/api/client", { clientId: "tab-1" });
+    await bridge.request("PUT", "/__draw/api/document", { clientId: "tab-1", document: active });
+    await bridge.request("PUT", "/__draw/api/client", { clientId: "tab-2" });
+
+    const staleWrite = await bridge.request("PUT", "/__draw/api/document", { clientId: "tab-1", document: stale });
+
+    expect(staleWrite.status).toBe(409);
+    const current = await bridge.request("GET", "/__draw/api/document");
+    expect(current.body.document.title).toBe("Active tab");
+  });
+
+  it("flushes the active tab before a freshness-requested canvas read", async () => {
+    const bridge = createBridgeHarness(createDrawMcpPlugin({ flushTimeoutMs: 1_000 }));
+    const original = createEmptyDocument("Before edit");
+    await bridge.request("PUT", "/__draw/api/client", { clientId: "tab-1" });
+    await bridge.request("PUT", "/__draw/api/document", { clientId: "tab-1", document: original });
+
+    const readPromise = bridge.request("GET", "/__draw/api/document?flush=1");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const message = bridge.events.find(({ event }) => event === "draw:flush-document")?.data;
+    expect(message).toMatchObject({ clientId: "tab-1" });
+
+    const edited = structuredClone(original);
+    edited.document.elements.push({ id: "immediate-edit", type: "rectangle" });
+    const ack = await bridge.request("POST", `/__draw/api/document/flush/${message.id}`, {
+      clientId: "tab-1", document: edited,
+    });
+    expect(ack.status).toBe(200);
+    const read = await readPromise;
+    expect(read.status).toBe(200);
+    expect(read.body.document.elements[0].id).toBe("immediate-edit");
+  });
+
+  it("accepts a late acknowledgement after returning a timeout and tells callers to inspect before retrying", async () => {
+    const bridge = createBridgeHarness(createDrawMcpPlugin({ commandTimeoutMs: 5, lateAckRetentionMs: 1_000 }));
+    const document = createEmptyDocument("MCP timeout");
+    await bridge.request("PUT", "/__draw/api/client", { clientId: "tab-1" });
+    await bridge.request("PUT", "/__draw/api/document", { clientId: "tab-1", document });
+    const commandResponse = bridge.request("POST", "/__draw/api/commands", {
+      operation: "create_diagram",
+      input: { nodes: [{ id: "a", label: "A", x: 0, y: 0 }], edges: [] },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const message = bridge.events.find(({ event }) => event === "draw:mcp-command")?.data;
+    const timeout = await commandResponse;
+    expect(timeout.status).toBe(504);
+    expect(timeout.body.error).toMatch(/get_current_canvas.*before retrying/i);
+
+    const lateDocument = structuredClone(document);
+    lateDocument.document.elements.push({ id: "late-shape", type: "rectangle" });
+    const ack = await bridge.request("POST", `/__draw/api/commands/${message.id}/ack`, {
+      clientId: "tab-1",
+      document: lateDocument,
+      result: { addedElementIds: ["late-shape"] },
+    });
+    expect(ack.status).toBe(200);
+    expect(ack.body.late).toBe(true);
+    expect((await bridge.request("GET", "/__draw/api/document")).body.document.elements[0].id).toBe("late-shape");
   });
 
   it("returns a clear conflict when no canvas client is registered", async () => {
