@@ -1,51 +1,53 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="600" viewBox="0 0 1000 600">
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800">
   <defs>
     <radialGradient id="slate" cx="50%" cy="46%" r="78%">
       <stop offset="0" stop-color="#1c1d1e" />
       <stop offset=".58" stop-color="#1a1b1c" />
       <stop offset="1" stop-color="#121314" />
     </radialGradient>
-    <filter id="chalk-surface" x="-5%" y="-5%" width="110%" height="110%" color-interpolation-filters="sRGB">
-      <feTurbulence type="fractalNoise" baseFrequency=".008 .014" numOctaves="3" seed="17" result="slate-wear" />
+    <filter id="chalk-surface" x="-12%" y="-12%" width="124%" height="124%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency=".008 .014" numOctaves="3" seed="17" stitchTiles="stitch" result="slate-wear" />
       <feColorMatrix in="slate-wear" type="saturate" values="0" result="gray-wear" />
       <feComponentTransfer in="gray-wear" result="faint-wear"><feFuncA type="linear" slope=".08" /></feComponentTransfer>
       <feBlend in="SourceGraphic" in2="faint-wear" mode="soft-light" result="worn-slate" />
-      <feTurbulence type="fractalNoise" baseFrequency=".3 .36" numOctaves="3" seed="8" result="chalk-grain" />
+      <feTurbulence type="fractalNoise" baseFrequency=".3 .36" numOctaves="3" seed="8" stitchTiles="stitch" result="chalk-grain" />
       <feColorMatrix in="chalk-grain" type="saturate" values="0" result="gray-grain" />
       <feComponentTransfer in="gray-grain" result="fine-grain"><feFuncA type="linear" slope=".28" /></feComponentTransfer>
       <feBlend in="worn-slate" in2="fine-grain" mode="overlay" />
     </filter>
-    <filter id="rough-chalk" x="-14%" y="-40%" width="128%" height="180%" color-interpolation-filters="sRGB">
-      <feTurbulence type="fractalNoise" baseFrequency=".018 .035" numOctaves="2" seed="31" result="chalk-edge" />
+    <filter id="rough-chalk" x="-25%" y="-150%" width="150%" height="400%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency=".018 .035" numOctaves="2" seed="31" stitchTiles="stitch" result="chalk-edge" />
       <feDisplacementMap in="SourceGraphic" in2="chalk-edge" scale="28" xChannelSelector="R" yChannelSelector="G" result="rough-stroke" />
-      <feGaussianBlur in="rough-stroke" stdDeviation="3" />
+      <feGaussianBlur in="rough-stroke" stdDeviation="2" />
     </filter>
-    <filter id="soft-dust" x="-12%" y="-20%" width="124%" height="140%" color-interpolation-filters="sRGB">
-      <feTurbulence type="fractalNoise" baseFrequency=".04 .08" numOctaves="2" seed="22" result="dust-edge" />
+    <filter id="soft-dust" x="-30%" y="-200%" width="160%" height="500%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency=".04 .08" numOctaves="2" seed="22" stitchTiles="stitch" result="dust-edge" />
       <feDisplacementMap in="SourceGraphic" in2="dust-edge" scale="14" xChannelSelector="R" yChannelSelector="G" result="rough-dust" />
       <feGaussianBlur in="rough-dust" stdDeviation="4" />
     </filter>
-    <filter id="chalk-scratch" x="-8%" y="-16%" width="116%" height="132%" color-interpolation-filters="sRGB">
-      <feTurbulence type="fractalNoise" baseFrequency=".04 .07" numOctaves="2" seed="41" result="scratch-edge" />
+    <filter id="chalk-scratch" x="-15%" y="-150%" width="130%" height="400%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency=".04 .07" numOctaves="2" seed="41" stitchTiles="stitch" result="scratch-edge" />
       <feDisplacementMap in="SourceGraphic" in2="scratch-edge" scale="10" xChannelSelector="R" yChannelSelector="G" />
     </filter>
   </defs>
 
-  <rect width="1000" height="600" fill="url(#slate)" filter="url(#chalk-surface)" />
+  <rect width="1280" height="800" fill="url(#slate)" filter="url(#chalk-surface)" />
+
+  <g transform="translate(128 100) scale(.9)">
 
   <!-- Broad, uneven wipe marks and chalky residue, kept close to the slate tone. -->
-  <g fill="none" stroke="#aaa8a1" stroke-linecap="round" filter="url(#rough-chalk)">
-    <path d="M -54 122 C 16 75 86 85 146 120 S 226 161 276 129" stroke-width="78" opacity=".09" />
-    <path d="M 344 91 C 411 59 466 70 517 104 S 602 146 661 116" stroke-width="54" opacity=".075" />
-    <path d="M 748 133 C 813 94 864 103 922 139 S 1001 168 1058 127" stroke-width="92" opacity=".085" />
-    <path d="M 31 286 C 99 245 156 248 210 279 S 280 318 329 287" stroke-width="56" opacity=".07" />
-    <path d="M 636 274 C 706 238 773 239 820 273 S 908 313 977 279" stroke-width="78" opacity=".075" />
-    <path d="M -40 463 C 30 414 91 418 149 452 S 233 491 291 459" stroke-width="104" opacity=".085" />
-    <path d="M 389 478 C 456 445 504 444 555 470 S 632 508 681 476" stroke-width="62" opacity=".07" />
-    <path d="M 805 446 C 870 407 921 419 969 449 S 1021 468 1060 443" stroke-width="88" opacity=".085" />
-    <path d="M 66 33 C 121 68 172 13 227 35 S 287 56 327 39" stroke-width="42" opacity=".065" />
-    <path d="M 456 222 C 502 197 542 209 572 234 M 716 385 C 758 357 805 356 844 379" stroke-width="38" opacity=".055" />
-    <path d="M 177 575 C 153 524 181 475 226 451 M 730 586 C 701 537 727 493 773 470" stroke-width="32" opacity=".055" />
+  <g fill="none" stroke="#aaa8a1" stroke-linecap="butt" filter="url(#rough-chalk)">
+    <path d="M -54 88 C 23 34 96 48 142 96 S 216 147 278 112" stroke-width="78" opacity=".115" />
+    <path d="M 346 116 C 395 56 468 49 508 91 S 564 153 625 115" stroke-width="56" opacity=".105" transform="rotate(18 500 110)" />
+    <path d="M 746 48 C 795 89 844 41 891 68 S 948 125 1054 77" stroke-width="84" opacity=".11" />
+    <path d="M 20 249 C 88 188 149 207 194 254 S 276 306 330 253" stroke-width="98" opacity=".135" />
+    <path d="M 398 365 C 435 309 501 326 527 383 S 579 449 636 402" stroke-width="66" opacity=".115" transform="rotate(-12 520 380)" />
+    <path d="M 713 174 C 769 121 833 151 859 205 S 922 271 985 220" stroke-width="90" opacity=".12" transform="rotate(13 850 205)" />
+    <path d="M 116 432 C 171 381 236 392 267 442 S 324 528 402 491" stroke-width="92" opacity=".135" />
+    <path d="M 494 323 C 531 268 590 261 620 309 S 671 390 734 348" stroke-width="74" opacity=".115" transform="rotate(16 610 335)" />
+    <path d="M 790 506 C 830 455 880 474 907 522 S 956 587 1022 545" stroke-width="90" opacity=".12" transform="rotate(-14 900 520)" />
+    <path d="M 30 565 C 93 511 151 527 187 573 S 248 608 291 573 M 632 545 C 679 501 723 514 752 550 S 814 596 865 558" stroke-width="58" opacity=".105" />
+    <path d="M 279 179 C 320 152 362 165 379 203 M 927 182 C 965 211 969 251 946 282" stroke-width="48" opacity=".095" />
   </g>
 
   <!-- Irregular curved scrapes and chalk dust trails remain visible through the soft residue. -->
@@ -61,14 +63,14 @@
 
   <!-- Layered curved wipe strokes leave uneven chalk edges instead of smooth haze. -->
   <g fill="none" stroke="#c0beb7" stroke-linecap="round" filter="url(#soft-dust)">
-    <path d="M 8 213 C 58 144 105 112 161 115 S 234 147 274 165" stroke-width="31" opacity=".095" />
-    <path d="M 312 201 C 374 148 425 147 468 175 S 518 207 553 193" stroke-width="18" opacity=".07" />
-    <path d="M 723 156 C 786 116 830 118 872 140 S 925 166 971 157" stroke-width="38" opacity=".085" />
-    <path d="M 71 366 C 124 328 174 325 216 344 S 260 378 300 382" stroke-width="25" opacity=".08" />
-    <path d="M 486 383 C 536 348 580 340 621 358 S 672 391 703 384" stroke-width="14" opacity=".065" />
-    <path d="M 818 368 C 872 323 916 326 959 354 S 1000 384 1035 371" stroke-width="32" opacity=".09" />
-    <path d="M 152 541 C 199 500 240 496 276 516 S 315 543 348 543" stroke-width="20" opacity=".08" />
-    <path d="M 586 536 C 631 505 671 492 703 507 M 756 250 C 804 222 848 218 884 231" stroke-width="11" opacity=".07" />
+    <path d="M 18 199 C 72 120 114 105 165 123 S 236 169 270 185" stroke-width="44" opacity=".12" />
+    <path d="M 311 286 C 359 226 412 205 452 228 S 501 272 550 257" stroke-width="26" opacity=".095" transform="rotate(11 430 245)" />
+    <path d="M 704 139 C 760 103 821 119 852 163 S 899 213 969 184" stroke-width="48" opacity=".11" />
+    <path d="M 98 418 C 141 380 186 389 222 430 S 254 472 309 461" stroke-width="36" opacity=".11" transform="rotate(-10 205 425)" />
+    <path d="M 481 310 C 526 267 575 272 604 311 S 662 370 718 344" stroke-width="25" opacity=".095" transform="rotate(15 600 320)" />
+    <path d="M 846 370 C 885 326 929 340 953 378 S 987 430 1038 410" stroke-width="42" opacity=".105" transform="rotate(-13 940 375)" />
+    <path d="M 147 518 C 192 466 245 474 278 514 S 320 561 360 544" stroke-width="30" opacity=".105" />
+    <path d="M 566 528 C 603 484 647 482 680 512 M 776 247 C 815 212 853 213 889 238" stroke-width="20" opacity=".09" />
   </g>
 
   <!-- Short, broken chalk scuffs follow the wipe motion without repeating a grid. -->
@@ -79,5 +81,6 @@
     <path d="M 95 489 C 127 469 150 457 183 456 M 207 461 C 238 447 262 433 288 426" stroke-width="6" opacity=".11" />
     <path d="M 564 482 C 594 468 621 450 649 449 M 675 454 C 702 439 727 431 753 430" stroke-width="7" opacity=".11" />
     <path d="M 786 550 C 817 531 842 521 868 520 M 888 527 C 920 513 945 502 969 487" stroke-width="6" opacity=".11" />
+  </g>
   </g>
 </svg>

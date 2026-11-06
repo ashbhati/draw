@@ -130,9 +130,11 @@ async function measureBoardTextureStats(page: Page, image: Buffer, mimeType = "i
     context.drawImage(bitmap, 0, 0);
     const { data } = context.getImageData(0, 0, bitmap.width, bitmap.height);
     const pixels: number[] = [];
+    // The same center-board region in live and exported images. This avoids
+    // Excalidraw's keyboard hint and toolbar controls in the live screenshot.
     const xBands: [number, number][] = [[0.34, 0.42], [0.58, 0.66]];
     for (const [startX, endX] of xBands) {
-      for (let y = Math.floor(bitmap.height * 0.12); y < bitmap.height * 0.9; y += 2) {
+      for (let y = Math.floor(bitmap.height * 0.3); y < bitmap.height * 0.7; y += 2) {
         for (let x = Math.floor(bitmap.width * startX); x < bitmap.width * endX; x += 2) {
           const offset = (y * bitmap.width + x) * 4;
           pixels.push(data[offset] * 0.2126 + data[offset + 1] * 0.7152 + data[offset + 2] * 0.0722);
@@ -142,6 +144,107 @@ async function measureBoardTextureStats(page: Page, image: Buffer, mimeType = "i
     const mean = pixels.reduce((sum, value) => sum + value, 0) / pixels.length;
     const standardDeviation = Math.sqrt(pixels.reduce((sum, value) => sum + (value - mean) ** 2, 0) / pixels.length);
     return { mean, standardDeviation };
+  }, { bytes: Array.from(image), mime: mimeType });
+}
+
+async function measureTextureSeamContrast(
+  page: Page,
+  image: Buffer,
+  axis: "vertical" | "horizontal",
+  seam: number,
+  mimeType = "image/png",
+): Promise<{ seamDifference: number; neighboringDifference: number }> {
+  return page.evaluate(async ({ bytes, axis, seam, mime }) => {
+    const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: mime }));
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Canvas pixel inspection is unavailable.");
+    context.drawImage(bitmap, 0, 0);
+    const { data } = context.getImageData(0, 0, bitmap.width, bitmap.height);
+    const luma = (x: number, y: number) => {
+      const offset = (y * bitmap.width + x) * 4;
+      return data[offset] * 0.2126 + data[offset + 1] * 0.7152 + data[offset + 2] * 0.0722;
+    };
+    const sampleCount = axis === "vertical" ? bitmap.height : bitmap.width;
+    const from = Math.floor(sampleCount * 0.25);
+    const to = Math.floor(sampleCount * 0.75);
+    const seamDiffs: number[] = [];
+    const neighborDiffs: number[] = [];
+    for (let index = from; index < to; index += 2) {
+      const before = axis === "vertical" ? luma(seam - 1, index) : luma(index, seam - 1);
+      const after = axis === "vertical" ? luma(seam, index) : luma(index, seam);
+      seamDiffs.push(Math.abs(after - before));
+      for (const offset of [-5, -4, -3, -2, 2, 3, 4, 5]) {
+        const x = axis === "vertical" ? seam + offset : index;
+        const y = axis === "horizontal" ? seam + offset : index;
+        neighborDiffs.push(Math.abs(luma(x, y) - luma(x - (axis === "vertical" ? 1 : 0), y - (axis === "horizontal" ? 1 : 0))));
+      }
+    }
+    const average = (values: number[]) => values.reduce((sum, value) => sum + value, 0) / values.length;
+    return { seamDifference: average(seamDiffs), neighboringDifference: average(neighborDiffs) };
+  }, { bytes: Array.from(image), axis, seam, mime: mimeType });
+}
+
+async function measureTexturePatchStdDev(
+  page: Page,
+  image: Buffer,
+  region: { x: number; y: number; width: number; height: number },
+): Promise<number> {
+  return page.evaluate(async ({ bytes, bounds }) => {
+    const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: "image/png" }));
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Canvas pixel inspection is unavailable.");
+    context.drawImage(bitmap, 0, 0);
+    const x = Math.floor(bitmap.width * bounds.x);
+    const y = Math.floor(bitmap.height * bounds.y);
+    const width = Math.floor(bitmap.width * bounds.width);
+    const height = Math.floor(bitmap.height * bounds.height);
+    const { data } = context.getImageData(x, y, width, height);
+    const values: number[] = [];
+    for (let i = 0; i < data.length; i += 4) values.push(data[i] * 0.2126 + data[i + 1] * 0.7152 + data[i + 2] * 0.0722);
+    const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+    return Math.sqrt(values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length);
+  }, { bytes: Array.from(image), bounds: region });
+}
+
+async function inspectTextureEdges(page: Page, image: Buffer, mimeType = "image/png") {
+  return page.evaluate(async ({ bytes, mime }) => {
+    const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: mime }));
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Canvas pixel inspection is unavailable.");
+    context.drawImage(bitmap, 0, 0);
+    const { data } = context.getImageData(0, 0, bitmap.width, bitmap.height);
+    const bandStats = (startX: number, endX: number) => {
+      const values: number[] = [];
+      for (let y = Math.floor(bitmap.height * 0.25); y < bitmap.height * 0.75; y += 2) {
+        for (let x = Math.floor(bitmap.width * startX); x < bitmap.width * endX; x += 2) {
+          const offset = (y * bitmap.width + x) * 4;
+          values.push(data[offset] * 0.2126 + data[offset + 1] * 0.7152 + data[offset + 2] * 0.0722);
+        }
+      }
+      const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+      const standardDeviation = Math.sqrt(values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length);
+      return { mean, standardDeviation };
+    };
+    return {
+      left: bandStats(0.005, 0.02), leftAdjacent: bandStats(0.03, 0.045),
+      right: bandStats(0.98, 0.995), rightAdjacent: bandStats(0.955, 0.97),
+    };
+  }, { bytes: Array.from(image), mime: mimeType });
+}
+
+async function getImageDimensions(page: Page, image: Buffer, mimeType = "image/png") {
+  return page.evaluate(async ({ bytes, mime }) => {
+    const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: mime }));
+    return { width: bitmap.width, height: bitmap.height };
   }, { bytes: Array.from(image), mime: mimeType });
 }
 
@@ -326,18 +429,23 @@ test("Meta+Shift+E cannot open Excalidraw's image exporter", async ({ page }) =>
   await expect(page.locator('a[href^="http"]')).toHaveCount(0);
 });
 
-test("Blackboard texture matches live and full-width PNG/JPEG diagram exports", async ({ page }) => {
+test("Blackboard texture is seam-safe across large live/PNG/JPEG canvases and shows through MCP nodes", async ({ page }) => {
   const createResponse = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
     input: { nodes: [
-      { id: "dark-fill", label: "Dark fill", x: 200, y: 180, width: 160, height: 280, color: "#18191a" },
-      { id: "wide-export-anchor", label: "Wide export", x: 1100, y: 180, width: 160, height: 280, color: "#18191a" },
+      { id: "dark-fill", label: "Readable node", x: 200, y: 180, width: 160, height: 280 },
+      { id: "wide-export-anchor", label: "Wide export", x: 2400, y: 700, width: 160, height: 160 },
     ], edges: [] },
   } });
   expect(createResponse.ok(), await createResponse.text()).toBeTruthy();
-  const viewport = { width: 1400, height: 800 };
+  const viewport = { width: 2400, height: 1700 };
   await page.setViewportSize(viewport);
   await page.waitForTimeout(100);
+  const document = await currentBridgeDocument(page);
+  expect(document.document.elements.filter((element: any) => element.type === "rectangle")).toEqual(expect.arrayContaining([
+    expect.objectContaining({ backgroundColor: "transparent", strokeColor: "#f6f2e9" }),
+  ]));
+  expect(document.document.elements.some((element: any) => element.type === "text" && element.text === "Readable node" && element.strokeColor === "#f6f2e9"), "node label remains chalk colored and readable").toBe(true);
   const liveBoard = await page.locator(".editor-shell").screenshot();
 
   const pngDownloadWait = page.waitForEvent("download");
@@ -347,6 +455,12 @@ test("Blackboard texture matches live and full-width PNG/JPEG diagram exports", 
   const jpegDownloadWait = page.waitForEvent("download");
   await page.getByLabel("Image export format").selectOption("image/jpeg");
   const jpeg = await readFile(await (await jpegDownloadWait).path());
+
+  for (const [format, image, mime] of [["live", liveBoard, "image/png"], ["PNG", png, "image/png"], ["JPEG", jpeg, "image/jpeg"]] as const) {
+    const dimensions = await getImageDimensions(page, image, mime);
+    expect(dimensions.width, `${format} width includes the x=2000 boundary`).toBeGreaterThan(2100);
+    expect(dimensions.height, `${format} keeps the full board image`).toBeGreaterThan(format === "live" ? 1200 : 700);
+  }
 
   const liveStats = await measureBoardTextureStats(page, liveBoard);
   const pngStats = await measureBoardTextureStats(page, png);
@@ -362,14 +476,26 @@ test("Blackboard texture matches live and full-width PNG/JPEG diagram exports", 
   expect(Math.abs(liveStats.mean - pngStats.mean), "live/PNG average board color").toBeLessThan(12);
   expect(Math.abs(liveStats.mean - jpegStats.mean), "live/JPEG average board color").toBeLessThan(14);
 
-  // The export includes 32px of padding around the 160x280 node. Sample its
-  // lower-right fill (away from the bound label) against the nearby board.
-  const fillPixel = await sampleImagePatch(page, png, { x: 0.1, y: 0.5 });
-  const adjacentBoardPixel = await sampleImagePatch(page, png, { x: 0.22, y: 0.5 });
-  expect(maxChannelDifference(fillPixel, adjacentBoardPixel), "PNG dark fill stays close to the dark slate background").toBeLessThanOrEqual(32);
-  const jpegFillPixel = await sampleImagePatch(page, jpeg, { x: 0.1, y: 0.5 }, "image/jpeg");
-  const jpegBoardPixel = await sampleImagePatch(page, jpeg, { x: 0.22, y: 0.5 }, "image/jpeg");
-  expect(maxChannelDifference(jpegFillPixel, jpegBoardPixel), "JPEG dark fill stays close to the dark slate background").toBeLessThanOrEqual(36);
+  for (const [format, image, mime] of [["live", liveBoard, "image/png"], ["PNG", png, "image/png"], ["JPEG", jpeg, "image/jpeg"]] as const) {
+    const edges = await inspectTextureEdges(page, image, mime);
+    expect(edges.left.standardDeviation, `${format} left edge has chalk grain`).toBeGreaterThan(3);
+    expect(edges.right.standardDeviation, `${format} right edge has chalk grain`).toBeGreaterThan(3);
+    expect(Math.abs(edges.left.mean - edges.leftAdjacent.mean), `${format} left edge has no vertical band`).toBeLessThan(13);
+    expect(Math.abs(edges.right.mean - edges.rightAdjacent.mean), `${format} right edge has no vertical band`).toBeLessThan(13);
+    const verticalSeam = await measureTextureSeamContrast(page, image, "vertical", 2000, mime);
+    expect(verticalSeam.seamDifference, `${format} vertical seam continuity`).toBeLessThan(verticalSeam.neighboringDifference * 2.2 + 2);
+    if (format === "live") {
+      const horizontalSeam = await measureTextureSeamContrast(page, image, "horizontal", 1200, mime);
+      expect(horizontalSeam.seamDifference, "live horizontal seam continuity").toBeLessThan(horizontalSeam.neighboringDifference * 2.2 + 2);
+    }
+  }
+
+  // Sample the top-right inside the first node, away from its label and border.
+  // A flat filled slab has almost no pixel variation; a transparent node keeps
+  // the Blackboard residue visible under its outline and text.
+  const nodeInteriorRegion = { x: 0.04, y: 0.1, width: 0.015, height: 0.025 };
+  expect(await measureTexturePatchStdDev(page, png, nodeInteriorRegion), "PNG node interior retains board grain").toBeGreaterThan(2);
+  expect(await measureTexturePatchStdDev(page, jpeg, nodeInteriorRegion), "JPEG node interior retains board grain").toBeGreaterThan(2);
 });
 
 test("the Draw wordmark and Open .draw action do not overlap on narrow screens", async ({ page }) => {
@@ -748,7 +874,7 @@ test("background changes recolor Draw defaults, preserve custom colors, and undo
   await expect.poll(async () => {
     const current = await currentBridgeDocument(page);
     const node = current.document.elements.find((element: any) => element.id === created.result.nodes.default);
-    return current.document.canvas.background.preset === "blackboard" && node?.strokeColor === "#f6f2e9" && node?.backgroundColor === "#18191a";
+    return current.document.canvas.background.preset === "blackboard" && node?.strokeColor === "#f6f2e9" && node?.backgroundColor === "transparent";
   }).toBe(true);
   await page.getByRole("button", { name: "Redo" }).click();
   await expect.poll(async () => (await currentBridgeDocument(page)).document.canvas.background.preset).toBe("white");
@@ -767,7 +893,7 @@ test("background changes recolor Draw defaults, preserve custom colors, and undo
   await expect.poll(async () => {
     const current = await currentBridgeDocument(page);
     const node = current.document.elements.find((element: any) => element.id === whiteNode.result.nodes["white-default"]);
-    return node?.strokeColor === "#f6f2e9" && node?.backgroundColor === "#18191a";
+    return node?.strokeColor === "#f6f2e9" && node?.backgroundColor === "transparent";
   }).toBe(true);
   const blackboardContrast = await currentBridgeDocument(page);
   const blackboardDefault = blackboardContrast.document.elements.find((element: any) => element.id === whiteNode.result.nodes["white-default"]);
