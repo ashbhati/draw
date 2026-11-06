@@ -89,6 +89,64 @@ async function countWarmImagePixels(page: Page, image: Buffer): Promise<number> 
   }, Array.from(image));
 }
 
+async function sampleImagePatch(
+  page: Page,
+  image: Buffer,
+  point: { x: number; y: number },
+  mimeType = "image/png",
+): Promise<[number, number, number]> {
+  return page.evaluate(async ({ bytes, position, mime }) => {
+    const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: mime }));
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Canvas pixel inspection is unavailable.");
+    context.drawImage(bitmap, 0, 0);
+    const patchWidth = Math.max(1, Math.floor(bitmap.width * 0.05));
+    const patchHeight = Math.max(1, Math.floor(bitmap.height * 0.05));
+    const centerX = Math.floor(bitmap.width * position.x);
+    const centerY = Math.floor(bitmap.height * position.y);
+    const startX = Math.max(0, Math.min(bitmap.width - patchWidth, centerX - Math.floor(patchWidth / 2)));
+    const startY = Math.max(0, Math.min(bitmap.height - patchHeight, centerY - Math.floor(patchHeight / 2)));
+    const pixels = context.getImageData(startX, startY, patchWidth, patchHeight).data;
+    const total = patchWidth * patchHeight;
+    const red = pixels.reduce((sum, value, index) => sum + (index % 4 === 0 ? value : 0), 0) / total;
+    const green = pixels.reduce((sum, value, index) => sum + (index % 4 === 1 ? value : 0), 0) / total;
+    const blue = pixels.reduce((sum, value, index) => sum + (index % 4 === 2 ? value : 0), 0) / total;
+    return [red, green, blue] as [number, number, number];
+  }, { bytes: Array.from(image), position: point, mime: mimeType });
+}
+
+async function measureBoardTextureStdDev(page: Page, image: Buffer, mimeType = "image/png"): Promise<number> {
+  return page.evaluate(async ({ bytes, mime }) => {
+    const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: mime }));
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Canvas pixel inspection is unavailable.");
+    context.drawImage(bitmap, 0, 0);
+    const { data } = context.getImageData(0, 0, bitmap.width, bitmap.height);
+    const pixels: number[] = [];
+    const xBands: [number, number][] = [[0.03, 0.12], [0.88, 0.97]];
+    for (const [startX, endX] of xBands) {
+      for (let y = Math.floor(bitmap.height * 0.12); y < bitmap.height * 0.9; y += 2) {
+        for (let x = Math.floor(bitmap.width * startX); x < bitmap.width * endX; x += 2) {
+          const offset = (y * bitmap.width + x) * 4;
+          pixels.push(data[offset] * 0.2126 + data[offset + 1] * 0.7152 + data[offset + 2] * 0.0722);
+        }
+      }
+    }
+    const mean = pixels.reduce((sum, value) => sum + value, 0) / pixels.length;
+    return Math.sqrt(pixels.reduce((sum, value) => sum + (value - mean) ** 2, 0) / pixels.length);
+  }, { bytes: Array.from(image), mime: mimeType });
+}
+
+function maxChannelDifference(a: readonly number[], b: readonly number[]): number {
+  return Math.max(...a.map((channel, index) => Math.abs(channel - b[index])));
+}
+
 test.beforeEach(async ({ page }) => {
   await waitForBridge(page);
   await page.locator(".excalidraw canvas").first().waitFor();
@@ -120,7 +178,7 @@ test("canvas controls fit inside the editor across responsive breakpoints", asyn
   const selector = toolbar.getByLabel("Canvas background");
   await expect(selector.locator("option")).toHaveText(["Blackboard Canvas", "Whiteboard Canvas"]);
   const editor = page.locator(".editor-shell");
-  for (const width of [360, 390, 700, 900, 950, 1019, 1020, 1021, 1400]) {
+  for (const width of [360, 390, 700, 900, 950, 1019, 1020, 1021, 1100, 1400, 1920]) {
     await page.setViewportSize({ width, height: 844 });
     const editorBounds = await editor.boundingBox();
     expect(editorBounds).not.toBeNull();
@@ -197,6 +255,53 @@ test("Meta+Shift+E cannot open Excalidraw's image exporter", async ({ page }) =>
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(page.getByText(/Embed scene/i)).toHaveCount(0);
   await expect(page.locator('a[href^="http"]')).toHaveCount(0);
+});
+
+test("Blackboard texture matches live and exports at fixed 1400x800 viewport", async ({ page }) => {
+  const createResponse = await page.request.post(commandApi, { data: {
+    operation: "create_diagram",
+    input: { nodes: [{ id: "dark-fill", label: "Dark fill", x: 200, y: 180, width: 160, height: 100, color: "#18191a" }], edges: [] },
+  } });
+  expect(createResponse.ok(), await createResponse.text()).toBeTruthy();
+  const viewport = { width: 1400, height: 800 };
+  await page.setViewportSize(viewport);
+  await page.waitForTimeout(100);
+  const liveBoard = await page.locator(".editor-shell").screenshot();
+
+  const pngDownloadWait = page.waitForEvent("download");
+  await page.locator("button.export-main").click();
+  const png = await readFile(await (await pngDownloadWait).path());
+
+  const jpegDownloadWait = page.waitForEvent("download");
+  await page.getByLabel("Image export format").selectOption("image/jpeg");
+  const jpeg = await readFile(await (await jpegDownloadWait).path());
+
+  const boardPoints = [{ x: 0.1, y: 0.5 }, { x: 0.9, y: 0.5 }, { x: 0.1, y: 0.8 }, { x: 0.9, y: 0.8 }];
+  const livePixels = await Promise.all(boardPoints.map((point) => sampleImagePatch(page, liveBoard, point)));
+  const pngPixels = await Promise.all(boardPoints.map((point) => sampleImagePatch(page, png, point)));
+  const jpegPixels = await Promise.all(boardPoints.map((point) => sampleImagePatch(page, jpeg, point, "image/jpeg")));
+  const pngDifferences = livePixels.map((pixel, index) => maxChannelDifference(pixel, pngPixels[index]));
+  const jpegDifferences = livePixels.map((pixel, index) => maxChannelDifference(pixel, jpegPixels[index]));
+  expect(Math.max(...pngDifferences), `live/PNG channel differences: ${pngDifferences.join(", ")}`).toBeLessThanOrEqual(3);
+  expect(Math.max(...jpegDifferences), `live/JPEG channel differences: ${jpegDifferences.join(", ")}`).toBeLessThanOrEqual(14);
+
+  const liveTextureStdDev = await measureBoardTextureStdDev(page, liveBoard);
+  const pngTextureStdDev = await measureBoardTextureStdDev(page, png);
+  const jpegTextureStdDev = await measureBoardTextureStdDev(page, jpeg, "image/jpeg");
+  for (const [format, deviation] of [["live", liveTextureStdDev], ["PNG", pngTextureStdDev], ["JPEG", jpegTextureStdDev]] as const) {
+    expect(deviation, `${format} texture standard deviation`).toBeGreaterThan(0.5);
+    expect(deviation, `${format} texture standard deviation`).toBeLessThan(4);
+  }
+  expect(Math.abs(liveTextureStdDev - pngTextureStdDev), "live/PNG texture variation").toBeLessThan(1);
+
+  // The export includes 32px of padding around the 160x100 node. Sample its
+  // lower-right fill (away from the bound label) against the nearby board.
+  const fillPixel = await sampleImagePatch(page, png, { x: 0.8, y: 0.73 });
+  const adjacentBoardPixel = await sampleImagePatch(page, png, { x: 0.06, y: 0.73 });
+  expect(maxChannelDifference(fillPixel, adjacentBoardPixel), "PNG dark fill continuity").toBeLessThanOrEqual(8);
+  const jpegFillPixel = await sampleImagePatch(page, jpeg, { x: 0.8, y: 0.73 }, "image/jpeg");
+  const jpegBoardPixel = await sampleImagePatch(page, jpeg, { x: 0.06, y: 0.73 }, "image/jpeg");
+  expect(maxChannelDifference(jpegFillPixel, jpegBoardPixel), "JPEG dark fill continuity").toBeLessThanOrEqual(12);
 });
 
 test("MCP create and update stay editable through save, reload, open, and image export", async ({ page }) => {
@@ -407,8 +512,8 @@ test("loads fonts and exports the hand-drawn scene without network access", asyn
   const exported = await downloadWait;
   const image = await readFile(await exported.path());
   expect(image.subarray(0, 8).toString("hex")).toBe("89504e470d0a1a0a");
-  expect(image.byteLength).toBeGreaterThan(5_000);
-  expect(await countWarmImagePixels(page, image)).toBeGreaterThan(40);
+  expect(await countWarmImagePixels(page, image), "the exported diagram includes visible yellow diagram pixels").toBeGreaterThan(40);
+  expect(await countPixelsNear(page, image, [24, 25, 26], 8), "the export includes its charcoal board background").toBeGreaterThan(1_000);
   expect(externalRequests).toEqual([]);
   expect(localFontRequests.every((url) => url.startsWith("http://127.0.0.1:5181/fonts/"))).toBe(true);
   expect(cjkFontRequests.every((url) => url.startsWith("http://127.0.0.1:5181/fonts/"))).toBe(true);

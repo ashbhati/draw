@@ -30,11 +30,11 @@ describe("export background composition", () => {
     expect(result).toContain('id="scene"');
   });
 
-  it("adds a textured charcoal board without flattening the scene markup", () => {
+  it("embeds the shared charcoal texture behind the scene without flattening it", () => {
     const result = composeBackgroundSvg(svg, "blackboard");
     expect(result.indexOf('data-draw-background="blackboard"')).toBeLessThan(result.indexOf('id="scene"'));
-    expect(result).toContain("feTurbulence");
-    expect(result).toContain('fill="#18191a"');
+    expect(result).toContain('href="data:image/svg+xml,');
+    expect(result).toContain("preserveAspectRatio=\"none\"");
     expect(result).toContain('id="scene"');
   });
 

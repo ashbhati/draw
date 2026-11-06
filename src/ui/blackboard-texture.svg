@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="600" viewBox="0 0 1000 600">
+  <defs>
+    <filter id="soft-wipe" x="-10%" y="-25%" width="120%" height="150%">
+      <feGaussianBlur stdDeviation="22" />
+    </filter>
+  </defs>
+  <rect width="1000" height="600" fill="#18191a" />
+  <g fill="none" stroke="#d2d0ca" stroke-linecap="round" filter="url(#soft-wipe)">
+    <path d="M -40 92 C 180 54 305 130 496 91 S 833 52 1040 105" stroke-width="46" opacity=".045" />
+    <path d="M -30 292 C 174 338 353 243 554 277 S 859 358 1040 305" stroke-width="34" opacity=".04" />
+    <path d="M -40 493 C 178 448 327 535 548 486 S 858 439 1040 514" stroke-width="40" opacity=".038" />
+  </g>
+  <g fill="none" stroke="#c8c6bf" stroke-linecap="round" opacity=".025">
+    <path d="M 88 180 C 235 146 352 205 473 172" stroke-width="3" />
+    <path d="M 536 390 C 682 356 824 417 944 381" stroke-width="3" />
+    <path d="M 194 560 C 322 535 398 574 501 551" stroke-width="2" />
+  </g>
+</svg>

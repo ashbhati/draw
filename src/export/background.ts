@@ -1,3 +1,5 @@
+import blackboardTexture from "../ui/blackboard-texture.svg?raw";
+
 export type DrawExportMimeType = "image/png" | "image/jpeg";
 
 export function selectExportElements<T extends { id: string; isDeleted?: boolean; containerId?: string | null }>(
@@ -13,20 +15,7 @@ export function selectExportElements<T extends { id: string; isDeleted?: boolean
   return live.filter((element) => selectedIds.has(element.id) || (element.containerId != null && selectedIds.has(element.containerId)));
 }
 
-const BLACKBOARD_BG = `
-<defs>
-  <filter id="draw-chalk-grain" x="0" y="0" width="100%" height="100%">
-    <feTurbulence type="fractalNoise" baseFrequency="0.024 0.03" numOctaves="4" seed="19" result="grain" />
-    <feColorMatrix in="grain" type="saturate" values="0" result="mono" />
-    <feComponentTransfer in="mono" result="soft-grain"><feFuncA type="table" tableValues="0 0.18" /></feComponentTransfer>
-    <feBlend in="SourceGraphic" in2="soft-grain" mode="screen" />
-  </filter>
-  <filter id="draw-chalk-smudge" x="-20%" y="-30%" width="140%" height="160%"><feGaussianBlur stdDeviation="16" /></filter>
-</defs>
-<rect data-draw-background="blackboard" x="0" y="0" width="100%" height="100%" fill="#18191a" />
-<rect x="0" y="0" width="100%" height="100%" fill="#18191a" filter="url(#draw-chalk-grain)" opacity=".9" />
-<path d="M 0 20 C 25 8, 50 28, 100 12 M 10 52 C 42 43, 66 60, 96 46 M 5 86 C 35 72, 70 92, 98 80" pathLength="100" fill="none" stroke="#d2d0ca" stroke-width="4" stroke-linecap="round" opacity=".045" filter="url(#draw-chalk-smudge)" />
-`;
+const BLACKBOARD_BG = `<image data-draw-background="blackboard" x="0" y="0" width="100%" height="100%" preserveAspectRatio="none" href="data:image/svg+xml,${encodeURIComponent(blackboardTexture)}" />`;
 
 function backgroundLayer(preset: "blackboard" | "white"): string {
   if (preset === "white") {
