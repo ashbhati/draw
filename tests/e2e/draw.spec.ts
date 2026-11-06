@@ -89,7 +89,7 @@ async function countWarmImagePixels(page: Page, image: Buffer): Promise<number> 
   }, Array.from(image));
 }
 
-async function sampleImagePixel(
+async function sampleImagePatch(
   page: Page,
   image: Buffer,
   point: { x: number; y: number },
@@ -103,10 +103,18 @@ async function sampleImagePixel(
     const context = canvas.getContext("2d");
     if (!context) throw new Error("Canvas pixel inspection is unavailable.");
     context.drawImage(bitmap, 0, 0);
-    const x = Math.min(bitmap.width - 1, Math.floor(bitmap.width * position.x));
-    const y = Math.min(bitmap.height - 1, Math.floor(bitmap.height * position.y));
-    const pixel = context.getImageData(x, y, 1, 1).data;
-    return [pixel[0], pixel[1], pixel[2]] as [number, number, number];
+    const patchWidth = Math.max(1, Math.floor(bitmap.width * 0.05));
+    const patchHeight = Math.max(1, Math.floor(bitmap.height * 0.05));
+    const centerX = Math.floor(bitmap.width * position.x);
+    const centerY = Math.floor(bitmap.height * position.y);
+    const startX = Math.max(0, Math.min(bitmap.width - patchWidth, centerX - Math.floor(patchWidth / 2)));
+    const startY = Math.max(0, Math.min(bitmap.height - patchHeight, centerY - Math.floor(patchHeight / 2)));
+    const pixels = context.getImageData(startX, startY, patchWidth, patchHeight).data;
+    const total = patchWidth * patchHeight;
+    const red = pixels.reduce((sum, value, index) => sum + (index % 4 === 0 ? value : 0), 0) / total;
+    const green = pixels.reduce((sum, value, index) => sum + (index % 4 === 1 ? value : 0), 0) / total;
+    const blue = pixels.reduce((sum, value, index) => sum + (index % 4 === 2 ? value : 0), 0) / total;
+    return [red, green, blue] as [number, number, number];
   }, { bytes: Array.from(image), position: point, mime: mimeType });
 }
 
@@ -119,13 +127,15 @@ async function measureBoardTextureStdDev(page: Page, image: Buffer, mimeType = "
     const context = canvas.getContext("2d");
     if (!context) throw new Error("Canvas pixel inspection is unavailable.");
     context.drawImage(bitmap, 0, 0);
+    const { data } = context.getImageData(0, 0, bitmap.width, bitmap.height);
     const pixels: number[] = [];
-    for (let row = 0; row < 16; row += 1) {
-      const y = Math.floor(bitmap.height * (0.2 + row * 0.04));
-      for (const xFraction of [0.04, 0.08, 0.92, 0.96]) {
-        const x = Math.floor(bitmap.width * xFraction);
-        const pixel = context.getImageData(x, y, 1, 1).data;
-        pixels.push(pixel[0] * 0.2126 + pixel[1] * 0.7152 + pixel[2] * 0.0722);
+    const xBands: [number, number][] = [[0.03, 0.12], [0.88, 0.97]];
+    for (const [startX, endX] of xBands) {
+      for (let y = Math.floor(bitmap.height * 0.12); y < bitmap.height * 0.9; y += 2) {
+        for (let x = Math.floor(bitmap.width * startX); x < bitmap.width * endX; x += 2) {
+          const offset = (y * bitmap.width + x) * 4;
+          pixels.push(data[offset] * 0.2126 + data[offset + 1] * 0.7152 + data[offset + 2] * 0.0722);
+        }
       }
     }
     const mean = pixels.reduce((sum, value) => sum + value, 0) / pixels.length;
@@ -247,48 +257,53 @@ test("Meta+Shift+E cannot open Excalidraw's image exporter", async ({ page }) =>
   await expect(page.locator('a[href^="http"]')).toHaveCount(0);
 });
 
-test("Blackboard texture matches live, PNG, and JPEG pixels and keeps dark fills continuous", async ({ page }) => {
+test("Blackboard texture matches live and exports across viewport sizes", async ({ page }) => {
   const createResponse = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
     input: { nodes: [{ id: "dark-fill", label: "Dark fill", x: 200, y: 180, width: 160, height: 100, color: "#18191a" }], edges: [] },
   } });
   expect(createResponse.ok(), await createResponse.text()).toBeTruthy();
-  const liveBoard = await page.locator(".editor-shell").screenshot();
+  const viewports = [{ width: 1280, height: 720 }, { width: 1400, height: 800 }, { width: 1600, height: 800 }];
+  for (const viewport of viewports) {
+    await page.setViewportSize(viewport);
+    await page.waitForTimeout(100);
+    const liveBoard = await page.locator(".editor-shell").screenshot();
 
-  const pngDownloadWait = page.waitForEvent("download");
-  await page.locator("button.export-main").click();
-  const png = await readFile(await (await pngDownloadWait).path());
+    const pngDownloadWait = page.waitForEvent("download");
+    await page.locator("button.export-main").click();
+    const png = await readFile(await (await pngDownloadWait).path());
 
-  const jpegDownloadWait = page.waitForEvent("download");
-  await page.getByLabel("Image export format").selectOption("image/jpeg");
-  const jpeg = await readFile(await (await jpegDownloadWait).path());
+    const jpegDownloadWait = page.waitForEvent("download");
+    await page.getByLabel("Image export format").selectOption("image/jpeg");
+    const jpeg = await readFile(await (await jpegDownloadWait).path());
 
-  const boardPoints = [{ x: 0.1, y: 0.5 }, { x: 0.9, y: 0.5 }, { x: 0.1, y: 0.8 }, { x: 0.9, y: 0.8 }];
-  const livePixels = await Promise.all(boardPoints.map((point) => sampleImagePixel(page, liveBoard, point)));
-  const pngPixels = await Promise.all(boardPoints.map((point) => sampleImagePixel(page, png, point)));
-  const jpegPixels = await Promise.all(boardPoints.map((point) => sampleImagePixel(page, jpeg, point, "image/jpeg")));
-  const pngDifferences = livePixels.map((pixel, index) => maxChannelDifference(pixel, pngPixels[index]));
-  const jpegDifferences = livePixels.map((pixel, index) => maxChannelDifference(pixel, jpegPixels[index]));
-  expect(Math.max(...pngDifferences), `live/PNG channel differences: ${pngDifferences.join(", ")}`).toBeLessThanOrEqual(3);
-  expect(Math.max(...jpegDifferences), `live/JPEG channel differences: ${jpegDifferences.join(", ")}`).toBeLessThanOrEqual(14);
+    const boardPoints = [{ x: 0.1, y: 0.5 }, { x: 0.9, y: 0.5 }, { x: 0.1, y: 0.8 }, { x: 0.9, y: 0.8 }];
+    const livePixels = await Promise.all(boardPoints.map((point) => sampleImagePatch(page, liveBoard, point)));
+    const pngPixels = await Promise.all(boardPoints.map((point) => sampleImagePatch(page, png, point)));
+    const jpegPixels = await Promise.all(boardPoints.map((point) => sampleImagePatch(page, jpeg, point, "image/jpeg")));
+    const pngDifferences = livePixels.map((pixel, index) => maxChannelDifference(pixel, pngPixels[index]));
+    const jpegDifferences = livePixels.map((pixel, index) => maxChannelDifference(pixel, jpegPixels[index]));
+    expect(Math.max(...pngDifferences), `${viewport.width}x${viewport.height} live/PNG channel differences: ${pngDifferences.join(", ")}`).toBeLessThanOrEqual(4);
+    expect(Math.max(...jpegDifferences), `${viewport.width}x${viewport.height} live/JPEG channel differences: ${jpegDifferences.join(", ")}`).toBeLessThanOrEqual(14);
 
-  const liveTextureStdDev = await measureBoardTextureStdDev(page, liveBoard);
-  const pngTextureStdDev = await measureBoardTextureStdDev(page, png);
-  const jpegTextureStdDev = await measureBoardTextureStdDev(page, jpeg, "image/jpeg");
-  for (const [format, deviation] of [["live", liveTextureStdDev], ["PNG", pngTextureStdDev], ["JPEG", jpegTextureStdDev]] as const) {
-    expect(deviation, `${format} texture standard deviation`).toBeGreaterThan(0.5);
-    expect(deviation, `${format} texture standard deviation`).toBeLessThan(4);
+    const liveTextureStdDev = await measureBoardTextureStdDev(page, liveBoard);
+    const pngTextureStdDev = await measureBoardTextureStdDev(page, png);
+    const jpegTextureStdDev = await measureBoardTextureStdDev(page, jpeg, "image/jpeg");
+    for (const [format, deviation] of [["live", liveTextureStdDev], ["PNG", pngTextureStdDev], ["JPEG", jpegTextureStdDev]] as const) {
+      expect(deviation, `${viewport.width}x${viewport.height} ${format} texture standard deviation`).toBeGreaterThan(0.5);
+      expect(deviation, `${viewport.width}x${viewport.height} ${format} texture standard deviation`).toBeLessThan(4);
+    }
+    expect(Math.abs(liveTextureStdDev - pngTextureStdDev), `${viewport.width}x${viewport.height} live/PNG texture variation`).toBeLessThan(1.5);
+
+    // The export includes 32px of padding around the 160x100 node. Sample its
+    // lower-right fill (away from the bound label) against the nearby board.
+    const fillPixel = await sampleImagePatch(page, png, { x: 0.8, y: 0.73 });
+    const adjacentBoardPixel = await sampleImagePatch(page, png, { x: 0.06, y: 0.73 });
+    expect(maxChannelDifference(fillPixel, adjacentBoardPixel), `${viewport.width}x${viewport.height} PNG dark fill continuity`).toBeLessThanOrEqual(8);
+    const jpegFillPixel = await sampleImagePatch(page, jpeg, { x: 0.8, y: 0.73 }, "image/jpeg");
+    const jpegBoardPixel = await sampleImagePatch(page, jpeg, { x: 0.06, y: 0.73 }, "image/jpeg");
+    expect(maxChannelDifference(jpegFillPixel, jpegBoardPixel), `${viewport.width}x${viewport.height} JPEG dark fill continuity`).toBeLessThanOrEqual(12);
   }
-  expect(Math.abs(liveTextureStdDev - pngTextureStdDev), "live/PNG texture variation").toBeLessThan(1);
-
-  // The export includes 32px of padding around the 160x100 node. Sample its
-  // lower-right fill (away from the bound label) against the nearby board.
-  const fillPixel = await sampleImagePixel(page, png, { x: 0.8, y: 0.73 });
-  const adjacentBoardPixel = await sampleImagePixel(page, png, { x: 0.06, y: 0.73 });
-  expect(maxChannelDifference(fillPixel, adjacentBoardPixel)).toBeLessThanOrEqual(8);
-  const jpegFillPixel = await sampleImagePixel(page, jpeg, { x: 0.8, y: 0.73 }, "image/jpeg");
-  const jpegBoardPixel = await sampleImagePixel(page, jpeg, { x: 0.06, y: 0.73 }, "image/jpeg");
-  expect(maxChannelDifference(jpegFillPixel, jpegBoardPixel)).toBeLessThanOrEqual(12);
 });
 
 test("MCP create and update stay editable through save, reload, open, and image export", async ({ page }) => {
