@@ -75,6 +75,7 @@ export default function App() {
   const [autosaveBlocked, setAutosaveBlocked] = useState(false);
   const [canWrite, setCanWrite] = useState(false);
   const [editorKey, setEditorKey] = useState(0);
+  const [exportScope, setExportScope] = useState<"canvas" | "selection">("canvas");
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
   const docRef = useRef<DrawDocument | null>(null);
   const clientId = useRef(randomId());
@@ -276,7 +277,10 @@ export default function App() {
     try {
       const allElements = apiRef.current.getSceneElements();
       const appState = apiRef.current.getAppState();
-      const elements = selectExportElements(allElements, appState.selectedElementIds as Record<string, boolean> | undefined);
+      const selectedElementIds = exportScope === "selection"
+        ? appState.selectedElementIds as Record<string, boolean> | undefined
+        : undefined;
+      const elements = selectExportElements(allElements, selectedElementIds);
       const files = apiRef.current.getFiles();
       const svg = await exportToSvg({ elements, appState: { ...appState, exportBackground: false }, files, exportPadding: 32 });
       const composed = composeBackgroundSvg(new XMLSerializer().serializeToString(svg), doc.document.canvas.background.preset);
@@ -517,7 +521,7 @@ export default function App() {
         <button className="button button-quiet" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open editable .draw file" : "Close the other Draw tab to open files here"}>Open</button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
         <button className="button button-primary" onClick={saveFile} title="Save the complete editable Draw file"><span className="button-icon">↓</span>Save .draw</button>
-        <div className="export-group"><button className="button button-quiet export-main" onClick={() => void exportImage("image/png")}>Export</button><select aria-label="Image export format" value="image/png" onChange={(event) => void exportImage(event.target.value as "image/png" | "image/jpeg")}><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option></select></div>
+        <div className="export-group"><button className="button button-quiet export-main" onClick={() => void exportImage("image/png")}>Export</button><select aria-label="Export scope" value={exportScope} onChange={(event) => setExportScope(event.target.value as "canvas" | "selection")}><option value="canvas">Whole drawing</option><option value="selection">Selection only</option></select><select aria-label="Image export format" value="image/png" onChange={(event) => void exportImage(event.target.value as "image/png" | "image/jpeg")}><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option></select></div>
       </div>
     </header>
     <div className="workspace">

@@ -897,3 +897,95 @@ test("embedded image assets survive autosave and editable Draw save/reopen", asy
     return reopened.document.elements.some((element: any) => element.type === "image") && Object.keys(reopened.document.assets).length > 0;
   }).toBe(true);
 });
+
+test("PNG and JPEG exports keep the complete editable scene even when an object is selected", async ({ page }) => {
+  const createdResponse = await page.request.post(commandApi, { data: {
+    operation: "create_diagram",
+    input: {
+      title: "Export fixture: complete scene",
+      nodes: [
+        { id: "first", label: "First node", x: 80, y: 100, width: 190, height: 90 },
+        { id: "second", label: "Second node", x: 720, y: 100, width: 190, height: 90, color: "#f2d27a" },
+      ],
+      edges: [{ from: "first", to: "second", label: "kept" }],
+    },
+  } });
+  expect(createdResponse.ok(), await createdResponse.text()).toBeTruthy();
+
+  // A vivid embedded image makes it possible to verify that export kept assets,
+  // not only the vector scene. The exported image uses a regular checker pattern.
+  const imageBytes = await page.evaluate(() => {
+    const source = document.createElement("canvas");
+    source.width = 48;
+    source.height = 48;
+    const context = source.getContext("2d");
+    if (!context) throw new Error("Could not create the image fixture.");
+    context.fillStyle = "#00e080";
+    context.fillRect(0, 0, 48, 48);
+    context.fillStyle = "#ff00c8";
+    context.fillRect(0, 0, 24, 24);
+    context.fillRect(24, 24, 24, 24);
+    return Array.from(atob(source.toDataURL("image/png").split(",")[1]), (char) => char.charCodeAt(0));
+  });
+  await page.locator(".excalidraw").evaluate((editor, bytes) => {
+    const bounds = editor.getBoundingClientRect();
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([new Uint8Array(bytes)], "export-fixture.png", { type: "image/png" }));
+    const coordinates = { clientX: bounds.left + bounds.width / 2, clientY: bounds.top + bounds.height / 2 + 150, bubbles: true, cancelable: true, dataTransfer: transfer };
+    editor.dispatchEvent(new DragEvent("dragenter", coordinates));
+    editor.dispatchEvent(new DragEvent("dragover", coordinates));
+    editor.dispatchEvent(new DragEvent("drop", coordinates));
+  }, imageBytes);
+
+  await expect.poll(async () => {
+    const current = await freshBridgeDocument(page);
+    return current.document.elements.some((element: any) => element.type === "image") &&
+      current.document.elements.filter((element: any) => element.type === "rectangle").length >= 2 &&
+      current.document.elements.some((element: any) => element.type === "arrow");
+  }).toBe(true);
+
+  // The image drop leaves an object selected, matching the reported workflow.
+  // Export must still be a shareable image of the whole drawing, rather than a
+  // crop containing only the current selection.
+  await expect.poll(async () => Object.keys((await freshBridgeDocument(page)).document.appState.selectedElementIds ?? {}).length).toBeGreaterThan(0);
+
+  for (const [mime, button] of [["image/png", "Export"], ["image/jpeg", "Export"]] as const) {
+    if (mime === "image/jpeg") await page.getByLabel("Image export format").selectOption(mime);
+    const downloadWait = page.waitForEvent("download");
+    await page.getByRole("button", { name: button }).click();
+    const image = await readFile(await (await downloadWait).path());
+    const actualMime = mime === "image/png" ? "image/png" : "image/jpeg";
+    const result = await page.evaluate(async ({ bytes, type }) => {
+      const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type }));
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("Could not inspect exported image pixels.");
+      context.drawImage(bitmap, 0, 0);
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      let greenImagePixels = 0;
+      let chalkPixels = 0;
+      for (let index = 0; index < pixels.length; index += 4) {
+        if (pixels[index + 1] > 170 && pixels[index] < 80 && pixels[index + 2] < 180) greenImagePixels += 1;
+        if (pixels[index] > 205 && pixels[index + 1] > 195 && pixels[index + 2] > 180) chalkPixels += 1;
+      }
+      return { width: bitmap.width, height: bitmap.height, greenImagePixels, chalkPixels };
+    }, { bytes: Array.from(image), type: actualMime });
+    expect(result.width, `${mime} should include both distant diagram nodes`).toBeGreaterThan(700);
+    expect(result.height).toBeGreaterThan(150);
+    expect(result.greenImagePixels, `${mime} should preserve the embedded image`).toBeGreaterThan(50);
+    expect(result.chalkPixels, `${mime} should preserve text and chalk strokes`).toBeGreaterThan(100);
+  }
+
+  // Keep the original selection-export feature available as an explicit scope.
+  await page.getByLabel("Export scope").selectOption("selection");
+  const selectionDownload = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Export" }).click();
+  const selectionImage = await readFile(await (await selectionDownload).path());
+  const selectionWidth = await page.evaluate(async (bytes) => {
+    const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: "image/png" }));
+    return bitmap.width;
+  }, Array.from(selectionImage));
+  expect(selectionWidth, "selection export should remain limited to the current selection").toBeLessThan(500);
+});
