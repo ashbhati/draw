@@ -232,6 +232,18 @@ test("canvas choices are in the main toolbar and replace the quick-start rail", 
   await expect(toolbar.getByRole("button", { name: "Blackboard Canvas" })).toHaveAttribute("aria-pressed", "true");
 });
 
+test("the editor omits the redundant canvas status strip without leaving a spacer", async ({ page }) => {
+  await expect(page.locator(".canvas-label")).toHaveCount(0);
+  await expect(page.getByText(/Infinite canvas\s*·\s*(Blackboard|Whiteboard) Canvas/)).toHaveCount(0);
+  await expect(page.locator(".editor-shell")).toBeVisible();
+  const canvasArea = await page.locator(".canvas-area").boundingBox();
+  const editor = await page.locator(".editor-shell").boundingBox();
+  expect(canvasArea).not.toBeNull();
+  expect(editor).not.toBeNull();
+  expect(editor!.y - canvasArea!.y).toBeLessThanOrEqual(1);
+  expect(editor!.height).toBeGreaterThan(200);
+});
+
 test("canvas controls fit inside the editor across responsive breakpoints", async ({ page }) => {
   const toolbar = page.getByRole("group", { name: "Canvas" });
   const selector = toolbar.getByLabel("Canvas background");
@@ -405,7 +417,7 @@ test("MCP create and update stay editable through save, reload, open, and image 
 
   await page.getByRole("button", { name: "Redo" }).click();
   await page.getByRole("button", { name: "Whiteboard Canvas" }).click();
-  await expect(page.locator(".canvas-label")).toContainText("White");
+  await expect(page.getByRole("button", { name: "Whiteboard Canvas" })).toHaveAttribute("aria-pressed", "true");
 
   const editedElementId = created.result.nodes.spec;
   const longText = "A considerably longer label that should wrap inside the node";
@@ -444,7 +456,7 @@ test("MCP create and update stay editable through save, reload, open, and image 
 
   await page.reload();
   await page.locator(".excalidraw canvas").first().waitFor();
-  await expect(page.locator(".canvas-label")).toContainText("White");
+  await expect(page.getByRole("button", { name: "Whiteboard Canvas" })).toHaveAttribute("aria-pressed", "true");
   expect((await readLocalDocument(page)).document.elements.some((element: any) => element.originalText === longText)).toBeTruthy();
 
   page.once("dialog", (dialog) => dialog.accept());
