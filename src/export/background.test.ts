@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { composeBackgroundSvg, selectExportElements } from "./background";
+import { composeBackgroundSvg, hasSelectedExportElements, selectExportElements } from "./background";
 
 describe("export background composition", () => {
   const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><rect id="scene" x="20" y="20" width="40" height="40" /></svg>';
@@ -21,6 +21,13 @@ describe("export background composition", () => {
     ];
     expect(selectExportElements(elements, { box: true }).map((element) => element.id)).toEqual(["box", "box-label"]);
     expect(selectExportElements(elements, { arrow: true }).map((element) => element.id)).toEqual(["arrow", "arrow-label"]);
+  });
+
+  it("reports whether a live scene element is selected", () => {
+    const elements = [{ id: "visible" }, { id: "deleted", isDeleted: true }];
+    expect(hasSelectedExportElements(elements, {})).toBe(false);
+    expect(hasSelectedExportElements(elements, { deleted: true })).toBe(false);
+    expect(hasSelectedExportElements(elements, { visible: true })).toBe(true);
   });
 
   it("places the selected white background behind existing scene elements", () => {
