@@ -556,6 +556,8 @@ test("Open .draw restores a downloaded file that remains editable through a seco
     const reopened = await freshBridgeDocument(page);
     return reopened.document.elements.some((element: any) => element.id === created.result.nodes.roundtrip);
   }).toBe(true);
+  await expect.poll(async () => (await freshBridgeDocument(page)).document.canvas.viewport, { timeout: 10_000 })
+    .toEqual(firstFile.document.canvas.viewport);
   const firstReopen = await freshBridgeDocument(page);
   expect(firstReopen.document.title).toBe(firstFile.document.title);
   expect(firstReopen.document.canvas.background.preset).toBe(firstFile.document.canvas.background.preset);
