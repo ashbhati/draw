@@ -362,6 +362,18 @@ test("Blackboard texture matches live and exports at fixed 1400x800 viewport", a
   expect(maxChannelDifference(jpegFillPixel, jpegBoardPixel), "JPEG dark fill continuity").toBeLessThanOrEqual(12);
 });
 
+test("the Draw wordmark and Open .draw action do not overlap on narrow screens", async ({ page }) => {
+  for (const width of [360, 390]) {
+    await page.setViewportSize({ width, height: 844 });
+    const brand = await page.locator(".brand-name").boundingBox();
+    const open = await page.getByRole("button", { name: "Open .draw" }).boundingBox();
+    expect(brand, `wordmark should be visible at ${width}px`).not.toBeNull();
+    expect(open, `Open .draw should be visible at ${width}px`).not.toBeNull();
+    const overlaps = brand!.x < open!.x + open!.width && brand!.x + brand!.width > open!.x && brand!.y < open!.y + open!.height && brand!.y + brand!.height > open!.y;
+    expect(overlaps, `wordmark should not overlap Open .draw at ${width}px`).toBe(false);
+  }
+});
+
 test("MCP create and update stay editable through save, reload, open, and image export", async ({ page }) => {
   const createdResponse = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
@@ -472,6 +484,120 @@ test("MCP diagram titles reserve at least their live Excalifont text width", asy
   }, title);
   expect(titleElement.fontFamily).toBe(5);
   expect(titleElement.width).toBeGreaterThanOrEqual(renderedWidth);
+});
+
+test("Open .draw restores a downloaded file that remains editable through a second save and reopen", async ({ page }) => {
+  const createResponse = await page.request.post(commandApi, { data: {
+    operation: "create_diagram",
+    input: { nodes: [{ id: "roundtrip", label: "Downloaded editable diagram", x: 140, y: 120 }], edges: [] },
+  } });
+  expect(createResponse.ok(), await createResponse.text()).toBeTruthy();
+  const created = await createResponse.json();
+
+  await page.getByLabel("Drawing title").fill("Portable Asset Round Trip");
+  await page.getByRole("button", { name: "Whiteboard Canvas" }).click();
+  await page.getByRole("button", { name: "Zoom in" }).click();
+  const canvas = page.locator(".excalidraw canvas").last();
+  const canvasBounds = await canvas.boundingBox();
+  if (!canvasBounds) throw new Error("Could not locate the drawing canvas.");
+  const panStart = { x: canvasBounds.x + canvasBounds.width - 40, y: canvasBounds.y + canvasBounds.height / 2 };
+  await page.keyboard.down("Space");
+  await page.mouse.move(panStart.x, panStart.y);
+  await page.mouse.down();
+  await page.mouse.move(panStart.x - 80, panStart.y + 30);
+  await page.mouse.up();
+  await page.keyboard.up("Space");
+
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jJ5sAAAAASUVORK5CYII=", "base64");
+  await page.locator(".excalidraw").evaluate((editor, bytes) => {
+    const bounds = editor.getBoundingClientRect();
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([new Uint8Array(bytes)], "portable-image.png", { type: "image/png" }));
+    const coordinates = { clientX: bounds.left + bounds.width / 2, clientY: bounds.top + bounds.height / 2, bubbles: true, cancelable: true, dataTransfer: transfer };
+    editor.dispatchEvent(new DragEvent("dragenter", coordinates));
+    editor.dispatchEvent(new DragEvent("dragover", coordinates));
+    editor.dispatchEvent(new DragEvent("drop", coordinates));
+  }, Array.from(png));
+  await expect.poll(async () => {
+    const current = await freshBridgeDocument(page);
+    return current.document.elements.some((element: any) => element.type === "image") && Object.keys(current.document.assets).length > 0;
+  }).toBe(true);
+  await expect.poll(async () => (await freshBridgeDocument(page)).document.title).toBe("Portable Asset Round Trip");
+  await expect.poll(async () => (await freshBridgeDocument(page)).document.canvas.background.preset).toBe("white");
+
+  const firstDownloadWait = page.waitForEvent("download");
+  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  const firstDownload = await firstDownloadWait;
+  const firstFilePath = await firstDownload.path();
+  const firstFile = JSON.parse((await readFile(firstFilePath)).toString("utf8"));
+  expect(firstFile.format).toBe("draw");
+  expect(firstFile.document.elements.some((element: any) => element.id === created.result.nodes.roundtrip)).toBe(true);
+  expect(firstFile.document.title).toBe("Portable Asset Round Trip");
+  expect(firstFile.document.canvas.background.preset).toBe("white");
+  expect(firstFile.document.canvas.viewport.zoom).toBeGreaterThan(1);
+  expect(firstFile.document.canvas.viewport.x !== 0 || firstFile.document.canvas.viewport.y !== 0).toBe(true);
+  expect(Object.values(firstFile.document.assets).length).toBeGreaterThan(0);
+  expect(firstFile.document.elements.filter((element: any) => element.type === "image")).toHaveLength(1);
+
+  await page.getByLabel("Drawing title").fill("Changed before opening saved file");
+  await page.getByRole("button", { name: "Blackboard Canvas" }).click();
+  await page.getByRole("button", { name: "Zoom out" }).click();
+  const changedBeforeOpen = await freshBridgeDocument(page);
+  expect(changedBeforeOpen.document.title).toBe("Changed before opening saved file");
+  expect(changedBeforeOpen.document.canvas.background.preset).toBe("blackboard");
+  expect(changedBeforeOpen.document.canvas.viewport).not.toEqual(firstFile.document.canvas.viewport);
+  expect(changedBeforeOpen.document.elements.some((element: any) => element.id === created.result.nodes.roundtrip)).toBe(true);
+
+  page.once("dialog", (dialog) => dialog.accept());
+  const firstChooserWait = page.waitForEvent("filechooser");
+  await page.getByRole("button", { name: "Open .draw" }).click();
+  await (await firstChooserWait).setFiles(firstFilePath);
+  await expect.poll(async () => {
+    const reopened = await freshBridgeDocument(page);
+    return reopened.document.elements.some((element: any) => element.id === created.result.nodes.roundtrip);
+  }).toBe(true);
+  await expect.poll(async () => (await freshBridgeDocument(page)).document.canvas.viewport, { timeout: 10_000 })
+    .toEqual(firstFile.document.canvas.viewport);
+  const firstReopen = await freshBridgeDocument(page);
+  expect(firstReopen.document.title).toBe(firstFile.document.title);
+  expect(firstReopen.document.canvas.background.preset).toBe(firstFile.document.canvas.background.preset);
+  expect(firstReopen.document.canvas.viewport).toEqual(firstFile.document.canvas.viewport);
+  expect(firstReopen.document.elements.filter((element: any) => element.type === "image")).toHaveLength(1);
+  expect(Object.keys(firstReopen.document.assets)).toHaveLength(Object.keys(firstFile.document.assets).length);
+  const localReopen = await readLocalDocument(page);
+  expect(localReopen).not.toBeNull();
+  expect(localReopen.document.title).toBe(firstFile.document.title);
+  expect(localReopen.document.canvas.background.preset).toBe(firstFile.document.canvas.background.preset);
+  expect(localReopen.document.canvas.viewport).toEqual(firstFile.document.canvas.viewport);
+  expect(localReopen.document.elements.filter((element: any) => element.type === "image")).toHaveLength(1);
+  expect(Object.keys(localReopen.document.assets)).toHaveLength(Object.keys(firstFile.document.assets).length);
+
+  const editedText = "Edited after opening the downloaded file";
+  const updateResponse = await page.request.post(commandApi, { data: {
+    operation: "update_elements",
+    input: { updates: [{ id: created.result.nodes.roundtrip, patch: { text: editedText } }] },
+  } });
+  expect(updateResponse.ok(), await updateResponse.text()).toBeTruthy();
+  await expect.poll(async () => {
+    const current = await freshBridgeDocument(page);
+    return current.document.elements.some((element: any) => element.originalText === editedText);
+  }).toBe(true);
+
+  const secondDownloadWait = page.waitForEvent("download");
+  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  const secondDownload = await secondDownloadWait;
+  const secondFilePath = await secondDownload.path();
+  const secondFile = JSON.parse((await readFile(secondFilePath)).toString("utf8"));
+  expect(secondFile.document.elements.some((element: any) => element.originalText === editedText)).toBe(true);
+
+  page.once("dialog", (dialog) => dialog.accept());
+  const secondChooserWait = page.waitForEvent("filechooser");
+  await page.getByRole("button", { name: "Open .draw" }).click();
+  await (await secondChooserWait).setFiles(secondFilePath);
+  await expect.poll(async () => {
+    const reopened = await freshBridgeDocument(page);
+    return reopened.document.elements.some((element: any) => element.originalText === editedText);
+  }).toBe(true);
 });
 
 test("malformed .draw files leave the current canvas and local autosave untouched", async ({ page }) => {

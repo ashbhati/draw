@@ -14,3 +14,4 @@
 
 /* Draw routes image exports through its own background-aware export action. */
 .editor-shell .help-icon{display:none}
+@media (max-width: 420px){.topbar{align-items:stretch;flex-direction:column;justify-content:center;gap:6px}.brand{flex:0 0 auto;width:100%;min-height:29px}.toolbar-actions{width:100%;justify-content:space-between}}
