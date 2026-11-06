@@ -92,7 +92,76 @@ async function countWarmImagePixels(page: Page, image: Buffer): Promise<number> 
 test.beforeEach(async ({ page }) => {
   await waitForBridge(page);
   await page.locator(".excalidraw canvas").first().waitFor();
-  await expect(page.getByRole("button", { name: "Blackboard" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Blackboard Canvas" })).toBeEnabled();
+});
+
+test("canvas choices are in the main toolbar and replace the quick-start rail", async ({ page }) => {
+  const toolbar = page.getByRole("group", { name: "Canvas" });
+  await expect(toolbar).toBeVisible();
+  await expect(toolbar.getByRole("button", { name: "Blackboard Canvas" })).toBeVisible();
+  await expect(toolbar.getByRole("button", { name: "Whiteboard Canvas" })).toBeVisible();
+  await expect(toolbar).toContainText("Canvas");
+  await expect(toolbar).toContainText("Blackboard Canvas");
+  await expect(toolbar).toContainText("Whiteboard Canvas");
+  await expect(page.locator(".editor-shell").getByRole("group", { name: "Canvas" })).toBeVisible();
+  await expect(toolbar.locator(".draw-canvas-option").first()).toBeVisible();
+  await expect(page.locator(".side-rail")).toHaveCount(0);
+  await expect(page.getByText("QUICK START")).toHaveCount(0);
+
+  await toolbar.getByRole("button", { name: "Whiteboard Canvas" }).click();
+  await expect(toolbar.getByRole("button", { name: "Whiteboard Canvas" })).toHaveAttribute("aria-pressed", "true");
+  await expect.poll(async () => (await currentBridgeDocument(page)).document.canvas.background.preset).toBe("white");
+  await toolbar.getByRole("button", { name: "Blackboard Canvas" }).click();
+  await expect(toolbar.getByRole("button", { name: "Blackboard Canvas" })).toHaveAttribute("aria-pressed", "true");
+});
+
+test("canvas controls fit inside the editor across responsive breakpoints", async ({ page }) => {
+  const toolbar = page.getByRole("group", { name: "Canvas" });
+  const selector = toolbar.getByLabel("Canvas background");
+  await expect(selector.locator("option")).toHaveText(["Blackboard Canvas", "Whiteboard Canvas"]);
+  const editor = page.locator(".editor-shell");
+  for (const width of [360, 390, 700, 900, 950, 1019, 1020, 1021, 1400]) {
+    await page.setViewportSize({ width, height: 844 });
+    const editorBounds = await editor.boundingBox();
+    expect(editorBounds).not.toBeNull();
+    const menuControls = await page.locator(".main-menu-trigger, .App-toolbar__extra-tools-trigger").evaluateAll((elements) => elements.map((element) => {
+      const rect = element.getBoundingClientRect();
+      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    }).filter((rect) => rect.width > 0 && rect.height > 0));
+    const overlapsMenu = (bounds: { x: number; y: number; width: number; height: number }) => menuControls.some((control) =>
+      bounds.x < control.x + control.width && bounds.x + bounds.width > control.x && bounds.y < control.y + control.height && bounds.y + bounds.height > control.y,
+    );
+    if (width <= 1020) {
+      await expect(selector).toBeVisible();
+      const bounds = await selector.boundingBox();
+      expect(bounds).not.toBeNull();
+      expect(bounds!.x).toBeGreaterThanOrEqual(editorBounds!.x);
+      expect(bounds!.y).toBeGreaterThanOrEqual(editorBounds!.y);
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(editorBounds!.x + editorBounds!.width);
+      expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(editorBounds!.y + editorBounds!.height);
+      const tools = await page.evaluate(() => {
+        const element = document.querySelector(".App-toolbar--mobile, .App-menu_top__left");
+        if (!element) return null;
+        const rect = element.getBoundingClientRect();
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+      });
+      expect(tools).not.toBeNull();
+      const overlapsTools = bounds!.x < tools!.x + tools!.width && bounds!.x + bounds!.width > tools!.x && bounds!.y < tools!.y + tools!.height && bounds!.y + bounds!.height > tools!.y;
+      expect(overlapsTools).toBe(false);
+      expect(overlapsMenu(bounds!)).toBe(false);
+    } else {
+      for (const button of [toolbar.getByRole("button", { name: "Blackboard Canvas" }), toolbar.getByRole("button", { name: "Whiteboard Canvas" })]) {
+        const bounds = await button.boundingBox();
+        expect(bounds).not.toBeNull();
+        expect(bounds!.x).toBeGreaterThanOrEqual(editorBounds!.x);
+        expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(editorBounds!.x + editorBounds!.width);
+        expect(overlapsMenu(bounds!)).toBe(false);
+      }
+    }
+  }
+  await page.setViewportSize({ width: 390, height: 844 });
+  await selector.selectOption("white");
+  await expect.poll(async () => (await currentBridgeDocument(page)).document.canvas.background.preset).toBe("white");
 });
 
 test("MCP create and update stay editable through save, reload, open, and image export", async ({ page }) => {
@@ -124,7 +193,7 @@ test("MCP create and update stay editable through save, reload, open, and image 
   }).toBe(true);
 
   await page.getByRole("button", { name: "Redo" }).click();
-  await page.getByRole("button", { name: "White" }).click();
+  await page.getByRole("button", { name: "Whiteboard Canvas" }).click();
   await expect(page.locator(".canvas-label")).toContainText("White");
 
   const editedElementId = created.result.nodes.spec;
@@ -235,7 +304,7 @@ test("a second tab is read-only while the first tab owns local autosave", async 
 
   await expect(secondTab.getByText(/reload this tab to edit/i)).toBeVisible();
   await expect(secondTab.getByLabel("Drawing title")).toBeDisabled();
-  await expect(secondTab.getByRole("button", { name: "White" })).toBeDisabled();
+  await expect(secondTab.getByRole("button", { name: "Whiteboard Canvas" })).toBeDisabled();
 });
 
 test("title edits flush to IndexedDB on pagehide and survive reload", async ({ page }) => {

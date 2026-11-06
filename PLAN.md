@@ -11,7 +11,7 @@ The first release is for one person on one canvas. It should be easy to draw man
 - **The `.draw` file is the editable source.** It stores the canvas scene and its diagram elements, not just a rendered image.
 - **PNG and JPEG are flattened exports.** They are for sharing and do not preserve editable objects.
 - **One infinite canvas can hold multiple diagrams.** Project folders and multiple pages are deferred.
-- **Background is a document choice.** Start with Blackboard and White presets and restore the selected preset when reopening a `.draw` file.
+- **Background is a document choice.** Start with Blackboard Canvas and Whiteboard Canvas presets and restore the selected preset when reopening a `.draw` file.
 - **Draw owns the product and file format.** Excalidraw's MIT-licensed React editor package is the recommended starting point for drawing interactions, not a requirement to support Excalidraw file import/export.
 - **AI creates native editable objects.** Generated diagrams should be text, shapes, arrows, and paths that can be selected and edited after creation.
 
@@ -27,9 +27,9 @@ The first release is for one person on one canvas. It should be easy to draw man
 
 ### Background and style
 
-- A visible background picker with **Blackboard** and **White** presets.
-- Blackboard uses a charcoal texture, chalk-like lettering and strokes, and a restrained palette: white for structure, yellow for emphasis, with occasional green or other accents.
-- White provides a clean alternative for conventional sketching.
+- A visible background picker with **Blackboard Canvas** and **Whiteboard Canvas** controls.
+- The Blackboard Canvas uses a charcoal texture, chalk-like lettering and strokes, and a restrained palette: white for structure, yellow for emphasis, with occasional green or other accents.
+- The Whiteboard Canvas provides a clean alternative for conventional sketching.
 - Store the selected background and its style version in the `.draw` document. Background changes must not flatten or merge the diagrams.
 
 ### Editable Draw document
@@ -67,7 +67,7 @@ The application should also autosave a working copy locally. Explicit **Open** a
 
 ### Milestone 1: A usable canvas
 
-Canvas navigation, selection, drawing primitives, text, connectors, undo/redo, and an initial Blackboard/White selector.
+Canvas navigation, selection, drawing primitives, text, connectors, undo/redo, and an initial Blackboard Canvas/Whiteboard Canvas selector.
 
 ### Milestone 2: Durable editable files
 
@@ -84,7 +84,7 @@ Connect Codex to the open document for diagram creation and targeted edits. Veri
 ## First-release acceptance checks
 
 - Create more than one diagram on the same infinite canvas; pan and zoom between them. **[Status: covered]**
-- Switch between Blackboard and White and confirm the choice persists after reopening. **[Status: covered]**
+- Switch between Blackboard Canvas and Whiteboard Canvas and confirm the choice persists after reopening. **[Status: covered]**
 - Create text, freehand strokes, shapes, arrows, and embedded assets; save as `.draw`, close, and reopen. **[Status: covered in Chrome E2E]**
 - Confirm every saved object is still individually selectable and editable, with geometry, colors, text, relationships, assets, background, and viewport restored. **[Status: covered in Chrome E2E]**
 - Export PNG and JPEG and confirm they include the selected background while the `.draw` file remains the editable source. **[Status: covered]**
@@ -93,7 +93,7 @@ Connect Codex to the open document for diagram creation and targeted edits. Veri
 
 ## V1 implementation status
 
-The core local-first V1 is implemented: one infinite canvas, Blackboard/White presets, editable `.draw` save/open, browser-local autosave, flattened PNG/JPEG export, and MCP creation/targeted edits. All listed acceptance flows are covered in automated Chrome E2E, including pan/zoom, manual drawing, both backgrounds, editable save/reopen, assets, image exports, reference flow, and MCP edits. Safari and Firefox have not been checked. The MCP bridge currently requires the Vite development server and an open Draw tab; a packaged production/desktop host is outside the current local development workflow and still needs explicit scope for release.
+The core local-first V1 is implemented: one infinite canvas, Blackboard Canvas/Whiteboard Canvas presets, editable `.draw` save/open, browser-local autosave, flattened PNG/JPEG export, and MCP creation/targeted edits. All listed acceptance flows are covered in automated Chrome E2E, including pan/zoom, manual drawing, both backgrounds, editable save/reopen, assets, image exports, reference flow, and MCP edits. Safari and Firefox have not been checked. The MCP bridge currently requires the Vite development server and an open Draw tab; a packaged production/desktop host is outside the current local development workflow and still needs explicit scope for release.
 
 Estimate: after the current review fixes, the remaining acceptance and visual-polish work is roughly **2–4 hours**, assuming the local Vite workflow is acceptable for V1. A standalone production app and MCP host would be additional work, likely **a few days**, depending on the packaging target.
 
@@ -111,7 +111,7 @@ Keep these out of the first build, then prioritize them based on actual use:
 
 - **Canvas model:** one infinite scene, multiple diagrams within it.
 - **Persistence:** local working autosave plus portable `.draw` documents.
-- **Initial backgrounds:** Blackboard and White.
+- **Initial backgrounds:** Blackboard Canvas and Whiteboard Canvas.
 - **Image exports:** PNG and JPEG; flattened by definition.
 - **Interoperability:** no Excalidraw-file compatibility requirement for v1.
 - **Future scope:** revisit the deferred capabilities after the first release is implemented and used.

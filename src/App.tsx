@@ -267,7 +267,7 @@ export default function App() {
     } catch (error) { setMessage(error instanceof Error ? error.message : "Image export failed."); }
   };
 
-  const selectBackground = (preset: DrawBackgroundPreset) => {
+  const selectBackground = useCallback((preset: DrawBackgroundPreset) => {
     if (!writerOwned.current) return;
     const current = docRef.current;
     if (!current) return;
@@ -301,7 +301,20 @@ export default function App() {
     setStatus("saving");
     autosave.schedule(next);
     bridgeAutosave.schedule(next);
-  };
+  }, [autosaveBlocked, autosave, bridgeAutosave, setDocument]);
+
+  const renderCanvasToolbar = useCallback(() => {
+    const selected = docRef.current?.document.canvas.background.preset ?? "blackboard";
+    return <div className="draw-canvas-picker" role="group" aria-label="Canvas">
+      <span className="draw-canvas-label">Canvas:</span>
+      <button className={`draw-canvas-option ${selected === "blackboard" ? "active" : ""}`} disabled={!canWrite} aria-label="Blackboard Canvas" aria-pressed={selected === "blackboard"} onClick={() => selectBackground("blackboard")}>Blackboard Canvas</button>
+      <button className={`draw-canvas-option ${selected === "white" ? "active" : ""}`} disabled={!canWrite} aria-label="Whiteboard Canvas" aria-pressed={selected === "white"} onClick={() => selectBackground("white")}>Whiteboard Canvas</button>
+      <select className="draw-canvas-mobile" aria-label="Canvas background" disabled={!canWrite} value={selected} onChange={(event) => selectBackground(event.target.value as DrawBackgroundPreset)}>
+        <option value="blackboard">Blackboard Canvas</option>
+        <option value="white">Whiteboard Canvas</option>
+      </select>
+    </div>;
+  }, [canWrite, selectBackground]);
 
   const handleMcpCommand = useCallback(async (event: BridgeCommand) => {
     const api = apiRef.current;
@@ -489,21 +502,10 @@ export default function App() {
       </div>
     </header>
     <div className="workspace">
-      <aside className="side-rail">
-        <div className="rail-label">CANVAS</div>
-        <div className="background-picker" role="group" aria-label="Canvas background">
-          <button disabled={!canWrite} className={`background-option ${background === "blackboard" ? "active" : ""}`} onClick={() => selectBackground("blackboard")} aria-pressed={background === "blackboard"}><span className="swatch swatch-chalk"><b>✳</b></span><span>Blackboard</span></button>
-          <button disabled={!canWrite} className={`background-option ${background === "white" ? "active" : ""}`} onClick={() => selectBackground("white")} aria-pressed={background === "white"}><span className="swatch swatch-paper"><b>◌</b></span><span>White</span></button>
-        </div>
-        <div className="rail-separator" />
-        <div className="rail-label">QUICK START</div>
-        <p className="rail-copy">Sketch freely on the infinite canvas. Pick a tool, draw, and connect ideas.</p>
-        <div className="shortcut"><kbd>V</kbd><span>Select</span></div><div className="shortcut"><kbd>R</kbd><span>Rectangle</span></div><div className="shortcut"><kbd>A</kbd><span>Arrow</span></div><div className="shortcut"><kbd>P</kbd><span>Draw</span></div>
-        <div className="rail-bottom"><span className="local-icon">⌂</span><span>Stored locally<br/><small>Your work stays on this device</small></span></div>
-      </aside>
       <section className="canvas-area" aria-label="Drawing canvas">
-        <div className="canvas-label"><span className="canvas-live"/>Infinite canvas <span className="dot-separator">·</span> {background === "blackboard" ? "Chalkboard" : "White"}</div>
-    <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onChange} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS} /></div>
+        <div className="canvas-label"><span className="canvas-live"/>Infinite canvas <span className="dot-separator">·</span> {background === "blackboard" ? "Blackboard Canvas" : "Whiteboard Canvas"}</div>
+    <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onChange} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS}
+      renderTopRightUI={renderCanvasToolbar} /></div>
       </section>
     </div>
     {message && <div className="toast" role="status"><span>{message}</span><button onClick={() => setMessage("")} aria-label="Dismiss message">×</button></div>}

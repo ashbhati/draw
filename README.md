@@ -11,7 +11,7 @@ npm install
 npm run dev
 ```
 
-Open <http://127.0.0.1:5173>. The current canvas autosaves in this browser on this device. Use **Save .draw** to download a portable editable document, and **Open** to restore one later. The Blackboard and White presets are saved in the document. Image exports are for sharing and cannot be edited as Draw objects.
+Open <http://127.0.0.1:5173>. The current canvas autosaves in this browser on this device. Use **Save .draw** to download a portable editable document, and **Open** to restore one later. The Blackboard Canvas and Whiteboard Canvas presets are saved in the document. Image exports are for sharing and cannot be edited as Draw objects.
 
 ## Verify
 
@@ -54,7 +54,7 @@ The MCP bridge is provided by the Vite development server, bound to loopback onl
 
 `.draw` is a versioned JSON document containing editable scene elements, view state, background metadata, and embedded assets. `plan.draw` is the initial planning canvas and remains available to open in Draw.
 
-Switching between Blackboard and White adapts Draw's default chalk and its V1 yellow accent for contrast. Other custom colors are preserved.
+Switching between the Blackboard Canvas and Whiteboard Canvas adapts Draw's default chalk and its V1 yellow accent for contrast. Other custom colors are preserved.
 
 The drawing engine is the `@excalidraw/excalidraw` package. Draw uses its editor API and maintains its own `.draw` document format; it does not promise Excalidraw file import/export compatibility.
 
