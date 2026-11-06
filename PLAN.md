@@ -93,9 +93,11 @@ Connect Codex to the open document for diagram creation and targeted edits. Veri
 
 ## V1 implementation status
 
-The core local-first V1 is implemented: one infinite canvas, Blackboard Canvas/Whiteboard Canvas presets, editable `.draw` save/open, browser-local autosave, flattened PNG/JPEG export, and MCP creation/targeted edits. All listed acceptance flows are covered in automated Chrome E2E, including pan/zoom, manual drawing, both backgrounds, editable save/reopen, assets, image exports, reference flow, and MCP edits. Safari and Firefox have not been checked. The MCP bridge currently requires the Vite development server and an open Draw tab; a packaged production/desktop host is outside the current local development workflow and still needs explicit scope for release.
+V1 is implemented and its review fixes are merged. It includes one infinite canvas, Blackboard Canvas/Whiteboard Canvas presets, editable `.draw` save/open, browser-local autosave, flattened PNG/JPEG export, and MCP creation/targeted edits. The left quick-start rail and Excalidraw outbound menu links were removed; canvas selection is in the main toolbar. Blackboard texture is consistent between the live canvas and exports.
 
-Estimate: after the current review fixes, the remaining acceptance and visual-polish work is roughly **2–4 hours**, assuming the local Vite workflow is acceptable for V1. A standalone production app and MCP host would be additional work, likely **a few days**, depending on the packaging target.
+The acceptance flows are covered by automated Chrome E2E, including pan/zoom, manual drawing, both backgrounds, editable save/reopen, assets, image exports, the supplied reference diagram, and MCP edits. The Playwright server now uses an isolated loopback port by default and will not silently reuse another server. On the merged main branch, `npm test` passes 77/77, `npm run build` succeeds with the existing large-chunk advisory, and system Chrome passes all 28 E2E flows. Safari and Firefox have not been checked.
+
+The MCP bridge currently requires the Vite development server and an open Draw tab. A packaged production/desktop host remains outside this V1 local development workflow and needs separate release scope.
 
 ## Revisit after the first release
 
@@ -105,7 +107,9 @@ Keep these out of the first build, then prioritize them based on actual use:
 - Cloud sync, user accounts, collaboration, view/edit permissions, and comments.
 - Excalidraw file import/export or compatibility, if it becomes useful.
 - Broader Excalidraw feature coverage after a focused feature audit.
-- Additional board/background presets, libraries, richer illustration tools, and presentation workflows.
+- Add selected elements to the reusable library (tracked in [issue #11](https://github.com/ashbhati/draw/issues/11)); library browsing works, saving new items is deferred.
+- Additional board/background presets, richer illustration tools, and presentation workflows.
+- Package the app and MCP bridge for a production or desktop workflow.
 
 ## Initial decisions
 
