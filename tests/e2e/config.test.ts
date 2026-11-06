@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createServer } from "node:net";
-import { createE2EServerConfig, isSameOriginURL, resolveAndStoreE2EBaseURL, resolveE2EBaseURL } from "./config";
+import { createE2EServerConfig, isBundledFontURL, isSameOriginURL, resolveAndStoreE2EBaseURL, resolveE2EBaseURL } from "./config";
 
 describe("Playwright E2E server configuration", () => {
   it("chooses an ephemeral default URL and accepts an explicit per-run loopback URL", async () => {
@@ -57,6 +57,16 @@ describe("Playwright E2E server configuration", () => {
     const origin = "http://127.0.0.1:5197";
     expect(isSameOriginURL(`${origin}/fonts/Excalifont/font.woff2`, origin)).toBe(true);
     expect(isSameOriginURL("http://127.0.0.1:51970/fonts/Excalifont/font.woff2", origin)).toBe(false);
+  });
+
+  it("only treats the bundled /fonts path as a local font source", () => {
+    const origin = "http://127.0.0.1:5197";
+    expect(isBundledFontURL(`${origin}/fonts/Excalifont/font.woff2`, origin)).toBe(true);
+    expect(isBundledFontURL(`${origin}/fonts/Xiaolai/font.woff2`, origin)).toBe(true);
+    expect(isBundledFontURL(`${origin}/@fs/node_modules/@excalidraw/excalidraw/Excalifont.woff2`, origin)).toBe(false);
+    expect(isBundledFontURL(`${origin}/assets/fonts/Xiaolai.woff2`, origin)).toBe(false);
+    expect(isBundledFontURL(`${origin}/fonts2/Xiaolai.woff2`, origin)).toBe(false);
+    expect(isBundledFontURL("http://127.0.0.1:51970/fonts/Xiaolai/font.woff2", origin)).toBe(false);
   });
 
   it("handles data and blob URLs without throwing or accepting foreign origins", () => {

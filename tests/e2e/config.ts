@@ -55,6 +55,14 @@ export function isSameOriginURL(candidateURL: string, expectedOrigin: string): b
   }
 }
 
+export function isBundledFontURL(candidateURL: string, expectedOrigin: string): boolean {
+  try {
+    return isSameOriginURL(candidateURL, expectedOrigin) && new URL(candidateURL).pathname.startsWith("/fonts/");
+  } catch {
+    return false;
+  }
+}
+
 async function findAvailablePort(): Promise<number> {
   const server = createServer();
   await new Promise<void>((resolve, reject) => {
