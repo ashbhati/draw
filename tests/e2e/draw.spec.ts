@@ -164,6 +164,18 @@ test("canvas controls fit inside the editor across responsive breakpoints", asyn
   await expect.poll(async () => (await currentBridgeDocument(page)).document.canvas.background.preset).toBe("white");
 });
 
+test("the main menu keeps local editor actions without Excalidraw outbound links", async ({ page }) => {
+  await page.locator('[data-testid="main-menu-trigger"]').click();
+  const menu = page.locator(".dropdown-menu");
+
+  await expect(menu.getByText("Export image...", { exact: true })).toBeVisible();
+  await expect(menu.getByText("Find on canvas", { exact: true })).toBeVisible();
+  await expect(menu.getByText("Help", { exact: true })).toBeVisible();
+  await expect(menu.getByText("Reset the canvas", { exact: true })).toBeVisible();
+  await expect(menu.getByText("Excalidraw links", { exact: true })).toHaveCount(0);
+  await expect(menu.locator('a[href^="http"]')).toHaveCount(0);
+});
+
 test("MCP create and update stay editable through save, reload, open, and image export", async ({ page }) => {
   const createdResponse = await page.request.post(commandApi, { data: {
     operation: "create_diagram",

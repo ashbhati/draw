@@ -1,4 +1,4 @@
-import { CaptureUpdateAction, Excalidraw, FONT_FAMILY, convertToExcalidrawElements, exportToSvg } from "@excalidraw/excalidraw";
+import { CaptureUpdateAction, Excalidraw, FONT_FAMILY, MainMenu, convertToExcalidrawElements, exportToSvg } from "@excalidraw/excalidraw";
 import type { ExcalidrawImperativeAPI, ExcalidrawInitialDataState } from "@excalidraw/excalidraw/types";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -27,6 +27,14 @@ const DEFAULT_COLOR: Record<DrawBackgroundPreset, string> = { blackboard: "#1819
 const EDITOR_UI_OPTIONS = {
   canvasActions: { loadScene: false, saveToActiveFile: false, export: false, toggleTheme: false, changeViewBackgroundColor: false },
 } as const;
+const DRAW_MENU = (
+  <MainMenu>
+    <MainMenu.DefaultItems.SaveAsImage />
+    <MainMenu.DefaultItems.SearchMenu />
+    <MainMenu.DefaultItems.Help />
+    <MainMenu.DefaultItems.ClearCanvas />
+  </MainMenu>
+);
 const randomId = () => globalThis.crypto?.randomUUID?.() ?? `el-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 function measureTextWithExcalidraw(text: string, fontSize: number, element: EditableSceneElement) {
@@ -505,7 +513,7 @@ export default function App() {
       <section className="canvas-area" aria-label="Drawing canvas">
         <div className="canvas-label"><span className="canvas-live"/>Infinite canvas <span className="dot-separator">·</span> {background === "blackboard" ? "Blackboard Canvas" : "Whiteboard Canvas"}</div>
     <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onChange} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS}
-      renderTopRightUI={renderCanvasToolbar} /></div>
+      renderTopRightUI={renderCanvasToolbar}>{DRAW_MENU}</Excalidraw></div>
       </section>
     </div>
     {message && <div className="toast" role="status"><span>{message}</span><button onClick={() => setMessage("")} aria-label="Dismiss message">×</button></div>}
