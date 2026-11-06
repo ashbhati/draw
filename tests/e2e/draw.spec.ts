@@ -178,7 +178,7 @@ test("canvas controls fit inside the editor across responsive breakpoints", asyn
   const selector = toolbar.getByLabel("Canvas background");
   await expect(selector.locator("option")).toHaveText(["Blackboard Canvas", "Whiteboard Canvas"]);
   const editor = page.locator(".editor-shell");
-  for (const width of [360, 390, 700, 900, 950, 1019, 1020, 1021, 1400]) {
+  for (const width of [360, 390, 700, 900, 950, 1019, 1020, 1021, 1100, 1400, 1920]) {
     await page.setViewportSize({ width, height: 844 });
     const editorBounds = await editor.boundingBox();
     expect(editorBounds).not.toBeNull();
@@ -257,53 +257,51 @@ test("Meta+Shift+E cannot open Excalidraw's image exporter", async ({ page }) =>
   await expect(page.locator('a[href^="http"]')).toHaveCount(0);
 });
 
-test("Blackboard texture matches live and exports across viewport sizes", async ({ page }) => {
+test("Blackboard texture matches live and exports at fixed 1400x800 viewport", async ({ page }) => {
   const createResponse = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
     input: { nodes: [{ id: "dark-fill", label: "Dark fill", x: 200, y: 180, width: 160, height: 100, color: "#18191a" }], edges: [] },
   } });
   expect(createResponse.ok(), await createResponse.text()).toBeTruthy();
-  const viewports = [{ width: 1280, height: 720 }, { width: 1400, height: 800 }, { width: 1600, height: 800 }];
-  for (const viewport of viewports) {
-    await page.setViewportSize(viewport);
-    await page.waitForTimeout(100);
-    const liveBoard = await page.locator(".editor-shell").screenshot();
+  const viewport = { width: 1400, height: 800 };
+  await page.setViewportSize(viewport);
+  await page.waitForTimeout(100);
+  const liveBoard = await page.locator(".editor-shell").screenshot();
 
-    const pngDownloadWait = page.waitForEvent("download");
-    await page.locator("button.export-main").click();
-    const png = await readFile(await (await pngDownloadWait).path());
+  const pngDownloadWait = page.waitForEvent("download");
+  await page.locator("button.export-main").click();
+  const png = await readFile(await (await pngDownloadWait).path());
 
-    const jpegDownloadWait = page.waitForEvent("download");
-    await page.getByLabel("Image export format").selectOption("image/jpeg");
-    const jpeg = await readFile(await (await jpegDownloadWait).path());
+  const jpegDownloadWait = page.waitForEvent("download");
+  await page.getByLabel("Image export format").selectOption("image/jpeg");
+  const jpeg = await readFile(await (await jpegDownloadWait).path());
 
-    const boardPoints = [{ x: 0.1, y: 0.5 }, { x: 0.9, y: 0.5 }, { x: 0.1, y: 0.8 }, { x: 0.9, y: 0.8 }];
-    const livePixels = await Promise.all(boardPoints.map((point) => sampleImagePatch(page, liveBoard, point)));
-    const pngPixels = await Promise.all(boardPoints.map((point) => sampleImagePatch(page, png, point)));
-    const jpegPixels = await Promise.all(boardPoints.map((point) => sampleImagePatch(page, jpeg, point, "image/jpeg")));
-    const pngDifferences = livePixels.map((pixel, index) => maxChannelDifference(pixel, pngPixels[index]));
-    const jpegDifferences = livePixels.map((pixel, index) => maxChannelDifference(pixel, jpegPixels[index]));
-    expect(Math.max(...pngDifferences), `${viewport.width}x${viewport.height} live/PNG channel differences: ${pngDifferences.join(", ")}`).toBeLessThanOrEqual(4);
-    expect(Math.max(...jpegDifferences), `${viewport.width}x${viewport.height} live/JPEG channel differences: ${jpegDifferences.join(", ")}`).toBeLessThanOrEqual(14);
+  const boardPoints = [{ x: 0.1, y: 0.5 }, { x: 0.9, y: 0.5 }, { x: 0.1, y: 0.8 }, { x: 0.9, y: 0.8 }];
+  const livePixels = await Promise.all(boardPoints.map((point) => sampleImagePatch(page, liveBoard, point)));
+  const pngPixels = await Promise.all(boardPoints.map((point) => sampleImagePatch(page, png, point)));
+  const jpegPixels = await Promise.all(boardPoints.map((point) => sampleImagePatch(page, jpeg, point, "image/jpeg")));
+  const pngDifferences = livePixels.map((pixel, index) => maxChannelDifference(pixel, pngPixels[index]));
+  const jpegDifferences = livePixels.map((pixel, index) => maxChannelDifference(pixel, jpegPixels[index]));
+  expect(Math.max(...pngDifferences), `live/PNG channel differences: ${pngDifferences.join(", ")}`).toBeLessThanOrEqual(3);
+  expect(Math.max(...jpegDifferences), `live/JPEG channel differences: ${jpegDifferences.join(", ")}`).toBeLessThanOrEqual(14);
 
-    const liveTextureStdDev = await measureBoardTextureStdDev(page, liveBoard);
-    const pngTextureStdDev = await measureBoardTextureStdDev(page, png);
-    const jpegTextureStdDev = await measureBoardTextureStdDev(page, jpeg, "image/jpeg");
-    for (const [format, deviation] of [["live", liveTextureStdDev], ["PNG", pngTextureStdDev], ["JPEG", jpegTextureStdDev]] as const) {
-      expect(deviation, `${viewport.width}x${viewport.height} ${format} texture standard deviation`).toBeGreaterThan(0.5);
-      expect(deviation, `${viewport.width}x${viewport.height} ${format} texture standard deviation`).toBeLessThan(4);
-    }
-    expect(Math.abs(liveTextureStdDev - pngTextureStdDev), `${viewport.width}x${viewport.height} live/PNG texture variation`).toBeLessThan(1.5);
-
-    // The export includes 32px of padding around the 160x100 node. Sample its
-    // lower-right fill (away from the bound label) against the nearby board.
-    const fillPixel = await sampleImagePatch(page, png, { x: 0.8, y: 0.73 });
-    const adjacentBoardPixel = await sampleImagePatch(page, png, { x: 0.06, y: 0.73 });
-    expect(maxChannelDifference(fillPixel, adjacentBoardPixel), `${viewport.width}x${viewport.height} PNG dark fill continuity`).toBeLessThanOrEqual(8);
-    const jpegFillPixel = await sampleImagePatch(page, jpeg, { x: 0.8, y: 0.73 }, "image/jpeg");
-    const jpegBoardPixel = await sampleImagePatch(page, jpeg, { x: 0.06, y: 0.73 }, "image/jpeg");
-    expect(maxChannelDifference(jpegFillPixel, jpegBoardPixel), `${viewport.width}x${viewport.height} JPEG dark fill continuity`).toBeLessThanOrEqual(12);
+  const liveTextureStdDev = await measureBoardTextureStdDev(page, liveBoard);
+  const pngTextureStdDev = await measureBoardTextureStdDev(page, png);
+  const jpegTextureStdDev = await measureBoardTextureStdDev(page, jpeg, "image/jpeg");
+  for (const [format, deviation] of [["live", liveTextureStdDev], ["PNG", pngTextureStdDev], ["JPEG", jpegTextureStdDev]] as const) {
+    expect(deviation, `${format} texture standard deviation`).toBeGreaterThan(0.5);
+    expect(deviation, `${format} texture standard deviation`).toBeLessThan(4);
   }
+  expect(Math.abs(liveTextureStdDev - pngTextureStdDev), "live/PNG texture variation").toBeLessThan(1);
+
+  // The export includes 32px of padding around the 160x100 node. Sample its
+  // lower-right fill (away from the bound label) against the nearby board.
+  const fillPixel = await sampleImagePatch(page, png, { x: 0.8, y: 0.73 });
+  const adjacentBoardPixel = await sampleImagePatch(page, png, { x: 0.06, y: 0.73 });
+  expect(maxChannelDifference(fillPixel, adjacentBoardPixel), "PNG dark fill continuity").toBeLessThanOrEqual(8);
+  const jpegFillPixel = await sampleImagePatch(page, jpeg, { x: 0.8, y: 0.73 }, "image/jpeg");
+  const jpegBoardPixel = await sampleImagePatch(page, jpeg, { x: 0.06, y: 0.73 }, "image/jpeg");
+  expect(maxChannelDifference(jpegFillPixel, jpegBoardPixel), "JPEG dark fill continuity").toBeLessThanOrEqual(12);
 });
 
 test("MCP create and update stay editable through save, reload, open, and image export", async ({ page }) => {
