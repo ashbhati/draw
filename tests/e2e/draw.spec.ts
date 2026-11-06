@@ -110,6 +110,29 @@ async function sampleImagePixel(
   }, { bytes: Array.from(image), position: point, mime: mimeType });
 }
 
+async function measureBoardTextureStdDev(page: Page, image: Buffer, mimeType = "image/png"): Promise<number> {
+  return page.evaluate(async ({ bytes, mime }) => {
+    const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: mime }));
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Canvas pixel inspection is unavailable.");
+    context.drawImage(bitmap, 0, 0);
+    const pixels: number[] = [];
+    for (let row = 0; row < 16; row += 1) {
+      const y = Math.floor(bitmap.height * (0.2 + row * 0.04));
+      for (const xFraction of [0.04, 0.08, 0.92, 0.96]) {
+        const x = Math.floor(bitmap.width * xFraction);
+        const pixel = context.getImageData(x, y, 1, 1).data;
+        pixels.push(pixel[0] * 0.2126 + pixel[1] * 0.7152 + pixel[2] * 0.0722);
+      }
+    }
+    const mean = pixels.reduce((sum, value) => sum + value, 0) / pixels.length;
+    return Math.sqrt(pixels.reduce((sum, value) => sum + (value - mean) ** 2, 0) / pixels.length);
+  }, { bytes: Array.from(image), mime: mimeType });
+}
+
 function maxChannelDifference(a: readonly number[], b: readonly number[]): number {
   return Math.max(...a.map((channel, index) => Math.abs(channel - b[index])));
 }
@@ -246,8 +269,17 @@ test("Blackboard texture matches live, PNG, and JPEG pixels and keeps dark fills
   const jpegPixels = await Promise.all(boardPoints.map((point) => sampleImagePixel(page, jpeg, point, "image/jpeg")));
   const pngDifferences = livePixels.map((pixel, index) => maxChannelDifference(pixel, pngPixels[index]));
   const jpegDifferences = livePixels.map((pixel, index) => maxChannelDifference(pixel, jpegPixels[index]));
-  expect(Math.max(...pngDifferences), `live/PNG channel differences: ${pngDifferences.join(", ")}`).toBeLessThanOrEqual(8);
+  expect(Math.max(...pngDifferences), `live/PNG channel differences: ${pngDifferences.join(", ")}`).toBeLessThanOrEqual(3);
   expect(Math.max(...jpegDifferences), `live/JPEG channel differences: ${jpegDifferences.join(", ")}`).toBeLessThanOrEqual(14);
+
+  const liveTextureStdDev = await measureBoardTextureStdDev(page, liveBoard);
+  const pngTextureStdDev = await measureBoardTextureStdDev(page, png);
+  const jpegTextureStdDev = await measureBoardTextureStdDev(page, jpeg, "image/jpeg");
+  for (const [format, deviation] of [["live", liveTextureStdDev], ["PNG", pngTextureStdDev], ["JPEG", jpegTextureStdDev]] as const) {
+    expect(deviation, `${format} texture standard deviation`).toBeGreaterThan(0.5);
+    expect(deviation, `${format} texture standard deviation`).toBeLessThan(4);
+  }
+  expect(Math.abs(liveTextureStdDev - pngTextureStdDev), "live/PNG texture variation").toBeLessThan(1);
 
   // The export includes 32px of padding around the 160x100 node. Sample its
   // lower-right fill (away from the bound label) against the nearby board.
@@ -467,7 +499,8 @@ test("loads fonts and exports the hand-drawn scene without network access", asyn
   const exported = await downloadWait;
   const image = await readFile(await exported.path());
   expect(image.subarray(0, 8).toString("hex")).toBe("89504e470d0a1a0a");
-  expect(await countWarmImagePixels(page, image)).toBeGreaterThan(40);
+  expect(await countWarmImagePixels(page, image), "the exported diagram includes visible yellow diagram pixels").toBeGreaterThan(40);
+  expect(await countPixelsNear(page, image, [24, 25, 26], 8), "the export includes its charcoal board background").toBeGreaterThan(1_000);
   expect(externalRequests).toEqual([]);
   expect(localFontRequests.every((url) => url.startsWith("http://127.0.0.1:5181/fonts/"))).toBe(true);
   expect(cjkFontRequests.every((url) => url.startsWith("http://127.0.0.1:5181/fonts/"))).toBe(true);
