@@ -32,7 +32,7 @@ export function buildDiagramSkeletons(
       type: node.shape === "ellipse" ? "ellipse" : node.shape === "diamond" ? "diamond" : "rectangle",
       x: node.x, y: node.y, width: node.width ?? 180, height: node.height ?? 72,
       strokeColor,
-      backgroundColor: onBlackboard ? "#18191a" : "#ffffff",
+      backgroundColor: onBlackboard ? "transparent" : "#ffffff",
       fillStyle: "solid", strokeWidth: 2, roughness: 1,
       label: { text: node.label, fontSize: 20, strokeColor },
     });

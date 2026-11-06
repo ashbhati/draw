@@ -23,4 +23,16 @@ describe("background default color migration", () => {
     const [onBlackboard] = recolorForBackgroundPreset([onWhite], "white", "blackboard");
     expect(onBlackboard.strokeColor).toBe("#f2d27a");
   });
+
+  it("turns transparent Blackboard node fills white on paper and leaves transparent labels alone", () => {
+    const elements = [
+      { id: "node", type: "rectangle", backgroundColor: "transparent" },
+      { id: "label", type: "text", backgroundColor: "transparent" },
+    ];
+    const [onWhiteNode, onWhiteLabel] = recolorForBackgroundPreset(elements, "blackboard", "white");
+    expect(onWhiteNode.backgroundColor).toBe("#ffffff");
+    expect(onWhiteLabel.backgroundColor).toBe("transparent");
+    const [onBlackboardNode] = recolorForBackgroundPreset([onWhiteNode], "white", "blackboard");
+    expect(onBlackboardNode.backgroundColor).toBe("transparent");
+  });
 });

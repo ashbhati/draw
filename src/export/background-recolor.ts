@@ -21,6 +21,7 @@ export function recolorForBackgroundPreset<T extends Record<string, unknown>>(
 ): T[] {
   if (from === to) return elements.map((element) => ({ ...element }));
   return elements.map((element) => {
+    const isShape = element.type === "rectangle" || element.type === "ellipse" || element.type === "diamond";
     const next = {
       ...element,
       ...(element.strokeColor === FOREGROUND[from]
@@ -33,7 +34,12 @@ export function recolorForBackgroundPreset<T extends Record<string, unknown>>(
         : typeof element.backgroundColor === "string" && ACCENTS[from][element.backgroundColor]
           ? { backgroundColor: ACCENTS[from][element.backgroundColor] }
           : {}),
-      ...(element.backgroundColor === BACKGROUND[from] ? { backgroundColor: BACKGROUND[to] } : {}),
+      ...(element.backgroundColor === BACKGROUND[from]
+        ? { backgroundColor: isShape && to === "blackboard" ? "transparent" : BACKGROUND[to] }
+        : {}),
+      ...(isShape && from === "blackboard" && to === "white" && element.backgroundColor === "transparent"
+        ? { backgroundColor: BACKGROUND[to] }
+        : {}),
     };
     if (next.strokeColor === element.strokeColor && next.backgroundColor === element.backgroundColor) return next;
     return {

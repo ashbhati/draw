@@ -44,4 +44,23 @@ describe("MCP diagram construction", () => {
       label: { text: "Custom", strokeColor: "#147a55" },
     });
   });
+
+  it("keeps blackboard node interiors transparent while retaining readable chalk outlines and labels", () => {
+    const result = buildDiagramSkeletons({
+      nodes: [
+        { id: "default", label: "Visible on chalkboard", x: 0, y: 0 },
+        { id: "accent", label: "Accent", x: 220, y: 0, color: "#f2d27a" },
+      ],
+      edges: [],
+    }, "blackboard", () => "node-id");
+
+    expect(result.skeletons[0]).toMatchObject({
+      type: "rectangle", strokeColor: "#f6f2e9", backgroundColor: "transparent",
+      label: { text: "Visible on chalkboard", strokeColor: "#f6f2e9" },
+    });
+    expect(result.skeletons[1]).toMatchObject({
+      type: "rectangle", strokeColor: "#f2d27a", backgroundColor: "transparent",
+      label: { text: "Accent", strokeColor: "#f2d27a" },
+    });
+  });
 });

@@ -15,7 +15,32 @@ export function selectExportElements<T extends { id: string; isDeleted?: boolean
   return live.filter((element) => selectedIds.has(element.id) || (element.containerId != null && selectedIds.has(element.containerId)));
 }
 
-const BLACKBOARD_BG = `<image data-draw-background="blackboard" x="0" y="0" width="100%" height="100%" preserveAspectRatio="none" href="data:image/svg+xml,${encodeURIComponent(blackboardTexture)}" />`;
+const BLACKBOARD_TEXTURE_SIZE = { width: 1280, height: 800 } as const;
+
+type SvgViewport = { x: number; y: number; width: number; height: number };
+
+function readSvgViewport(svg: string): SvgViewport {
+  const viewBox = svg.match(/\bviewBox\s*=\s*["']\s*([-+\d.e]+)[,\s]+([-+\d.e]+)[,\s]+([-+\d.e]+)[,\s]+([-+\d.e]+)\s*["']/i);
+  if (viewBox) {
+    const [, x, y, width, height] = viewBox.map(Number);
+    if ([x, y, width, height].every(Number.isFinite) && width > 0 && height > 0) return { x, y, width, height };
+  }
+  const openTag = svg.match(/<svg\b[^>]*>/i)?.[0] ?? "";
+  const width = Number(openTag.match(/\bwidth\s*=\s*["']\s*([\d.]+)/i)?.[1]);
+  const height = Number(openTag.match(/\bheight\s*=\s*["']\s*([\d.]+)/i)?.[1]);
+  return Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0
+    ? { x: 0, y: 0, width, height }
+    : { x: 0, y: 0, width: BLACKBOARD_TEXTURE_SIZE.width, height: BLACKBOARD_TEXTURE_SIZE.height };
+}
+
+function blackboardBackgroundLayer(viewport: SvgViewport): string {
+  const scale = Math.max(viewport.width / BLACKBOARD_TEXTURE_SIZE.width, viewport.height / BLACKBOARD_TEXTURE_SIZE.height);
+  const imageWidth = BLACKBOARD_TEXTURE_SIZE.width * scale;
+  const imageHeight = BLACKBOARD_TEXTURE_SIZE.height * scale;
+  const imageX = viewport.x + (viewport.width - imageWidth) / 2;
+  const imageY = viewport.y + (viewport.height - imageHeight) / 2;
+  return `<rect data-draw-background="blackboard" x="${viewport.x}" y="${viewport.y}" width="${viewport.width}" height="${viewport.height}" fill="#18191a" /><defs><clipPath id="draw-blackboard-texture-clip" clipPathUnits="userSpaceOnUse"><rect x="${viewport.x}" y="${viewport.y}" width="${viewport.width}" height="${viewport.height}" /></clipPath></defs><image data-draw-background-texture="blackboard" x="${imageX}" y="${imageY}" width="${imageWidth}" height="${imageHeight}" preserveAspectRatio="none" clip-path="url(#draw-blackboard-texture-clip)" href="data:image/svg+xml,${encodeURIComponent(blackboardTexture)}" />`;
+}
 
 export function hasSelectedExportElements<T extends { id: string; isDeleted?: boolean }>(
   elements: readonly T[],
@@ -26,11 +51,11 @@ export function hasSelectedExportElements<T extends { id: string; isDeleted?: bo
   ));
 }
 
-function backgroundLayer(preset: "blackboard" | "white"): string {
+function backgroundLayer(preset: "blackboard" | "white", viewport: SvgViewport): string {
   if (preset === "white") {
-    return '<rect data-draw-background="white" x="0" y="0" width="100%" height="100%" fill="#ffffff" />';
+    return `<rect data-draw-background="white" x="${viewport.x}" y="${viewport.y}" width="${viewport.width}" height="${viewport.height}" fill="#ffffff" />`;
   }
-  return BLACKBOARD_BG;
+  return blackboardBackgroundLayer(viewport);
 }
 
 /** Insert a persistent canvas background before any exported scene elements. */
@@ -45,7 +70,7 @@ export function composeBackgroundSvg(
   if (!openTag || !/<\/svg\s*>/i.test(svg)) {
     throw new TypeError("Expected a complete SVG document.");
   }
-  return svg.replace(openTag, `${openTag}\n${backgroundLayer(preset)}`);
+  return svg.replace(openTag, `${openTag}\n${backgroundLayer(preset, readSvgViewport(svg))}`);
 }
 
 /** Render an SVG to a shareable PNG/JPEG. The result is flattened by design. */

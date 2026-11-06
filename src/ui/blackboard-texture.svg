@@ -1,18 +1,86 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="600" viewBox="0 0 1000 600">
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800">
   <defs>
-    <filter id="soft-wipe" x="-10%" y="-25%" width="120%" height="150%">
-      <feGaussianBlur stdDeviation="22" />
+    <radialGradient id="slate" cx="50%" cy="46%" r="78%">
+      <stop offset="0" stop-color="#1c1d1e" />
+      <stop offset=".58" stop-color="#1a1b1c" />
+      <stop offset="1" stop-color="#121314" />
+    </radialGradient>
+    <filter id="chalk-surface" x="-12%" y="-12%" width="124%" height="124%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency=".008 .014" numOctaves="3" seed="17" stitchTiles="stitch" result="slate-wear" />
+      <feColorMatrix in="slate-wear" type="saturate" values="0" result="gray-wear" />
+      <feComponentTransfer in="gray-wear" result="faint-wear"><feFuncA type="linear" slope=".08" /></feComponentTransfer>
+      <feBlend in="SourceGraphic" in2="faint-wear" mode="soft-light" result="worn-slate" />
+      <feTurbulence type="fractalNoise" baseFrequency=".3 .36" numOctaves="3" seed="8" stitchTiles="stitch" result="chalk-grain" />
+      <feColorMatrix in="chalk-grain" type="saturate" values="0" result="gray-grain" />
+      <feComponentTransfer in="gray-grain" result="fine-grain"><feFuncA type="linear" slope=".28" /></feComponentTransfer>
+      <feBlend in="worn-slate" in2="fine-grain" mode="overlay" />
+    </filter>
+    <filter id="rough-chalk" x="-25%" y="-150%" width="150%" height="400%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency=".018 .035" numOctaves="2" seed="31" stitchTiles="stitch" result="chalk-edge" />
+      <feDisplacementMap in="SourceGraphic" in2="chalk-edge" scale="28" xChannelSelector="R" yChannelSelector="G" result="rough-stroke" />
+      <feGaussianBlur in="rough-stroke" stdDeviation="2" />
+    </filter>
+    <filter id="soft-dust" x="-30%" y="-200%" width="160%" height="500%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency=".04 .08" numOctaves="2" seed="22" stitchTiles="stitch" result="dust-edge" />
+      <feDisplacementMap in="SourceGraphic" in2="dust-edge" scale="14" xChannelSelector="R" yChannelSelector="G" result="rough-dust" />
+      <feGaussianBlur in="rough-dust" stdDeviation="4" />
+    </filter>
+    <filter id="chalk-scratch" x="-15%" y="-150%" width="130%" height="400%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency=".04 .07" numOctaves="2" seed="41" stitchTiles="stitch" result="scratch-edge" />
+      <feDisplacementMap in="SourceGraphic" in2="scratch-edge" scale="10" xChannelSelector="R" yChannelSelector="G" />
     </filter>
   </defs>
-  <rect width="1000" height="600" fill="#18191a" />
-  <g fill="none" stroke="#d2d0ca" stroke-linecap="round" filter="url(#soft-wipe)">
-    <path d="M -40 92 C 180 54 305 130 496 91 S 833 52 1040 105" stroke-width="46" opacity=".045" />
-    <path d="M -30 292 C 174 338 353 243 554 277 S 859 358 1040 305" stroke-width="34" opacity=".04" />
-    <path d="M -40 493 C 178 448 327 535 548 486 S 858 439 1040 514" stroke-width="40" opacity=".038" />
+
+  <rect width="1280" height="800" fill="url(#slate)" filter="url(#chalk-surface)" />
+
+  <g transform="translate(128 100) scale(.9)">
+
+  <!-- Broad, uneven wipe marks and chalky residue, kept close to the slate tone. -->
+  <g fill="none" stroke="#aaa8a1" stroke-linecap="butt" filter="url(#rough-chalk)">
+    <path d="M -54 88 C 23 34 96 48 142 96 S 216 147 278 112" stroke-width="78" opacity=".115" />
+    <path d="M 346 116 C 395 56 468 49 508 91 S 564 153 625 115" stroke-width="56" opacity=".105" transform="rotate(18 500 110)" />
+    <path d="M 746 48 C 795 89 844 41 891 68 S 948 125 1054 77" stroke-width="84" opacity=".11" />
+    <path d="M 20 249 C 88 188 149 207 194 254 S 276 306 330 253" stroke-width="98" opacity=".135" />
+    <path d="M 398 365 C 435 309 501 326 527 383 S 579 449 636 402" stroke-width="66" opacity=".115" transform="rotate(-12 520 380)" />
+    <path d="M 713 174 C 769 121 833 151 859 205 S 922 271 985 220" stroke-width="90" opacity=".12" transform="rotate(13 850 205)" />
+    <path d="M 116 432 C 171 381 236 392 267 442 S 324 528 402 491" stroke-width="92" opacity=".135" />
+    <path d="M 494 323 C 531 268 590 261 620 309 S 671 390 734 348" stroke-width="74" opacity=".115" transform="rotate(16 610 335)" />
+    <path d="M 790 506 C 830 455 880 474 907 522 S 956 587 1022 545" stroke-width="90" opacity=".12" transform="rotate(-14 900 520)" />
+    <path d="M 30 565 C 93 511 151 527 187 573 S 248 608 291 573 M 632 545 C 679 501 723 514 752 550 S 814 596 865 558" stroke-width="58" opacity=".105" />
+    <path d="M 279 179 C 320 152 362 165 379 203 M 927 182 C 965 211 969 251 946 282" stroke-width="48" opacity=".095" />
   </g>
-  <g fill="none" stroke="#c8c6bf" stroke-linecap="round" opacity=".025">
-    <path d="M 88 180 C 235 146 352 205 473 172" stroke-width="3" />
-    <path d="M 536 390 C 682 356 824 417 944 381" stroke-width="3" />
-    <path d="M 194 560 C 322 535 398 574 501 551" stroke-width="2" />
+
+  <!-- Irregular curved scrapes and chalk dust trails remain visible through the soft residue. -->
+  <g fill="none" stroke="#cac8c1" stroke-linecap="round" filter="url(#chalk-scratch)">
+    <path d="M -12 153 C 38 112 88 92 134 103 S 203 143 253 132" stroke-width="3.1" opacity=".13" />
+    <path d="M 289 122 C 342 94 386 81 428 94 S 471 114 495 105 M 614 143 C 654 125 695 94 735 95 S 783 113 805 126" stroke-width="2.3" opacity=".14" />
+    <path d="M 887 99 C 935 109 971 145 1027 105 M 56 280 C 110 253 153 258 193 280 S 236 304 270 301" stroke-width="3.5" opacity=".13" />
+    <path d="M 358 285 C 406 251 457 251 496 274 S 533 297 570 290 M 686 315 C 727 287 766 283 799 300" stroke-width="2" opacity=".15" />
+    <path d="M 830 302 C 883 276 931 286 970 314 M 20 511 C 73 474 116 469 154 488 S 190 516 221 514" stroke-width="3" opacity=".12" />
+    <path d="M 267 483 C 307 462 336 458 369 468 M 466 517 C 504 487 548 480 582 496 M 746 470 C 786 450 824 457 850 475" stroke-width="1.8" opacity=".14" />
+    <path d="M 77 224 C 111 196 140 187 173 192 M 211 202 C 249 180 279 175 309 182 M 712 210 C 754 185 783 180 817 186 M 855 203 C 891 186 920 178 948 180" stroke-width="1.8" opacity=".13" />
+  </g>
+
+  <!-- Layered curved wipe strokes leave uneven chalk edges instead of smooth haze. -->
+  <g fill="none" stroke="#c0beb7" stroke-linecap="round" filter="url(#soft-dust)">
+    <path d="M 18 199 C 72 120 114 105 165 123 S 236 169 270 185" stroke-width="44" opacity=".12" />
+    <path d="M 311 286 C 359 226 412 205 452 228 S 501 272 550 257" stroke-width="26" opacity=".095" transform="rotate(11 430 245)" />
+    <path d="M 704 139 C 760 103 821 119 852 163 S 899 213 969 184" stroke-width="48" opacity=".11" />
+    <path d="M 98 418 C 141 380 186 389 222 430 S 254 472 309 461" stroke-width="36" opacity=".11" transform="rotate(-10 205 425)" />
+    <path d="M 481 310 C 526 267 575 272 604 311 S 662 370 718 344" stroke-width="25" opacity=".095" transform="rotate(15 600 320)" />
+    <path d="M 846 370 C 885 326 929 340 953 378 S 987 430 1038 410" stroke-width="42" opacity=".105" transform="rotate(-13 940 375)" />
+    <path d="M 147 518 C 192 466 245 474 278 514 S 320 561 360 544" stroke-width="30" opacity=".105" />
+    <path d="M 566 528 C 603 484 647 482 680 512 M 776 247 C 815 212 853 213 889 238" stroke-width="20" opacity=".09" />
+  </g>
+
+  <!-- Short, broken chalk scuffs follow the wipe motion without repeating a grid. -->
+  <g fill="none" stroke="#cbc9c2" stroke-linecap="round" filter="url(#soft-dust)">
+    <path d="M 47 301 C 83 281 105 272 142 269 M 159 260 C 188 246 215 241 246 244" stroke-width="7" opacity=".12" />
+    <path d="M 338 250 C 369 238 399 226 423 228 M 460 234 C 495 224 523 212 548 211" stroke-width="6" opacity=".11" />
+    <path d="M 735 300 C 770 282 798 278 832 279 M 860 286 C 889 273 914 261 944 252" stroke-width="8" opacity=".12" />
+    <path d="M 95 489 C 127 469 150 457 183 456 M 207 461 C 238 447 262 433 288 426" stroke-width="6" opacity=".11" />
+    <path d="M 564 482 C 594 468 621 450 649 449 M 675 454 C 702 439 727 431 753 430" stroke-width="7" opacity=".11" />
+    <path d="M 786 550 C 817 531 842 521 868 520 M 888 527 C 920 513 945 502 969 487" stroke-width="6" opacity=".11" />
+  </g>
   </g>
 </svg>
