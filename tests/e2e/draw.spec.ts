@@ -115,15 +115,51 @@ test("canvas choices are in the main toolbar and replace the quick-start rail", 
   await expect(toolbar.getByRole("button", { name: "Blackboard Canvas" })).toHaveAttribute("aria-pressed", "true");
 });
 
-test("canvas controls remain visible and usable at phone width", async ({ page }) => {
-  await page.setViewportSize({ width: 390, height: 844 });
+test("canvas controls fit inside the editor across responsive breakpoints", async ({ page }) => {
   const toolbar = page.getByRole("group", { name: "Canvas" });
   const selector = toolbar.getByLabel("Canvas background");
-  const bounds = await selector.boundingBox();
-  expect(bounds).not.toBeNull();
-  expect(bounds!.x).toBeGreaterThanOrEqual(0);
-  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(390);
   await expect(selector.locator("option")).toHaveText(["Blackboard Canvas", "Whiteboard Canvas"]);
+  const editor = page.locator(".editor-shell");
+  for (const width of [360, 390, 700, 900, 950, 1019, 1020, 1021, 1400]) {
+    await page.setViewportSize({ width, height: 844 });
+    const editorBounds = await editor.boundingBox();
+    expect(editorBounds).not.toBeNull();
+    const menuControls = await page.locator(".main-menu-trigger, .App-toolbar__extra-tools-trigger").evaluateAll((elements) => elements.map((element) => {
+      const rect = element.getBoundingClientRect();
+      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    }).filter((rect) => rect.width > 0 && rect.height > 0));
+    const overlapsMenu = (bounds: { x: number; y: number; width: number; height: number }) => menuControls.some((control) =>
+      bounds.x < control.x + control.width && bounds.x + bounds.width > control.x && bounds.y < control.y + control.height && bounds.y + bounds.height > control.y,
+    );
+    if (width <= 1020) {
+      await expect(selector).toBeVisible();
+      const bounds = await selector.boundingBox();
+      expect(bounds).not.toBeNull();
+      expect(bounds!.x).toBeGreaterThanOrEqual(editorBounds!.x);
+      expect(bounds!.y).toBeGreaterThanOrEqual(editorBounds!.y);
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(editorBounds!.x + editorBounds!.width);
+      expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(editorBounds!.y + editorBounds!.height);
+      const tools = await page.evaluate(() => {
+        const element = document.querySelector(".App-toolbar--mobile, .App-menu_top__left");
+        if (!element) return null;
+        const rect = element.getBoundingClientRect();
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+      });
+      expect(tools).not.toBeNull();
+      const overlapsTools = bounds!.x < tools!.x + tools!.width && bounds!.x + bounds!.width > tools!.x && bounds!.y < tools!.y + tools!.height && bounds!.y + bounds!.height > tools!.y;
+      expect(overlapsTools).toBe(false);
+      expect(overlapsMenu(bounds!)).toBe(false);
+    } else {
+      for (const button of [toolbar.getByRole("button", { name: "Blackboard Canvas" }), toolbar.getByRole("button", { name: "Whiteboard Canvas" })]) {
+        const bounds = await button.boundingBox();
+        expect(bounds).not.toBeNull();
+        expect(bounds!.x).toBeGreaterThanOrEqual(editorBounds!.x);
+        expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(editorBounds!.x + editorBounds!.width);
+        expect(overlapsMenu(bounds!)).toBe(false);
+      }
+    }
+  }
+  await page.setViewportSize({ width: 390, height: 844 });
   await selector.selectOption("white");
   await expect.poll(async () => (await currentBridgeDocument(page)).document.canvas.background.preset).toBe("white");
 });
