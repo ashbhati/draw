@@ -474,6 +474,59 @@ test("MCP diagram titles reserve at least their live Excalifont text width", asy
   expect(titleElement.width).toBeGreaterThanOrEqual(renderedWidth);
 });
 
+test("Open .draw restores a downloaded file that remains editable through a second save and reopen", async ({ page }) => {
+  const createResponse = await page.request.post(commandApi, { data: {
+    operation: "create_diagram",
+    input: { nodes: [{ id: "roundtrip", label: "Downloaded editable diagram", x: 140, y: 120 }], edges: [] },
+  } });
+  expect(createResponse.ok(), await createResponse.text()).toBeTruthy();
+  const created = await createResponse.json();
+
+  const firstDownloadWait = page.waitForEvent("download");
+  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  const firstDownload = await firstDownloadWait;
+  const firstFilePath = await firstDownload.path();
+  const firstFile = JSON.parse((await readFile(firstFilePath)).toString("utf8"));
+  expect(firstFile.format).toBe("draw");
+  expect(firstFile.document.elements.some((element: any) => element.id === created.result.nodes.roundtrip)).toBe(true);
+
+  page.once("dialog", (dialog) => dialog.accept());
+  const firstChooserWait = page.waitForEvent("filechooser");
+  await page.getByRole("button", { name: "Open .draw" }).click();
+  await (await firstChooserWait).setFiles(firstFilePath);
+  await expect.poll(async () => {
+    const reopened = await freshBridgeDocument(page);
+    return reopened.document.elements.some((element: any) => element.id === created.result.nodes.roundtrip);
+  }).toBe(true);
+
+  const editedText = "Edited after opening the downloaded file";
+  const updateResponse = await page.request.post(commandApi, { data: {
+    operation: "update_elements",
+    input: { updates: [{ id: created.result.nodes.roundtrip, patch: { text: editedText } }] },
+  } });
+  expect(updateResponse.ok(), await updateResponse.text()).toBeTruthy();
+  await expect.poll(async () => {
+    const current = await freshBridgeDocument(page);
+    return current.document.elements.some((element: any) => element.originalText === editedText);
+  }).toBe(true);
+
+  const secondDownloadWait = page.waitForEvent("download");
+  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  const secondDownload = await secondDownloadWait;
+  const secondFilePath = await secondDownload.path();
+  const secondFile = JSON.parse((await readFile(secondFilePath)).toString("utf8"));
+  expect(secondFile.document.elements.some((element: any) => element.originalText === editedText)).toBe(true);
+
+  page.once("dialog", (dialog) => dialog.accept());
+  const secondChooserWait = page.waitForEvent("filechooser");
+  await page.getByRole("button", { name: "Open .draw" }).click();
+  await (await secondChooserWait).setFiles(secondFilePath);
+  await expect.poll(async () => {
+    const reopened = await freshBridgeDocument(page);
+    return reopened.document.elements.some((element: any) => element.originalText === editedText);
+  }).toBe(true);
+});
+
 test("malformed .draw files leave the current canvas and local autosave untouched", async ({ page }) => {
   const create = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
