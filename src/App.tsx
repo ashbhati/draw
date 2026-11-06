@@ -84,6 +84,20 @@ export default function App() {
   const fileInput = useRef<HTMLInputElement>(null);
   const onEditorReady = useCallback((api: ExcalidrawImperativeAPI) => { apiRef.current = api; }, []);
 
+  useEffect(() => {
+    const blockExcalidrawDialogs = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLElement && target.closest("input, textarea, select, [contenteditable='true']")) return;
+      const opensHelp = event.key === "?";
+      const opensImageExporter = (event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "e";
+      if (!opensHelp && !opensImageExporter) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
+    window.addEventListener("keydown", blockExcalidrawDialogs, true);
+    return () => window.removeEventListener("keydown", blockExcalidrawDialogs, true);
+  }, []);
+
   const setDocument = useCallback((next: DrawDocument) => {
     docRef.current = next;
     setDoc(next);
