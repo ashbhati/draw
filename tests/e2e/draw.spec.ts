@@ -169,6 +169,42 @@ async function inspectImagePixels(page: Page, image: Buffer, mimeType: "image/pn
   }, { bytes: Array.from(image), type: mimeType });
 }
 
+async function countInkInSceneRegion(
+  page: Page,
+  image: Buffer,
+  mimeType: "image/png" | "image/jpeg",
+  region: { left: number; top: number; right: number; bottom: number },
+  origin: { x: number; y: number },
+  ink: "chalk" | "whiteboard-mark",
+): Promise<number> {
+  return page.evaluate(async ({ bytes, type, bounds, exportOrigin, expectedInk }) => {
+    const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type }));
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Could not inspect exported image pixels.");
+    context.drawImage(bitmap, 0, 0);
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    const left = Math.max(0, Math.floor(bounds.left - exportOrigin.x));
+    const top = Math.max(0, Math.floor(bounds.top - exportOrigin.y));
+    const right = Math.min(canvas.width, Math.ceil(bounds.right - exportOrigin.x));
+    const bottom = Math.min(canvas.height, Math.ceil(bounds.bottom - exportOrigin.y));
+    let count = 0;
+    for (let y = top; y < bottom; y += 1) {
+      for (let x = left; x < right; x += 1) {
+        const offset = (y * canvas.width + x) * 4;
+        const red = pixels[offset];
+        const green = pixels[offset + 1];
+        const blue = pixels[offset + 2];
+        const luminance = red * 0.2126 + green * 0.7152 + blue * 0.0722;
+        if (expectedInk === "chalk" ? luminance > 130 : red < 230 || green < 230 || blue < 230) count += 1;
+      }
+    }
+    return count;
+  }, { bytes: Array.from(image), type: mimeType, bounds: region, exportOrigin: origin, expectedInk: ink });
+}
+
 test.beforeEach(async ({ page }) => {
   await waitForBridge(page);
   await page.locator(".excalidraw canvas").first().waitFor();
@@ -971,6 +1007,34 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
   // Export must still be a shareable image of the whole drawing, rather than a
   // crop containing only the current selection.
   await expect.poll(async () => Object.keys((await freshBridgeDocument(page)).document.appState.selectedElementIds ?? {}).length).toBeGreaterThan(0);
+  const exportScene = await freshBridgeDocument(page);
+  const liveElements = exportScene.document.elements.filter((element: any) => element.isDeleted !== true);
+  const sceneBounds = liveElements.reduce((bounds: { left: number; top: number; right: number; bottom: number }, element: any) => {
+    const left = Math.min(element.x, element.x + element.width, ...(element.points ?? []).map((point: number[]) => element.x + point[0]));
+    const top = Math.min(element.y, element.y + element.height, ...(element.points ?? []).map((point: number[]) => element.y + point[1]));
+    const right = Math.max(element.x, element.x + element.width, ...(element.points ?? []).map((point: number[]) => element.x + point[0]));
+    const bottom = Math.max(element.y, element.y + element.height, ...(element.points ?? []).map((point: number[]) => element.y + point[1]));
+    return { left: Math.min(bounds.left, left), top: Math.min(bounds.top, top), right: Math.max(bounds.right, right), bottom: Math.max(bounds.bottom, bottom) };
+  }, { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity });
+  const exportOrigin = { x: sceneBounds.left - 32, y: sceneBounds.top - 32 };
+  const nodeLabels = ["First node", "Second node"].map((label) => {
+    const element = liveElements.find((candidate: any) => candidate.type === "text" && candidate.text?.includes(label));
+    if (!element) throw new Error(`Could not find editable ${label} text in the exported scene.`);
+    return { label, region: { left: element.x + 1, top: element.y + 1, right: element.x + element.width - 1, bottom: element.y + element.height - 1 } };
+  });
+  const arrow = liveElements.find((element: any) => element.type === "arrow");
+  if (!arrow?.points || arrow.points.length < 2) throw new Error("Could not find the exported arrow path.");
+  const arrowSegments = arrow.points.slice(1).map((point: number[], index: number) => {
+    const from = { x: arrow.x + arrow.points[index][0], y: arrow.y + arrow.points[index][1] };
+    const to = { x: arrow.x + point[0], y: arrow.y + point[1] };
+    return { from, to, length: Math.hypot(to.x - from.x, to.y - from.y) };
+  });
+  const longestArrowSegment = arrowSegments.reduce((longest: any, segment: any) => segment.length > longest.length ? segment : longest);
+  const arrowSample = {
+    x: longestArrowSegment.from.x + (longestArrowSegment.to.x - longestArrowSegment.from.x) * 0.25,
+    y: longestArrowSegment.from.y + (longestArrowSegment.to.y - longestArrowSegment.from.y) * 0.25,
+  };
+  const arrowRegion = { left: arrowSample.x - 9, top: arrowSample.y - 9, right: arrowSample.x + 9, bottom: arrowSample.y + 9 };
 
   for (const [preset, presetButton] of [["blackboard", "Blackboard Canvas"], ["white", "Whiteboard Canvas"]] as const) {
     await page.getByRole("button", { name: presetButton }).click();
@@ -982,18 +1046,26 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
       const image = await readFile(await (await downloadWait).path());
       const sample = await inspectImagePixels(page, image, mime);
       const corner = await sampleImagePatch(page, image, { x: 0.025, y: 0.025 }, mime);
-      expect(sample.width, `${mime} should include both distant diagram nodes`).toBeGreaterThan(700);
-      expect(sample.height).toBeGreaterThan(150);
       expect(sample.greenAssetPixels, `${mime} should preserve the embedded image`).toBeGreaterThan(50);
       if (preset === "blackboard") {
         const luminance = corner[0] * 0.2126 + corner[1] * 0.7152 + corner[2] * 0.0722;
         expect(luminance, `${mime} blackboard corner should stay charcoal`).toBeLessThanOrEqual(35);
         expect(sample.whiteInkPixels, `${mime} should preserve text and chalk strokes`).toBeGreaterThan(100);
+        for (const { label, region } of nodeLabels) {
+          expect(await countInkInSceneRegion(page, image, mime, region, exportOrigin, "chalk"), `${mime} should render ${label} on Blackboard`).toBeGreaterThan(0);
+        }
+        expect(await countInkInSceneRegion(page, image, mime, arrowRegion, exportOrigin, "chalk"), `${mime} should render its arrow on Blackboard`).toBeGreaterThan(0);
       } else {
         const tolerance = mime === "image/png" ? 1 : 12;
         expect(corner.every((channel) => channel >= 255 - tolerance), `${mime} whiteboard corner should stay white: ${corner.join(", ")}`).toBe(true);
         expect(sample.darkInkPixels, `${mime} should preserve text and shape strokes`).toBeGreaterThan(100);
+        for (const { label, region } of nodeLabels) {
+          expect(await countInkInSceneRegion(page, image, mime, region, exportOrigin, "whiteboard-mark"), `${mime} should render ${label} on Whiteboard`).toBeGreaterThan(0);
+        }
+        expect(await countInkInSceneRegion(page, image, mime, arrowRegion, exportOrigin, "whiteboard-mark"), `${mime} should render its arrow on Whiteboard`).toBeGreaterThan(0);
       }
+      expect(Math.abs(sample.width - (sceneBounds.right - sceneBounds.left + 64)), `${mime} width should equal scene bounds plus 32px padding on each side`).toBeLessThanOrEqual(3);
+      expect(Math.abs(sample.height - (sceneBounds.bottom - sceneBounds.top + 64)), `${mime} height should equal scene bounds plus 32px padding on each side`).toBeLessThanOrEqual(3);
     }
   }
 
