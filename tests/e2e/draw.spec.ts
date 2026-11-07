@@ -1963,6 +1963,9 @@ test("revocation rolls back in place and retains the selected human scene and un
 });
 
 test("MCP mutation replay and actor-safe undo/redo survive editor and stdio-client reloads", async ({ page, baseURL }) => {
+  // This flow includes several editor and stdio restarts; allow for a loaded
+  // Chrome worker while keeping each individual MCP request timeout bounded.
+  test.setTimeout(60_000);
   if (!baseURL) throw new Error("Playwright baseURL is required for the MCP integration test.");
   const directory = await mkdtemp(join(tmpdir(), "draw-mcp-durable-e2e-"));
   let mcp = await startStdioMcp(baseURL, directory);
@@ -2068,6 +2071,68 @@ test("MCP mutation replay and actor-safe undo/redo survive editor and stdio-clie
     expect(rejectedUndo.result?.isError).toBe(true);
     const afterRejectedUndo = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
     expect(afterRejectedUndo.elements.filter((element: any) => element.type === "rectangle" && element.isDeleted !== true)).toHaveLength(2);
+  } finally {
+    await mcp.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("damaged MCP history leaves the drawing editable and the next committed mutation cleans corruption", async ({ page, baseURL }) => {
+  if (!baseURL) throw new Error("Playwright baseURL is required for the MCP integration test.");
+  const directory = await mkdtemp(join(tmpdir(), "draw-mcp-corrupt-ledger-"));
+  const mcp = await startStdioMcp(baseURL, directory);
+  try {
+    await waitForBridge(page);
+    const initial = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    await page.evaluate(async ({ documentId }) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open("draw-local");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const transaction = db.transaction(["mcpUndo", "mcpRedo", "mcpOperations", "mcpMeta"], "readwrite");
+      transaction.objectStore("mcpUndo").put({ broken: true }, documentId);
+      transaction.objectStore("mcpRedo").put({ broken: true }, documentId);
+      transaction.objectStore("mcpOperations").put({ broken: true }, JSON.stringify([documentId, "damaged-client", "damaged-key"]));
+      transaction.objectStore("mcpMeta").put(31, "commit-count");
+      await new Promise<void>((resolve, reject) => {
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(transaction.error);
+      });
+      db.close();
+    }, { documentId: initial.documentId });
+    await page.reload();
+    await waitForBridge(page);
+    await expect(page.getByText(/drawing loaded, but stored MCP undo history is damaged/i)).toBeVisible();
+
+    const current = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const created = await mcp.call("create_diagram", {
+      documentId: current.documentId,
+      expectedDocumentRevision: current.documentRevision,
+      idempotencyKey: "recover-after-corrupt-history",
+      nodes: [{ id: "recovery-node", label: "Still editable", x: 100, y: 100 }],
+      edges: [],
+    });
+    expect(created.error).toBeUndefined();
+    expect(created.result?.isError).not.toBe(true);
+    expect(JSON.parse(created.result.content[0].text).nodes["recovery-node"]).toBeTruthy();
+    const state = await page.evaluate(async (documentId) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open("draw-local");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const transaction = db.transaction(["mcpUndo", "mcpRedo", "mcpOperations"], "readonly");
+      const undo = await new Promise((resolve, reject) => { const request = transaction.objectStore("mcpUndo").get(documentId); request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
+      const redo = await new Promise((resolve, reject) => { const request = transaction.objectStore("mcpRedo").get(documentId); request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
+      const broken = await new Promise((resolve, reject) => { const request = transaction.objectStore("mcpOperations").get(JSON.stringify([documentId, "damaged-client", "damaged-key"])); request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
+      db.close();
+      return { undo, redo, broken };
+    }, current.documentId);
+    expect(state.undo).toBeTruthy();
+    expect(state.redo).toBeUndefined();
+    expect(state.broken).toBeUndefined();
   } finally {
     await mcp.close();
     await rm(directory, { recursive: true, force: true });

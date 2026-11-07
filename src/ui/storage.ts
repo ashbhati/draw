@@ -1,13 +1,27 @@
 import { validateDrawDocument, type DrawDocument } from "../document/document";
-import { compactOperationLedger, operationLedgerKey, OPERATION_TOMBSTONE_RETENTION_MS, sameSceneSnapshot, type DurableMcpOperation, type DurableMcpOperationResult, type DurableMcpRedo, type DurableMcpTombstone, type OperationLedgerEntry } from "../integrations/operation-ledger";
+import { compactOperationLedger, operationLedgerKey, OPERATION_SNAPSHOT_RETENTION_MS, OPERATION_TOMBSTONE_RETENTION_MS, sameSceneSnapshot, type DurableMcpOperation, type DurableMcpOperationResult, type DurableMcpRedo, type DurableMcpTombstone, type OperationLedgerEntry } from "../integrations/operation-ledger";
 
 const DATABASE_NAME = "draw-local";
-const DATABASE_VERSION = 3;
+const DATABASE_VERSION = 4;
 const DOCUMENTS_STORE = "documents";
 const MCP_OPERATIONS_STORE = "mcpOperations";
 const MCP_UNDO_STORE = "mcpUndo";
 const MCP_REDO_STORE = "mcpRedo";
+const MCP_META_STORE = "mcpMeta";
 const CURRENT_DOCUMENT_KEY = "current";
+const CURRENT_WRITE_ORDER_KEY = "current-write-order";
+const AUTOSAVE_SESSION_ID = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+let autosaveSequence = 0;
+const MCP_COMPACTION_INTERVAL = 32;
+const MAX_DOCUMENT_SNAPSHOTS = 100;
+
+type AutosaveOrder = { sessionId: string; sequence: number };
+
+function autosaveSceneAndMetadata(document: DrawDocument): string {
+  const { appState: _appState, ...metadata } = document.document;
+  const { viewport: _viewport, ...canvas } = metadata.canvas;
+  return JSON.stringify({ ...document, document: { ...metadata, canvas } });
+}
 
 function openDatabase(): Promise<IDBDatabase> {
   if (typeof indexedDB === "undefined") {
@@ -25,11 +39,16 @@ function openDatabase(): Promise<IDBDatabase> {
         database.createObjectStore(MCP_OPERATIONS_STORE);
       }
       if (!database.objectStoreNames.contains(MCP_UNDO_STORE)) {
-        database.createObjectStore(MCP_UNDO_STORE);
+        const undo = database.createObjectStore(MCP_UNDO_STORE);
+        undo.createIndex("byCompletedAt", "completedAt", { unique: false });
       }
       if (!database.objectStoreNames.contains(MCP_REDO_STORE)) {
-        database.createObjectStore(MCP_REDO_STORE);
+        const redo = database.createObjectStore(MCP_REDO_STORE);
+        redo.createIndex("byCompletedAt", "operation.completedAt", { unique: false });
       }
+      if (database.objectStoreNames.contains(MCP_UNDO_STORE) && !request.transaction!.objectStore(MCP_UNDO_STORE).indexNames.contains("byCompletedAt")) request.transaction!.objectStore(MCP_UNDO_STORE).createIndex("byCompletedAt", "completedAt", { unique: false });
+      if (database.objectStoreNames.contains(MCP_REDO_STORE) && !request.transaction!.objectStore(MCP_REDO_STORE).indexNames.contains("byCompletedAt")) request.transaction!.objectStore(MCP_REDO_STORE).createIndex("byCompletedAt", "operation.completedAt", { unique: false });
+      if (!database.objectStoreNames.contains(MCP_META_STORE)) database.createObjectStore(MCP_META_STORE);
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("Could not open the Draw autosave database."));
@@ -79,15 +98,22 @@ function assertDurableMcpOperation(value: unknown): asserts value is DurableMcpO
 }
 
 /** Save the current editable scene locally; this is separate from image export. */
-export async function saveCurrentDocument(document: DrawDocument, options: { replaceDocument?: boolean } = {}): Promise<void> {
+export async function saveCurrentDocument(document: DrawDocument, options: { replaceDocument?: boolean; writeToken?: AutosaveOrder } = {}): Promise<{ saved: boolean }> {
   validateDrawDocument(document);
+  const writeOrder = options.writeToken ?? { sessionId: AUTOSAVE_SESSION_ID, sequence: ++autosaveSequence };
   const database = await openDatabase();
   try {
     const transaction = database.transaction(DOCUMENTS_STORE, "readwrite");
     const store = transaction.objectStore(DOCUMENTS_STORE);
     const currentRequest = store.get(CURRENT_DOCUMENT_KEY);
-    currentRequest.onsuccess = () => {
+    const orderRequest = store.get(CURRENT_WRITE_ORDER_KEY);
+    let saved = false;
+    let readsRemaining = 2;
+    const maybeSave = () => {
+      readsRemaining -= 1;
+      if (readsRemaining > 0) return;
       const current = currentRequest.result as DrawDocument | undefined;
+      const currentOrder = orderRequest.result as AutosaveOrder | undefined;
       if (current && current.document.id !== document.document.id && !options.replaceDocument) return;
       if (current && (
         (current.document.documentRevision ?? 0) > (document.document.documentRevision ?? 0)
@@ -98,10 +124,17 @@ export async function saveCurrentDocument(document: DrawDocument, options: { rep
         && (current.document.documentRevision ?? 0) === (document.document.documentRevision ?? 0)
         && (current.document.viewRevision ?? 0) === (document.document.viewRevision ?? 0)
         && JSON.stringify(current) !== JSON.stringify(document)
-        && !options.replaceDocument) return;
+        && !options.replaceDocument
+        && (autosaveSceneAndMetadata(current) !== autosaveSceneAndMetadata(document)
+          || currentOrder?.sessionId === writeOrder.sessionId && currentOrder.sequence > writeOrder.sequence)) return;
       store.put(document, CURRENT_DOCUMENT_KEY);
+      store.put(writeOrder, CURRENT_WRITE_ORDER_KEY);
+      saved = true;
     };
+    currentRequest.onsuccess = maybeSave;
+    orderRequest.onsuccess = maybeSave;
     await waitForTransaction(transaction);
+    return { saved };
   } finally {
     database.close();
   }
@@ -148,39 +181,47 @@ export async function commitMcpOperation(
   }
   const database = await openDatabase();
   try {
-    const transaction = database.transaction([DOCUMENTS_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE], "readwrite");
+    const transaction = database.transaction([DOCUMENTS_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE, MCP_META_STORE], "readwrite");
     const documents = transaction.objectStore(DOCUMENTS_STORE);
     const operations = transaction.objectStore(MCP_OPERATIONS_STORE);
     const undo = transaction.objectStore(MCP_UNDO_STORE);
     const redo = transaction.objectStore(MCP_REDO_STORE);
+    const meta = transaction.objectStore(MCP_META_STORE);
     let commitError: Error | null = null;
     const operationKey = operationLedgerKey(operation.documentId, operation.clientIdentity, operation.idempotencyKey);
     const currentRequest = documents.get(CURRENT_DOCUMENT_KEY);
     const existingRequest = operations.get(operationKey);
     const undoRequest = undo.get(operation.documentId);
     const redoRequest = redo.get(operation.documentId);
-    const operationKeysRequest = operations.getAllKeys();
-    const operationEntriesRequest = operations.getAll();
-    let readsRemaining = 6;
+    const metaRequest = meta.get("commit-count");
+    let readsRemaining = 5;
+    let prepared = false;
     const tryCommit = () => {
+      if (prepared) return;
       readsRemaining -= 1;
       if (readsRemaining > 0) return;
+      prepared = true;
+      const count = Number(metaRequest.result ?? 0) + 1;
+      meta.put(count, "commit-count");
+      const finalizeCommit = (ledgerKeys: IDBValidKey[] = [], ledgerValues: unknown[] = []) => {
       try {
       const current = currentRequest.result as DrawDocument | undefined;
       const existingRaw = existingRequest.result as unknown;
       const latestUndoRaw = undoRequest.result as unknown;
       const latestRedoRaw = redoRequest.result as unknown;
       if (existingRaw !== undefined) assertOperationResult(existingRaw);
-      if (latestUndoRaw !== undefined) assertDurableMcpOperation(latestUndoRaw);
       const existing = existingRaw as DurableMcpOperationResult | DurableMcpTombstone | undefined;
-      const latestUndo = latestUndoRaw as DurableMcpOperation | undefined;
-      const latestRedo = latestRedoRaw as DurableMcpRedo | undefined;
-      const ledgerKeys = operationKeysRequest.result as IDBValidKey[];
-      const ledgerValues = operationEntriesRequest.result as OperationLedgerEntry[];
-      if (latestRedoRaw !== undefined) {
-        if (typeof latestRedo !== "object" || !latestRedo || !Number.isSafeInteger(latestRedo.undoneRevision)) throw new Error("The durable MCP redo ledger is malformed; refusing to redo it.");
-        assertDurableMcpOperation(latestRedo.operation);
-      }
+      let latestUndo: DurableMcpOperation | undefined;
+      let latestRedo: DurableMcpRedo | undefined;
+      try { if (latestUndoRaw !== undefined) assertDurableMcpOperation(latestUndoRaw); latestUndo = latestUndoRaw as DurableMcpOperation | undefined; } catch { /* quarantine the unusable pointer on the successful write below */ }
+      try {
+        if (latestRedoRaw !== undefined) {
+          const candidate = latestRedoRaw as DurableMcpRedo;
+          if (typeof candidate !== "object" || !candidate || !Number.isSafeInteger(candidate.undoneRevision)) throw new Error("Malformed redo pointer");
+          assertDurableMcpOperation(candidate.operation);
+          latestRedo = candidate;
+        }
+      } catch { /* quarantine the unusable pointer on the successful write below */ }
       if (existing) {
         commitError = existing.payloadHash !== operation.payloadHash
           ? new Error("IDEMPOTENCY_KEY_REUSE: This key was already used with a different operation payload.")
@@ -221,16 +262,27 @@ export async function commitMcpOperation(
       }
       documents.put(document, CURRENT_DOCUMENT_KEY);
       try {
-        const compacted = compactOperationLedger(ledgerKeys.map((key, index) => {
-          assertOperationResult(ledgerValues[index]);
-          return [key, ledgerValues[index]];
-        }), Date.now());
+        if (ledgerKeys.length) {
+          const validEntries: Array<[IDBValidKey, OperationLedgerEntry]> = [];
+          const validKeys = new Set<string>();
+          ledgerKeys.forEach((key, index) => {
+            try {
+              assertOperationResult(ledgerValues[index]);
+              validEntries.push([key, ledgerValues[index] as OperationLedgerEntry]);
+              validKeys.add(String(key));
+            } catch { operations.delete(key); }
+          });
+          const compacted = compactOperationLedger(validEntries, Date.now());
         const compactedByKey = new Map(compacted.map(([key, value]) => [String(key), value]));
         ledgerKeys.forEach((key, index) => {
+          if (!validKeys.has(String(key))) return;
           const next = compactedByKey.get(String(key));
           if (!next) operations.delete(key);
           else if (next !== ledgerValues[index]) operations.put(next, key);
         });
+        }
+        if (latestUndoRaw !== undefined && !latestUndo) undo.delete(operation.documentId);
+        if (latestRedoRaw !== undefined && !latestRedo) redo.delete(operation.documentId);
         hooks.afterDocumentWrite?.();
         const { beforeDocument: _before, afterDocument: _after, undoEligible: _undoEligible, ...durableResult } = operation;
         operations.put(durableResult, operationKey);
@@ -252,19 +304,52 @@ export async function commitMcpOperation(
         commitError = error instanceof Error ? error : new Error(String(error));
         transaction.abort();
       }
+      };
+      if (count % MCP_COMPACTION_INTERVAL === 0) {
+        const keysRequest = operations.getAllKeys();
+        const entriesRequest = operations.getAll();
+        let compactionReads = 4;
+        const pruneSnapshotStore = (store: IDBObjectStore, completedAt: (value: any) => number) => {
+          const countRequest = store.count();
+          countRequest.onsuccess = () => {
+            let remaining = countRequest.result;
+            const request = store.index("byCompletedAt").openCursor();
+            request.onsuccess = () => {
+              const cursor = request.result;
+              if (!cursor) { finishCompaction(); return; }
+              const expired = completedAt(cursor.value) <= Date.now() - OPERATION_SNAPSHOT_RETENTION_MS;
+              if (expired || remaining > MAX_DOCUMENT_SNAPSHOTS) {
+                cursor.delete();
+                remaining -= 1;
+              }
+              cursor.continue();
+            };
+            request.onerror = () => { commitError = request.error ?? new Error("Could not prune old MCP snapshots."); transaction.abort(); };
+          };
+          countRequest.onerror = () => { commitError = countRequest.error ?? new Error("Could not count MCP snapshots."); transaction.abort(); };
+        };
+        const finishCompaction = () => {
+          compactionReads -= 1;
+          if (compactionReads === 0) finalizeCommit(keysRequest.result as IDBValidKey[], entriesRequest.result as unknown[]);
+        };
+        keysRequest.onsuccess = finishCompaction;
+        entriesRequest.onsuccess = finishCompaction;
+        pruneSnapshotStore(undo, (value) => value.completedAt);
+        pruneSnapshotStore(redo, (value) => value.operation.completedAt);
+        keysRequest.onerror = () => { commitError = keysRequest.error ?? new Error("Could not compact the MCP operation ledger."); transaction.abort(); };
+        entriesRequest.onerror = () => { commitError = entriesRequest.error ?? new Error("Could not compact the MCP operation ledger."); transaction.abort(); };
+      } else finalizeCommit();
     };
     currentRequest.onsuccess = tryCommit;
     existingRequest.onsuccess = tryCommit;
     undoRequest.onsuccess = tryCommit;
     redoRequest.onsuccess = tryCommit;
-    operationKeysRequest.onsuccess = tryCommit;
-    operationEntriesRequest.onsuccess = tryCommit;
+    metaRequest.onsuccess = tryCommit;
     currentRequest.onerror = () => { commitError = currentRequest.error ?? new Error("Could not inspect the current Draw revision."); transaction.abort(); };
     existingRequest.onerror = () => { commitError = existingRequest.error ?? new Error("Could not inspect the MCP operation ledger."); transaction.abort(); };
     undoRequest.onerror = () => { commitError = undoRequest.error ?? new Error("Could not inspect the MCP undo ledger."); transaction.abort(); };
     redoRequest.onerror = () => { commitError = redoRequest.error ?? new Error("Could not inspect the MCP redo ledger."); transaction.abort(); };
-    operationKeysRequest.onerror = () => { commitError = operationKeysRequest.error ?? new Error("Could not inspect MCP ledger retention state."); transaction.abort(); };
-    operationEntriesRequest.onerror = () => { commitError = operationEntriesRequest.error ?? new Error("Could not inspect MCP ledger retention state."); transaction.abort(); };
+    metaRequest.onerror = () => { commitError = metaRequest.error ?? new Error("Could not inspect MCP ledger maintenance state."); transaction.abort(); };
     try {
       await waitForTransaction(transaction);
     } catch (error) {
@@ -390,6 +475,12 @@ export async function loadLatestMcpRedoOperation(documentId: string): Promise<Du
     const redo = value as DurableMcpRedo;
     if (typeof redo !== "object" || !redo || !Number.isSafeInteger(redo.undoneRevision)) throw new Error("The durable MCP redo ledger is malformed; refusing to redo it.");
     assertDurableMcpOperation(redo.operation);
+    if (Date.now() - redo.operation.completedAt >= OPERATION_SNAPSHOT_RETENTION_MS) {
+      const cleanup = database.transaction(MCP_REDO_STORE, "readwrite");
+      cleanup.objectStore(MCP_REDO_STORE).delete(documentId);
+      await waitForTransaction(cleanup);
+      return null;
+    }
     return redo;
   } finally {
     database.close();
@@ -411,6 +502,12 @@ export async function loadLatestMcpUndoOperation(documentId: string): Promise<Du
     if (value === undefined) return null;
     assertDurableMcpOperation(value);
     if ("tombstone" in value) throw new Error("The MCP undo pointer is malformed; refusing to undo an expired operation.");
+    if (Date.now() - value.completedAt >= OPERATION_SNAPSHOT_RETENTION_MS) {
+      const cleanup = database.transaction(MCP_UNDO_STORE, "readwrite");
+      cleanup.objectStore(MCP_UNDO_STORE).delete(documentId);
+      await waitForTransaction(cleanup);
+      return null;
+    }
     return value;
   } finally {
     database.close();

@@ -1,6 +1,7 @@
 import type { DrawDocument } from "../document/document";
 
 export const OPERATION_RESULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+export const OPERATION_SNAPSHOT_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 export const OPERATION_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 export const MAX_OPERATION_TOMBSTONES_PER_CLIENT = 10_000;
 
@@ -71,9 +72,11 @@ export function canUndoMcpOperation(
   operation: DurableMcpOperation | null,
   clientIdentity: string,
   currentDocument: { id: string; documentRevision: number },
+  now = Date.now(),
 ): boolean {
   return Boolean(operation
     && operation.undoEligible
+    && now - operation.completedAt < OPERATION_SNAPSHOT_RETENTION_MS
     && operation.actor === clientIdentity
     && operation.clientIdentity === clientIdentity
     && operation.documentId === currentDocument.id
@@ -84,8 +87,10 @@ export function canRedoMcpOperation(
   redo: DurableMcpRedo | null,
   clientIdentity: string,
   currentDocument: { id: string; documentRevision: number },
+  now = Date.now(),
 ): boolean {
   return Boolean(redo
+    && now - redo.operation.completedAt < OPERATION_SNAPSHOT_RETENTION_MS
     && redo.operation.actor === clientIdentity
     && redo.operation.clientIdentity === clientIdentity
     && redo.operation.documentId === currentDocument.id

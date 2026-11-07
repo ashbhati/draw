@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canUndoMcpOperation, compactOperationLedger, OPERATION_RESULT_RETENTION_MS, OPERATION_TOMBSTONE_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "./operation-ledger";
+import { canUndoMcpOperation, compactOperationLedger, OPERATION_RESULT_RETENTION_MS, OPERATION_SNAPSHOT_RETENTION_MS, OPERATION_TOMBSTONE_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "./operation-ledger";
 
 const operation: DurableMcpOperation = {
   documentId: "doc-1",
@@ -14,13 +14,13 @@ const operation: DurableMcpOperation = {
   beforeDocument: {} as DurableMcpOperation["beforeDocument"],
   afterDocument: {} as DurableMcpOperation["afterDocument"],
   undoEligible: true,
-  completedAt: 100,
+  completedAt: Date.now(),
 };
 
 describe("durable MCP operation ledger", () => {
   it("replays the original result only for the same actor, key, and payload", () => {
-    expect(resolveOperationReplay(operation, { clientIdentity: "client-a", idempotencyKey: "key-1", payloadHash: "hash-a", now: 101 })).toEqual({ kind: "replay", operationId: "op-1", result: operation.result });
-    expect(resolveOperationReplay(operation, { clientIdentity: "client-a", idempotencyKey: "key-1", payloadHash: "hash-b", now: 101 })).toEqual({ kind: "conflict", code: "IDEMPOTENCY_KEY_REUSE" });
+    expect(resolveOperationReplay(operation, { clientIdentity: "client-a", idempotencyKey: "key-1", payloadHash: "hash-a", now: operation.completedAt + 1 })).toEqual({ kind: "replay", operationId: "op-1", result: operation.result });
+    expect(resolveOperationReplay(operation, { clientIdentity: "client-a", idempotencyKey: "key-1", payloadHash: "hash-b", now: operation.completedAt + 1 })).toEqual({ kind: "conflict", code: "IDEMPOTENCY_KEY_REUSE" });
   });
 
   it("does not reveal or replay an operation to a revoked or different identity", () => {
@@ -29,7 +29,7 @@ describe("durable MCP operation ledger", () => {
   });
 
   it("reports an expired result as unknown instead of reapplying it", () => {
-    expect(resolveOperationReplay(operation, { clientIdentity: "client-a", idempotencyKey: "key-1", payloadHash: "hash-a", now: 100 + 7 * 24 * 60 * 60 * 1000 + 1 })).toEqual({ kind: "unknown", reason: "idempotency_expired" });
+    expect(resolveOperationReplay(operation, { clientIdentity: "client-a", idempotencyKey: "key-1", payloadHash: "hash-a", now: operation.completedAt + OPERATION_RESULT_RETENTION_MS + 1 })).toEqual({ kind: "unknown", reason: "idempotency_expired" });
   });
 
   it("compacts expired results to bounded tombstones and later evicts the oldest tombstones", () => {
@@ -53,5 +53,11 @@ describe("durable MCP operation ledger", () => {
     expect(canUndoMcpOperation(operation, "client-b", { id: "doc-1", documentRevision: 5 })).toBe(false);
     expect(canUndoMcpOperation(operation, "client-a", { id: "doc-1", documentRevision: 6 })).toBe(false);
     expect(canUndoMcpOperation(operation, "client-a", { id: "another-doc", documentRevision: 5 })).toBe(false);
+  });
+
+  it("expires undo eligibility when the durable snapshot retention window ends", () => {
+    const oldOperation = { ...operation, completedAt: 100 };
+    expect(canUndoMcpOperation(oldOperation, "client-a", { id: "doc-1", documentRevision: 5 }, 100 + OPERATION_SNAPSHOT_RETENTION_MS - 1)).toBe(true);
+    expect(canUndoMcpOperation(oldOperation, "client-a", { id: "doc-1", documentRevision: 5 }, 100 + OPERATION_SNAPSHOT_RETENTION_MS)).toBe(false);
   });
 });

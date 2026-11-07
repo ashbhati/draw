@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import "fake-indexeddb/auto";
 import { createEmptyDocument } from "../document/document";
 import { commitMcpOperation, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadMcpOperation, restoreMcpCommandSnapshot, saveCurrentDocument } from "./storage";
-import { canRedoMcpOperation, canUndoMcpOperation, OPERATION_RESULT_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "../integrations/operation-ledger";
+import { canRedoMcpOperation, canUndoMcpOperation, OPERATION_RESULT_RETENTION_MS, OPERATION_SNAPSHOT_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "../integrations/operation-ledger";
 
 describe("local Draw autosave", () => {
   beforeEach(async () => {
@@ -158,6 +158,92 @@ describe("local Draw autosave", () => {
     expect(await loadCurrentDocument()).toEqual(newer);
   });
 
+  it("keeps the newer app-state-only autosave when equal-revision writes finish out of order", async () => {
+    const before = createEmptyDocument("Equal revision view");
+    await saveCurrentDocument(before);
+    const older = structuredClone(before);
+    older.document.appState = { ...older.document.appState, scrollX: 10 };
+    older.document.canvas.viewport = { x: 10, y: 0, zoom: 1 };
+    const newer = structuredClone(before);
+    newer.document.appState = { ...newer.document.appState, scrollX: 25 };
+    newer.document.canvas.viewport = { x: 25, y: 0, zoom: 1 };
+    await saveCurrentDocument(newer, { writeToken: { sessionId: "test-session", sequence: 2 } });
+    expect(await saveCurrentDocument(older, { writeToken: { sessionId: "test-session", sequence: 1 } })).toEqual({ saved: false });
+    expect((await loadCurrentDocument())?.document.appState.scrollX).toBe(25);
+  });
+
+  it("loads the document despite corrupt history and clears malformed undo/redo pointers on commit", async () => {
+    const document = createEmptyDocument("Recover from history corruption");
+    await saveCurrentDocument(document);
+    const database = await openDrawDatabaseForTest();
+    const seed = database.transaction(["mcpUndo", "mcpRedo", "mcpOperations", "mcpMeta"], "readwrite");
+    seed.objectStore("mcpUndo").put({ broken: true }, document.document.id);
+    seed.objectStore("mcpRedo").put({ broken: true }, document.document.id);
+    seed.objectStore("mcpOperations").put({ broken: true }, JSON.stringify([document.document.id, "unrelated-client", "broken-key"]));
+    seed.objectStore("mcpMeta").put(31, "commit-count");
+    await transactionDone(seed);
+    database.close();
+
+    expect(await loadCurrentDocument()).toEqual(document);
+    await expect(loadLatestMcpUndoOperation(document.document.id)).rejects.toThrow(/malformed|incomplete/i);
+
+    const after = structuredClone(document);
+    after.document.documentRevision = 1;
+    after.document.elements.push({ id: "recovering-mcp", type: "rectangle", x: 1, y: 2, width: 30, height: 20, strokeColor: "#fff" });
+    await commitMcpOperation(after, {
+      documentId: document.document.id, clientIdentity: "healthy-client", idempotencyKey: "healthy-key", payloadHash: "healthy-hash",
+      operationId: "healthy-operation", actor: "healthy-client", baseRevision: 0, resultingRevision: 1,
+      result: { ok: true }, beforeDocument: document, afterDocument: after, undoEligible: true, completedAt: Date.now(),
+    });
+    expect(await loadCurrentDocument()).toEqual(after);
+    expect(await loadLatestMcpUndoOperation(document.document.id)).toMatchObject({ operationId: "healthy-operation" });
+    expect(await loadMcpOperation(document.document.id, "unrelated-client", "broken-key")).toBeNull();
+  });
+
+  it("expires and deletes undo snapshots after the retention window", async () => {
+    const before = createEmptyDocument("Expired snapshot");
+    const after = structuredClone(before);
+    after.document.documentRevision = 1;
+    const operation: DurableMcpOperation = {
+      documentId: before.document.id, clientIdentity: "paired-client-expired", idempotencyKey: "old-snapshot", payloadHash: "old",
+      operationId: "old-snapshot-operation", actor: "paired-client-expired", baseRevision: 0, resultingRevision: 1,
+      result: { operationId: "old-snapshot-operation" }, beforeDocument: before, afterDocument: after, undoEligible: true,
+      completedAt: Date.now() - OPERATION_SNAPSHOT_RETENTION_MS - 1,
+    };
+    await commitMcpOperation(after, operation);
+    expect(canUndoMcpOperation(operation, operation.clientIdentity, { id: before.document.id, documentRevision: 1 })).toBe(false);
+    expect(await loadLatestMcpUndoOperation(before.document.id)).toBeNull();
+  });
+
+  it("bounds undo snapshots retained for older documents during periodic compaction", async () => {
+    const current = createEmptyDocument("Current retention bound");
+    await saveCurrentDocument(current);
+    const database = await openDrawDatabaseForTest();
+    const seed = database.transaction(["mcpUndo", "mcpMeta"], "readwrite");
+    for (let index = 0; index < 101; index += 1) seed.objectStore("mcpUndo").put({ completedAt: Date.now() - 101 + index }, `old-document-${index}`);
+    seed.objectStore("mcpMeta").put(31, "commit-count");
+    await transactionDone(seed);
+    database.close();
+
+    const after = structuredClone(current);
+    after.document.documentRevision = 1;
+    const mutation: DurableMcpOperation = {
+      documentId: current.document.id, clientIdentity: "retention-client", idempotencyKey: "retention-trigger", payloadHash: "retention",
+      operationId: "retention-trigger", actor: "retention-client", baseRevision: 0, resultingRevision: 1,
+      result: { operationId: "retention-trigger" }, beforeDocument: current, afterDocument: after, undoEligible: false, completedAt: Date.now(),
+    };
+    await commitMcpOperation(after, mutation);
+    const verify = await openDrawDatabaseForTest();
+    const transaction = verify.transaction("mcpUndo", "readonly");
+    const count = await new Promise<number>((resolve, reject) => {
+      const request = transaction.objectStore("mcpUndo").count();
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    expect(count).toBe(100);
+    verify.close();
+  });
+
   it("does not let a delayed autosave from a previous document replace the active document", async () => {
     const active = createEmptyDocument("Active document");
     await saveCurrentDocument(active);
@@ -297,6 +383,11 @@ describe("local Draw autosave", () => {
       baseRevision: 1, resultingRevision: 2, beforeDocument: after, afterDocument: afterSecond, undoEligible: false, completedAt: Date.now(),
       result: { operationId: "second-operation" },
     };
+    const database = await openDrawDatabaseForTest();
+    const maintenance = database.transaction("mcpMeta", "readwrite");
+    maintenance.objectStore("mcpMeta").put(31, "commit-count");
+    await transactionDone(maintenance);
+    database.close();
     await commitMcpOperation(afterSecond, second, { invalidateUndo: true });
 
     const tombstone = await loadMcpOperation(before.document.id, "paired-client-a", "expired-key");
@@ -308,7 +399,7 @@ describe("local Draw autosave", () => {
     const document = createEmptyDocument("Malformed ledger");
     await saveCurrentDocument(document);
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open("draw-local", 3);
+      const request = indexedDB.open("draw-local", 4);
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
@@ -320,3 +411,19 @@ describe("local Draw autosave", () => {
     await expect(loadMcpOperation(document.document.id, "paired-client-a", "bad")).rejects.toThrow(/malformed|incomplete/i);
   });
 });
+
+async function openDrawDatabaseForTest(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open("draw-local", 4);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function transactionDone(transaction: IDBTransaction): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
+  });
+}

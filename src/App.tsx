@@ -221,8 +221,12 @@ export default function App() {
 
   const autosave = useMemo(() => createDebouncedSaver<DrawDocument>(async (value) => {
     if (!writerOwned.current) return;
-    await saveCurrentDocument(value);
-    setStatus("saved");
+    const outcome = await saveCurrentDocument(value);
+    if (outcome.saved) setStatus("saved");
+    else {
+      setStatus("error");
+      setMessage("A newer saved scene or app state was kept; reload the page to continue from it.");
+    }
   }, 350, (error) => {
     setStatus("error");
     setMessage(`Autosave failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -268,10 +272,15 @@ export default function App() {
           if (!live) return;
           setDocument(stored ?? createEmptyDocument());
           if (stored) {
-            const latestUndo = await loadLatestMcpUndoOperation(stored.document.id);
-            if (!live) return;
-            if (latestUndo && canUndoMcpOperation(latestUndo, latestUndo.clientIdentity, { id: stored.document.id, documentRevision: stored.document.documentRevision })) {
-              lastMcpOperation.current = { id: latestUndo.operationId, revision: latestUndo.resultingRevision };
+            try {
+              const latestUndo = await loadLatestMcpUndoOperation(stored.document.id);
+              if (!live) return;
+              if (latestUndo && canUndoMcpOperation(latestUndo, latestUndo.clientIdentity, { id: stored.document.id, documentRevision: stored.document.documentRevision })) {
+                lastMcpOperation.current = { id: latestUndo.operationId, revision: latestUndo.resultingRevision };
+              }
+            } catch (historyError) {
+              if (!live) return;
+              setMessage(`The drawing loaded, but stored MCP undo history is damaged. That undo is unavailable; the next successful edit will clear the damaged history. ${historyError instanceof Error ? historyError.message : String(historyError)}`);
             }
           }
           setStatus(lock.acquired ? "ready" : "error");
