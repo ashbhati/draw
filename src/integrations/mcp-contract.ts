@@ -20,6 +20,8 @@ export type DiagramEdgeInput = {
 
 export type CreateDiagramInput = {
   title?: string;
+  documentId?: string;
+  expectedDocumentRevision?: number;
   nodes: DiagramNodeInput[];
   edges: DiagramEdgeInput[];
 };
@@ -48,7 +50,7 @@ export type DrawPrimitiveInput = {
   roughness?: 0 | 1 | 2;
   endArrowhead?: "arrow" | "bar" | "dot" | "triangle" | null;
 };
-export type CreateElementsInput = { elements: DrawPrimitiveInput[] };
+export type CreateElementsInput = { elements: DrawPrimitiveInput[]; documentId?: string; expectedDocumentRevision?: number };
 
 export type ElementUpdateInput = {
   id: string;
@@ -63,12 +65,44 @@ export type ElementUpdateInput = {
   };
 };
 
-export type UpdateElementsInput = { updates: ElementUpdateInput[] };
+export type UpdateElementsInput = { updates: ElementUpdateInput[]; documentId?: string; expectedDocumentRevision?: number };
+
+export type SceneIdsInput = { documentId: string; expectedDocumentRevision: number; ids: string[] };
+export type ArrangeElementsInput = SceneIdsInput & {
+  action: "bring_to_front" | "send_to_back" | "align" | "distribute";
+  alignment?: "left" | "right" | "top" | "bottom" | "center_x" | "center_y";
+  axis?: "horizontal" | "vertical";
+};
+export type CanvasSettingsInput = {
+  documentId: string; expectedDocumentRevision: number; title?: string; background?: "blackboard" | "white";
+};
+export type ViewportInput = {
+  documentId: string; expectedViewRevision: number;
+  action: "fit_content" | "set"; x?: number; y?: number; zoom?: number;
+};
+export type OpenDocumentInput = { path: string; documentId: string; expectedDocumentRevision: number; confirmationToken?: string };
+export type SaveDocumentInput = { path?: string; documentId: string; expectedDocumentRevision: number };
+export type ExportImageInput = {
+  path?: string; documentId: string; format: "png" | "jpeg"; scope: "canvas" | "selection";
+  background?: "blackboard" | "white" | "transparent";
+};
 
 export type McpCommand =
   | { operation: "create_diagram"; input: CreateDiagramInput }
   | { operation: "create_elements"; input: CreateElementsInput }
-  | { operation: "update_elements"; input: UpdateElementsInput };
+  | { operation: "update_elements"; input: UpdateElementsInput }
+  | { operation: "delete_elements"; input: SceneIdsInput }
+  | { operation: "duplicate_elements"; input: SceneIdsInput & { offsetX?: number; offsetY?: number } }
+  | { operation: "set_selection"; input: { documentId: string; ids: string[] } }
+  | { operation: "group_elements"; input: SceneIdsInput }
+  | { operation: "ungroup_elements"; input: SceneIdsInput }
+  | { operation: "arrange_elements"; input: ArrangeElementsInput }
+  | { operation: "undo_operation" | "redo_operation"; input: { documentId: string; operationId: string; expectedDocumentRevision: number } }
+  | { operation: "set_canvas_settings"; input: CanvasSettingsInput }
+  | { operation: "set_viewport"; input: ViewportInput }
+  | { operation: "open_document"; input: OpenDocumentInput; document?: DrawDocument }
+  | { operation: "save_document"; input: SaveDocumentInput }
+  | { operation: "export_image"; input: ExportImageInput };
 
 export class McpValidationError extends Error {
   constructor(message: string) {
@@ -131,6 +165,15 @@ function optionalColor(value: unknown, label: string): string | undefined {
 function optionalBackgroundColor(value: unknown, label: string): string | undefined {
   if (value === undefined || value === "transparent") return value;
   return optionalColor(value, label);
+}
+
+function optionalRevisionContext(input: Record<string, unknown>, label: string) {
+  if (input.documentId === undefined && input.expectedDocumentRevision === undefined) return {};
+  const documentId = requireString(input.documentId, `${label}.documentId`, 200);
+  if (!Number.isSafeInteger(input.expectedDocumentRevision) || (input.expectedDocumentRevision as number) < 0) {
+    throw new McpValidationError(`${label}.expectedDocumentRevision must be a non-negative integer.`);
+  }
+  return { documentId, expectedDocumentRevision: input.expectedDocumentRevision as number };
 }
 
 function parsePrimitivePoints(value: unknown, label: string, allowPressure: boolean): PrimitivePoint[] {
@@ -272,7 +315,7 @@ function parseCreateElements(value: unknown): CreateElementsInput {
       throw new McpValidationError(`Arrow "${element.id}" endpoints must reference valid shapes from this create_elements call.`);
     }
   }
-  return { elements };
+  return { ...optionalRevisionContext(input, "create_elements"), elements };
 }
 
 function parseCreateDiagram(value: unknown): CreateDiagramInput {
@@ -322,7 +365,7 @@ function parseCreateDiagram(value: unknown): CreateDiagramInput {
     };
   });
 
-  return { ...(title !== undefined ? { title } : {}), nodes, edges };
+  return { ...optionalRevisionContext(input, "create_diagram"), ...(title !== undefined ? { title } : {}), nodes, edges };
 }
 
 const UPDATE_FIELDS = new Set(["text", "x", "y", "width", "height", "strokeColor", "backgroundColor"]);
@@ -366,7 +409,154 @@ function parseUpdateElements(value: unknown): UpdateElementsInput {
     }
     return { id, patch: normalized };
   });
-  return { updates };
+  return { ...optionalRevisionContext(input, "update_elements"), updates };
+}
+
+function parseSceneIds(value: unknown, label: string, allowEmpty = false): SceneIdsInput & { ids: string[] } {
+  const input = requireRecord(value, `${label} input`);
+  const documentId = requireString(input.documentId, `${label}.documentId`, 200);
+  if (!Number.isSafeInteger(input.expectedDocumentRevision) || (input.expectedDocumentRevision as number) < 0) {
+    throw new McpValidationError(`${label}.expectedDocumentRevision must be a non-negative integer.`);
+  }
+  if (!Array.isArray(input.ids) || input.ids.length > MAX_NODES || (!allowEmpty && input.ids.length < 1)) {
+    throw new McpValidationError(`${label}.ids must contain ${allowEmpty ? "no more than" : "between 1 and"} ${MAX_NODES} element IDs.`);
+  }
+  const ids = input.ids.map((id, index) => requireString(id, `${label}.ids[${index}]`, 200));
+  if (new Set(ids).size !== ids.length) throw new McpValidationError(`${label}.ids cannot contain duplicates.`);
+  return { documentId, expectedDocumentRevision: input.expectedDocumentRevision as number, ids };
+}
+
+function parseRelativeFileName(value: unknown, label: string, allowedExtensions: string[]): string {
+  const name = requireString(value, label, 160);
+  if (name === "." || name === ".." || name.includes("/") || name.includes("\\") || name.includes(":") || name.startsWith("~")) {
+    throw new McpValidationError(`${label} must be a plain filename inside the configured Draw folder.`);
+  }
+  const extension = name.slice(name.lastIndexOf(".")).toLowerCase();
+  if (!allowedExtensions.includes(extension)) throw new McpValidationError(`${label} must end in ${allowedExtensions.join(" or ")}.`);
+  return name;
+}
+
+function parseSceneTool(name: string, value: unknown): McpCommand | null {
+  if (["delete_elements", "duplicate_elements", "group_elements", "ungroup_elements"].includes(name)) {
+    const base = parseSceneIds(value, name);
+    if (name === "duplicate_elements") {
+      const input = requireRecord(value, `${name} input`);
+      const offsetX = input.offsetX === undefined ? undefined : requireFiniteCoordinate(input.offsetX, `${name}.offsetX`);
+      const offsetY = input.offsetY === undefined ? undefined : requireFiniteCoordinate(input.offsetY, `${name}.offsetY`);
+      return { operation: name, input: { ...base, ...(offsetX !== undefined ? { offsetX } : {}), ...(offsetY !== undefined ? { offsetY } : {}) } } as McpCommand;
+    }
+    return { operation: name, input: base } as McpCommand;
+  }
+  if (name === "set_selection") {
+    const input = parseSceneIds(value, name, true);
+    return { operation: "set_selection", input: { documentId: input.documentId, ids: input.ids } };
+  }
+  if (name === "arrange_elements") {
+    const base = parseSceneIds(value, name);
+    const input = requireRecord(value, `${name} input`);
+    const action = input.action;
+    if (action !== "bring_to_front" && action !== "send_to_back" && action !== "align" && action !== "distribute") {
+      throw new McpValidationError(`${name}.action must be bring_to_front, send_to_back, align, or distribute.`);
+    }
+    const alignment = input.alignment;
+    const axis = input.axis;
+    if (action === "align" && !["left", "right", "top", "bottom", "center_x", "center_y"].includes(alignment as string)) {
+      throw new McpValidationError(`${name}.alignment must be left, right, top, bottom, center_x, or center_y.`);
+    }
+    if (action === "distribute" && axis !== "horizontal" && axis !== "vertical") {
+      throw new McpValidationError(`${name}.axis must be horizontal or vertical.`);
+    }
+    if (action === "align" && base.ids.length < 2) throw new McpValidationError("align requires at least two elements.");
+    if (action === "distribute" && base.ids.length < 3) throw new McpValidationError("distribute requires at least three elements.");
+    return { operation: "arrange_elements", input: { ...base, action, ...(alignment ? { alignment: alignment as ArrangeElementsInput["alignment"] } : {}), ...(axis ? { axis: axis as ArrangeElementsInput["axis"] } : {}) } };
+  }
+  if (name === "undo_operation" || name === "redo_operation") {
+    const input = requireRecord(value, `${name} input`);
+    if (!Number.isSafeInteger(input.expectedDocumentRevision) || (input.expectedDocumentRevision as number) < 0) {
+      throw new McpValidationError(`${name}.expectedDocumentRevision must be a non-negative integer.`);
+    }
+    return { operation: name, input: {
+      documentId: requireString(input.documentId, `${name}.documentId`, 200),
+      operationId: requireString(input.operationId, `${name}.operationId`, 200),
+      expectedDocumentRevision: input.expectedDocumentRevision as number,
+    } };
+  }
+  if (name === "set_canvas_settings") {
+    const input = requireRecord(value, `${name} input`);
+    if (!Number.isSafeInteger(input.expectedDocumentRevision) || (input.expectedDocumentRevision as number) < 0) {
+      throw new McpValidationError(`${name}.expectedDocumentRevision must be a non-negative integer.`);
+    }
+    if (input.title === undefined && input.background === undefined) throw new McpValidationError("set_canvas_settings requires title or background.");
+    if (input.background !== undefined && input.background !== "blackboard" && input.background !== "white") {
+      throw new McpValidationError("set_canvas_settings.background must be blackboard or white.");
+    }
+    return { operation: name, input: {
+      documentId: requireString(input.documentId, `${name}.documentId`, 200),
+      expectedDocumentRevision: input.expectedDocumentRevision as number,
+      ...(input.title !== undefined ? { title: requireString(input.title, `${name}.title`, 200) } : {}),
+      ...(input.background !== undefined ? { background: input.background as CanvasSettingsInput["background"] } : {}),
+    } };
+  }
+  if (name === "set_viewport") {
+    const input = requireRecord(value, `${name} input`);
+    if (!Number.isSafeInteger(input.expectedViewRevision) || (input.expectedViewRevision as number) < 0) {
+      throw new McpValidationError(`${name}.expectedViewRevision must be a non-negative integer.`);
+    }
+    if (input.action !== "fit_content" && input.action !== "set") throw new McpValidationError("set_viewport.action must be fit_content or set.");
+    if (input.action === "set") {
+      requireFiniteCoordinate(input.x, `${name}.x`);
+      requireFiniteCoordinate(input.y, `${name}.y`);
+      if (typeof input.zoom !== "number" || !Number.isFinite(input.zoom) || input.zoom < 0.1 || input.zoom > 10) {
+        throw new McpValidationError("set_viewport.zoom must be between 0.1 and 10.");
+      }
+    }
+    return { operation: name, input: {
+      documentId: requireString(input.documentId, `${name}.documentId`, 200),
+      expectedViewRevision: input.expectedViewRevision as number,
+      action: input.action,
+      ...(input.action === "set" ? { x: input.x as number, y: input.y as number, zoom: input.zoom as number } : {}),
+    } };
+  }
+  if (name === "open_document") {
+    const input = requireRecord(value, `${name} input`);
+    if (!Number.isSafeInteger(input.expectedDocumentRevision) || (input.expectedDocumentRevision as number) < 0) {
+      throw new McpValidationError(`${name}.expectedDocumentRevision must be a non-negative integer.`);
+    }
+    return { operation: name, input: {
+      path: parseRelativeFileName(input.path, `${name}.path`, [".draw"]),
+      documentId: requireString(input.documentId, `${name}.documentId`, 200),
+      expectedDocumentRevision: input.expectedDocumentRevision as number,
+      ...(input.confirmationToken !== undefined ? { confirmationToken: requireString(input.confirmationToken, `${name}.confirmationToken`, 200) } : {}),
+    } };
+  }
+  if (name === "save_document") {
+    const input = requireRecord(value, `${name} input`);
+    if (!Number.isSafeInteger(input.expectedDocumentRevision) || (input.expectedDocumentRevision as number) < 0) {
+      throw new McpValidationError(`${name}.expectedDocumentRevision must be a non-negative integer.`);
+    }
+    return { operation: name, input: {
+      ...(input.path !== undefined ? { path: parseRelativeFileName(input.path, `${name}.path`, [".draw"]) } : {}),
+      documentId: requireString(input.documentId, `${name}.documentId`, 200),
+      expectedDocumentRevision: input.expectedDocumentRevision as number,
+    } };
+  }
+  if (name === "export_image") {
+    const input = requireRecord(value, `${name} input`);
+    const format = input.format;
+    if (format !== "png" && format !== "jpeg") throw new McpValidationError("export_image.format must be png or jpeg.");
+    if (input.scope !== "canvas" && input.scope !== "selection") throw new McpValidationError("export_image.scope must be canvas or selection.");
+    if (input.background !== undefined && !["blackboard", "white", "transparent"].includes(input.background as string)) {
+      throw new McpValidationError("export_image.background must be blackboard, white, or transparent.");
+    }
+    if (input.path !== undefined) parseRelativeFileName(input.path, `${name}.path`, format === "png" ? [".png"] : [".jpg", ".jpeg"]);
+    return { operation: name, input: {
+      ...(input.path !== undefined ? { path: input.path as string } : {}),
+      documentId: requireString(input.documentId, `${name}.documentId`, 200),
+      format, scope: input.scope,
+      ...(input.background !== undefined ? { background: input.background as ExportImageInput["background"] } : {}),
+    } };
+  }
+  return null;
 }
 
 export function parseMcpToolInput(
@@ -382,6 +572,8 @@ export function parseMcpToolInput(
   if (name === "update_elements") {
     return { operation: "update_elements", input: parseUpdateElements(input) };
   }
+  const sceneTool = parseSceneTool(name, input);
+  if (sceneTool) return sceneTool;
   throw new McpValidationError(`Unknown Draw MCP tool "${name}".`);
 }
 
@@ -390,6 +582,7 @@ export interface CanvasPageOptions {
   offset?: number;
   /** Maximum number of elements in this page. */
   limit?: number;
+  expectedDocumentRevision?: number;
 }
 
 const MAX_CANVAS_PAGE_SIZE = 250;
@@ -410,12 +603,18 @@ export function summarizeCurrentCanvas(document: DrawDocument, options: CanvasPa
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_CANVAS_PAGE_SIZE) {
     throw new McpValidationError(`limit must be an integer between 1 and ${MAX_CANVAS_PAGE_SIZE}.`);
   }
+  if (typeof options !== "number" && options.expectedDocumentRevision !== undefined && options.expectedDocumentRevision !== document.document.documentRevision) {
+    throw new McpValidationError(`Document revision conflict. Expected ${options.expectedDocumentRevision}; current revision is ${document.document.documentRevision}. Read the first page again.`);
+  }
 
   const visible = elements.slice(offset, offset + limit);
   const nextOffset = offset + visible.length;
   const hasMore = nextOffset < elements.length;
   return {
     id: document.document.id,
+    documentId: document.document.id,
+    documentRevision: document.document.documentRevision ?? 0,
+    viewRevision: document.document.viewRevision ?? 0,
     title: document.document.title,
     background: document.document.canvas.background.preset,
     viewport: document.document.canvas.viewport,
@@ -436,6 +635,17 @@ export function summarizeCurrentCanvas(document: DrawDocument, options: CanvasPa
       boundElements: Array.isArray(element.boundElements) ? element.boundElements : undefined,
       strokeColor: element.strokeColor,
       backgroundColor: element.backgroundColor,
+      strokeWidth: element.strokeWidth,
+      strokeStyle: element.strokeStyle,
+      fillStyle: element.fillStyle,
+      roughness: element.roughness,
+      opacity: element.opacity,
+      angle: element.angle,
+      groupIds: Array.isArray(element.groupIds) ? element.groupIds : undefined,
+      startBinding: element.startBinding,
+      endBinding: element.endBinding,
+      points: element.points,
+      ...(element.originalText ? { originalText: element.originalText } : {}),
     })),
     assetsCount: Object.keys(document.document.assets).length,
     truncated: hasMore || offset > 0,
