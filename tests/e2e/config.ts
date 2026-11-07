@@ -5,6 +5,8 @@ import { join } from "node:path";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const E2E_EDITOR_LAUNCH_SEED = randomBytes(6).toString("hex").toUpperCase();
+const E2E_MCP_CLIENT_ID = process.env.DRAW_E2E_MCP_CLIENT_ID ?? "draw-e2e-client";
+const E2E_MCP_CLIENT_SECRET = process.env.DRAW_E2E_MCP_CLIENT_SECRET ?? randomBytes(32).toString("hex");
 
 export async function resolveE2EBaseURL(configuredURL = process.env.DRAW_E2E_BASE_URL): Promise<string> {
   if (!configuredURL) {
@@ -38,6 +40,8 @@ export function createE2EServerConfig(
   baseURL: string,
   reuseExistingServer = process.env.DRAW_E2E_REUSE_SERVER === "1",
 ) {
+  process.env.DRAW_E2E_MCP_CLIENT_ID = E2E_MCP_CLIENT_ID;
+  process.env.DRAW_E2E_MCP_CLIENT_SECRET = E2E_MCP_CLIENT_SECRET;
   const url = new URL(baseURL);
   const port = Number(url.port);
   return {
@@ -45,6 +49,8 @@ export function createE2EServerConfig(
     env: {
       DRAW_E2E_EDITOR_CODE: E2E_EDITOR_LAUNCH_SEED,
       DRAW_E2E_AUTH_STATE_PATH: join(tmpdir(), `draw-e2e-auth-${randomUUID()}.json`),
+      DRAW_E2E_MCP_CLIENT_ID: E2E_MCP_CLIENT_ID,
+      DRAW_E2E_MCP_CLIENT_SECRET: E2E_MCP_CLIENT_SECRET,
     },
     url: `${url.origin}/__draw/api/health`,
     reuseExistingServer,

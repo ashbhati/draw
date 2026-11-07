@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -9,6 +9,7 @@ import { parseDrawFile, validateDrawDocument } from "../document/document";
 import type { McpCommand } from "./mcp-contract";
 import { parseMcpToolInput } from "./mcp-contract";
 import { createEditorAuthManager, createFileEditorAuthStore, type EditorAuthOptions, type EditorAuthManager } from "./editor-auth";
+import { createMcpClientAuthManager, createFileMcpClientAuthStore, type McpClientAuthOptions, type McpClientAuthManager, type McpClientAuthState } from "./mcp-client-auth";
 
 export type DrawDocumentBridgeValue = DrawDocument;
 
@@ -54,6 +55,8 @@ export type DrawMcpBridgeOptions = {
   maxBodyBytes?: number;
   /** Test seam for deterministic launch-code exchange. Production uses an interactive trusted terminal. */
   editorAuthForTests?: Partial<EditorAuthOptions>;
+  /** Deterministic auth seams for isolated bridge tests. */
+  mcpClientAuthForTests?: Partial<McpClientAuthOptions>;
 };
 
 const API_ROOT = "/__draw/api";
@@ -133,9 +136,11 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
   const pending = new Map<string, PendingCommand>();
   const pendingFlushes = new Map<string, PendingFlush>();
   const confirmations = new Map<string, PendingConfirmation>();
+  const pendingMcpPairings = new Map<string, { clientId: string; resolve: (value: { clientIdentity: string; capability: string; expiresAt: number } | null) => void; timer: ReturnType<typeof setTimeout> }>();
   let document: DrawDocumentBridgeValue | null = null;
   let activeClientId: string | null = null;
   let editorAuth: Promise<EditorAuthManager> | null = null;
+  let mcpClientAuth: Promise<McpClientAuthManager> | null = null;
   let commandSequence = 0;
 
   return {
@@ -180,12 +185,49 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
           ? { store: testAuth.store }
           : { store: createFileEditorAuthStore(isE2ETestMode ? e2eAuthStatePath : undefined) }),
       });
+      const mcpAuthTest = options.mcpClientAuthForTests;
+      const e2eMcpClientId = process.env.DRAW_E2E_MCP_CLIENT_ID;
+      const e2eMcpCapability = process.env.DRAW_E2E_MCP_CLIENT_SECRET;
+      let e2eMcpState: McpClientAuthState | null = isE2ETestMode && e2eMcpClientId && /^[a-f\d]{64}$/i.test(e2eMcpCapability ?? "") ? {
+        failedAttempts: 0,
+        lockedUntil: 0,
+        clients: [{
+          clientIdentity: e2eMcpClientId,
+          name: "Isolated Playwright MCP client",
+          fingerprint: createHash("sha256").update(e2eMcpClientId).digest("hex"),
+          secretHash: createHash("sha256").update(e2eMcpCapability!).digest("hex"),
+          createdAt: Date.now(), expiresAt: Date.now() + 60 * 60_000, revokedAt: null,
+        }],
+      } : null;
+      mcpClientAuth = createMcpClientAuthManager({
+        ...(mcpAuthTest?.now ? { now: mcpAuthTest.now } : {}),
+        ...(mcpAuthTest?.generatePairingCode ? { generatePairingCode: mcpAuthTest.generatePairingCode } : {}),
+        ...(mcpAuthTest?.generateIdentity ? { generateIdentity: mcpAuthTest.generateIdentity } : {}),
+        ...(mcpAuthTest?.generateCapability ? { generateCapability: mcpAuthTest.generateCapability } : {}),
+        ...(mcpAuthTest?.generateRequestId ? { generateRequestId: mcpAuthTest.generateRequestId } : {}),
+        ...(mcpAuthTest?.pairingCodeTtlMs ? { pairingCodeTtlMs: mcpAuthTest.pairingCodeTtlMs } : {}),
+        ...(mcpAuthTest?.maxFailedAttempts ? { maxFailedAttempts: mcpAuthTest.maxFailedAttempts } : {}),
+        ...(mcpAuthTest?.store ? { store: mcpAuthTest.store } : e2eMcpState ? {
+          store: { load: async () => structuredClone(e2eMcpState!), save: async (state: McpClientAuthState) => { e2eMcpState = structuredClone(state); } },
+        } : { store: createFileMcpClientAuthStore() }),
+      });
       if (isE2ETestMode && e2eAuthStatePath) {
         server.httpServer?.once("close", () => { void rm(e2eAuthStatePath, { force: true }); });
       }
       const getAuth = () => {
         if (!editorAuth) throw new Error("Editor authentication is unavailable.");
         return editorAuth;
+      };
+      const getMcpAuth = () => {
+        if (!mcpClientAuth) throw new Error("MCP client authentication is unavailable.");
+        return mcpClientAuth;
+      };
+      const authenticatedMcpClient = async (request: IncomingMessage) => {
+        const identity = request.headers["x-draw-client-identity"];
+        const authorization = request.headers.authorization;
+        const capability = typeof authorization === "string" && authorization.startsWith("Bearer ") ? authorization.slice(7) : undefined;
+        const auth = await getMcpAuth();
+        return auth.authenticate(identity, capability) ? { clientIdentity: identity as string } : null;
       };
       const authorizedEditor = async (request: IncomingMessage): Promise<{ auth: EditorAuthManager; clientId: string } | null> => {
         const auth = await getAuth();
@@ -228,7 +270,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
         try {
           const authManager = await getAuth();
           if (request.method === "GET" && path === `${API_ROOT}/health`) {
-            sendJson(response, 200, { ok: true, documentReady: document !== null, clientReady: activeClientId !== null });
+            sendJson(response, 200, { ok: true });
             return;
           }
 
@@ -299,6 +341,88 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
             return;
           }
 
+          if (request.method === "POST" && path === `${API_ROOT}/mcp/pairing-secret`) {
+            const authenticated = await authorizedEditor(request);
+            if (!authenticated || origin !== `http://${host}` || authenticated.clientId !== activeClientId) {
+              sendJson(response, 401, { error: "MCP pairing must be started from the active Draw editor." });
+              return;
+            }
+            const pairingSecret = (await getMcpAuth()).issuePairingCode();
+            if (!pairingSecret) {
+              sendJson(response, 429, { error: "A pairing request is already pending or pairing is temporarily unavailable." });
+              return;
+            }
+            sendJson(response, 200, { pairingSecret, expiresInMs: 5 * 60_000 });
+            return;
+          }
+
+          if (request.method === "POST" && path === `${API_ROOT}/mcp/pair`) {
+            const body = await readJsonBody(request, maxBodyBytes);
+            if (!isRecord(body)) { sendJson(response, 401, { error: "MCP pairing is unavailable. Check Draw and retry." }); return; }
+            let pairingRequest;
+            try {
+              pairingRequest = await (await getMcpAuth()).beginPairing(body.pairingSecret, body.clientName, body.fingerprint);
+            } catch {
+              sendJson(response, 401, { error: "MCP pairing is unavailable. Check Draw and retry." });
+              return;
+            }
+            if (!activeClientId) {
+              sendJson(response, 409, { error: "Open Draw and connect its editor before pairing an MCP client." });
+              return;
+            }
+            const clientId = activeClientId;
+            server.ws.send("draw:mcp-pairing-required", { requestId: pairingRequest.requestId, clientId, name: pairingRequest.name, fingerprint: pairingRequest.fingerprint, expiresAt: pairingRequest.expiresAt });
+            const credential = await new Promise<{ clientIdentity: string; capability: string; expiresAt: number } | null>((resolve) => {
+              const timer = setTimeout(() => {
+                pendingMcpPairings.delete(pairingRequest.requestId);
+                resolve(null);
+              }, Math.max(1, pairingRequest.expiresAt - Date.now()));
+              pendingMcpPairings.set(pairingRequest.requestId, { clientId, resolve, timer });
+            });
+            if (!credential) {
+              sendJson(response, 410, { error: "MCP pairing was denied or expired." });
+              return;
+            }
+            sendJson(response, 200, credential);
+            return;
+          }
+
+          const pairingResponseMatch = path.match(/^\/__draw\/api\/mcp\/pairings\/([^/]+)\/respond$/);
+          if (request.method === "POST" && pairingResponseMatch) {
+            const authenticated = await authorizedEditor(request);
+            const body = await readJsonBody(request, maxBodyBytes);
+            const requestId = decodeURIComponent(pairingResponseMatch[1]);
+            const pendingPairing = pendingMcpPairings.get(requestId);
+            if (!authenticated) {
+              sendJson(response, 401, { error: "Editor authentication is required." });
+              return;
+            }
+            if (!isRecord(body) || body.clientId !== authenticated.clientId || body.clientId !== activeClientId || !pendingPairing || pendingPairing.clientId !== authenticated.clientId || typeof body.approved !== "boolean") {
+              sendJson(response, 409, { error: "This pairing request is stale or unavailable." });
+              return;
+            }
+            clearTimeout(pendingPairing.timer);
+            pendingMcpPairings.delete(requestId);
+            const credential = await (await getMcpAuth()).resolvePairing(requestId, body.approved);
+            pendingPairing.resolve(credential);
+            sendJson(response, 200, { status: credential ? "APPROVED" : "DENIED" });
+            return;
+          }
+
+          if (request.method === "GET" && path === `${API_ROOT}/mcp/clients`) {
+            if (!(await authorizedEditor(request))) { sendJson(response, 401, { error: "Editor authentication is required." }); return; }
+            sendJson(response, 200, { clients: (await getMcpAuth()).list() });
+            return;
+          }
+
+          const revokeMcpMatch = path.match(/^\/__draw\/api\/mcp\/clients\/([^/]+)$/);
+          if (request.method === "DELETE" && revokeMcpMatch) {
+            if (!(await authorizedEditor(request))) { sendJson(response, 401, { error: "Editor authentication is required." }); return; }
+            const revoked = await (await getMcpAuth()).revoke(decodeURIComponent(revokeMcpMatch[1]));
+            sendJson(response, revoked ? 200 : 404, { revoked });
+            return;
+          }
+
           if (request.method === "PUT" && path === `${API_ROOT}/client`) {
             sendJson(response, 401, { error: "Editor registration requires the authenticated bootstrap flow." });
             return;
@@ -325,6 +449,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
           }
 
           if (request.method === "POST" && path === `${API_ROOT}/confirmations`) {
+            if (!(await authenticatedMcpClient(request))) { sendJson(response, 401, { error: "MCP authentication is required." }); return; }
             const body = await readJsonBody(request, maxBodyBytes);
             if (!isRecord(body) || body.action !== "open_document" || typeof body.documentId !== "string" || typeof body.expectedDocumentRevision !== "number" || typeof body.filename !== "string" || typeof body.fingerprint !== "string" || !/^[a-f\d]{64}$/i.test(body.fingerprint)) {
               sendJson(response, 400, { error: "Confirmation request is invalid." });
@@ -380,6 +505,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
 
           const confirmationConsumeMatch = path.match(/^\/__draw\/api\/confirmations\/([^/]+)\/consume$/);
           if (request.method === "POST" && confirmationConsumeMatch) {
+            if (!(await authenticatedMcpClient(request))) { sendJson(response, 401, { error: "MCP authentication is required." }); return; }
             const body = await readJsonBody(request, maxBodyBytes);
             const token = decodeURIComponent(confirmationConsumeMatch[1]);
             const confirmation = confirmations.get(token);
@@ -403,6 +529,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
           }
 
           if (request.method === "GET" && path === `${API_ROOT}/document`) {
+            if (!(await authenticatedMcpClient(request))) { sendJson(response, 401, { error: "MCP authentication is required." }); return; }
             if (!document) {
               sendJson(response, 404, { error: "No Draw document is open in the app." });
               return;
@@ -472,6 +599,8 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
           }
 
           if (request.method === "POST" && path === `${API_ROOT}/commands`) {
+            const authenticated = await authenticatedMcpClient(request);
+            if (!authenticated) { sendJson(response, 401, { error: "MCP authentication is required." }); return; }
             const body = await readJsonBody(request, maxBodyBytes);
             const command = asMcpCommand(body);
             if (!document) {
