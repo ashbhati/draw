@@ -1,13 +1,10 @@
 import { createServer } from "node:net";
+import { randomBytes, randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const LOOPBACK_HOST = "127.0.0.1";
-export const E2E_EDITOR_LAUNCH_CODE = "D4A7C091B52E";
-let e2eLaunchCodeSequence = 0n;
-export function nextE2EEditorLaunchCode(): string {
-  const code = (BigInt(`0x${E2E_EDITOR_LAUNCH_CODE}`) + e2eLaunchCodeSequence).toString(16).toUpperCase().slice(-12).padStart(12, "0");
-  e2eLaunchCodeSequence += 1n;
-  return code;
-}
+const E2E_EDITOR_LAUNCH_SEED = randomBytes(6).toString("hex").toUpperCase();
 
 export async function resolveE2EBaseURL(configuredURL = process.env.DRAW_E2E_BASE_URL): Promise<string> {
   if (!configuredURL) {
@@ -45,7 +42,10 @@ export function createE2EServerConfig(
   const port = Number(url.port);
   return {
     command: `npm run dev -- --mode e2e --host ${LOOPBACK_HOST} --port ${port} --strictPort`,
-    env: { DRAW_E2E_EDITOR_CODE: E2E_EDITOR_LAUNCH_CODE },
+    env: {
+      DRAW_E2E_EDITOR_CODE: E2E_EDITOR_LAUNCH_SEED,
+      DRAW_E2E_AUTH_STATE_PATH: join(tmpdir(), `draw-e2e-auth-${randomUUID()}.json`),
+    },
     url: `${url.origin}/__draw/api/health`,
     reuseExistingServer,
     timeout: 30_000,

@@ -423,6 +423,25 @@ export default function App() {
     }
   }, [bridgeSync, canWrite, launchCodeInput]);
 
+  const requestFreshEditorCode = useCallback(async () => {
+    setConnectError("");
+    try {
+      const response = await fetch("/__draw/api/editor/reissue-code", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({}),
+      });
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}));
+        throw new Error(typeof result.error === "string" ? result.error : "Could not request a fresh code.");
+      }
+      setConnectError("A fresh code was printed in the trusted terminal. Enter it here.");
+    } catch (error) {
+      setConnectError(error instanceof Error ? error.message : "Could not request a fresh code.");
+    }
+  }, []);
+
   const openFile = async (file?: File) => {
     if (!file) return;
     if (docRef.current && shouldRequireOpenConfirmation(docRef.current) &&
@@ -902,11 +921,12 @@ export default function App() {
     {connectOpen && <div className="draw-confirmation-backdrop" role="presentation">
       <section className="draw-confirmation" role="dialog" aria-modal="true" aria-labelledby="draw-connect-title">
         <h2 id="draw-connect-title">Connect to MCP</h2>
-        <p>Enter the one-time launch code printed in the trusted terminal running Draw. The code expires after one minute.</p>
+        <p>Enter the one-time code printed in the trusted terminal running Draw. This must be the Draw tab you intend to connect; the code expires after one minute.</p>
         <label htmlFor="draw-launch-code">Launch code</label>
         <input id="draw-launch-code" autoComplete="off" spellCheck={false} value={launchCodeInput} onChange={(event) => setLaunchCodeInput(event.target.value.toUpperCase())} onKeyDown={(event) => { if (event.key === "Enter") void connectEditorToMcp(); }} />
         {connectError && <p role="alert">{connectError}</p>}
         <div className="draw-confirmation-actions">
+          <button className="button button-quiet" onClick={() => void requestFreshEditorCode()}>Request fresh code</button>
           <button className="button button-quiet" onClick={() => setConnectOpen(false)}>Cancel</button>
           <button className="button button-primary" disabled={launchCodeInput.trim().length < 12} onClick={() => void connectEditorToMcp()}>Connect</button>
         </div>

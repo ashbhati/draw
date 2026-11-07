@@ -13,6 +13,10 @@ npm run dev
 
 Open <http://127.0.0.1:5173>. The current canvas autosaves in this browser on this device. Use **Save .draw** to download a portable editable document, and **Open** to restore one later. The Blackboard and Whiteboard presets are saved in the document. Image exports are for sharing and cannot be edited as Draw objects.
 
+For MCP use, start `npm run dev` yourself in a trusted terminal that you control. Do not start the Vite server from an agent or automation PTY. Keep that terminal open: it prints a random one-use code, valid for 60 seconds. Manually type the code into Draw's **Connect MCP** dialog. The code is never returned over HTTP or included in a URL. After a browser reload, connect again with the newly printed code; if the code expired or was missed, use **Request fresh code** in the dialog and then type the code shown in the terminal.
+
+This protects editor actions from an unauthenticated loopback caller that only knows a `clientId`. The MCP-facing loopback API is still unauthenticated, and this is not a boundary against another process running as your OS user: such a process may be able to read terminal output or interact with your browser. Run MCP only with local processes you trust.
+
 ## Verify
 
 ```sh
@@ -26,7 +30,7 @@ The e2e suite runs the app locally in Chromium and selects an available loopback
 
 ## Connect an MCP client
 
-The local MCP server communicates with the active development canvas. Start the app with `npm run dev`, then configure your MCP client to launch `npm run mcp` from this project directory. For clients using JSON MCP configuration, the server entry is:
+The local MCP server communicates with the active development canvas. First start Draw yourself from a trusted terminal and manually connect the tab using the printed code. Then configure your MCP client to launch `npm run mcp` from this project directory. For clients using JSON MCP configuration, the server entry is:
 
 ```json
 {
@@ -54,7 +58,7 @@ Available tools:
 - `set_selection`: select or clear element IDs in the editor; selection is temporary and is not saved in `.draw`.
 - `undo_operation` and `redo_operation`: act on the latest eligible MCP operation by its returned `operationId`. Draw rejects an undo after any later human scene change; eligibility is intentionally not retained across page reloads or MCP restarts.
 - `set_canvas_settings` and `set_viewport`: set the document title/background or pan, zoom, and fit-to-content. Scene and view revisions are tracked separately.
-- `save_document`, `open_document`, and `export_image`: save editable `.draw` documents, reopen them, and return PNG/JPEG image artifacts. Direct file operations require `DRAW_MCP_DOCUMENT_DIR`; MCP paths are basenames within that folder. Existing output files fail with `PATH_EXISTS` and are never overwritten; save-as to a new filename. Safe overwrite is tracked in [issue #39](https://github.com/ashbhati/draw/issues/39). Replacing a populated canvas returns `NEEDS_CONFIRMATION` with a one-use token; approve or deny it in Draw, then retry `open_document` with the token. **This confirmation is a UX guard, not an authentication boundary against other local callers:** the development bridge trusts a caller-supplied `clientId`. Authenticated bridge sessions are tracked in [issue #41](https://github.com/ashbhati/draw/issues/41). Do not treat the local bridge as trusted against other processes running as your user.
+- `save_document`, `open_document`, and `export_image`: save editable `.draw` documents, reopen them, and return PNG/JPEG image artifacts. Direct file operations require `DRAW_MCP_DOCUMENT_DIR`; MCP paths are basenames within that folder. Existing output files fail with `PATH_EXISTS` and are never overwritten; save-as to a new filename. Safe overwrite is tracked in [issue #39](https://github.com/ashbhati/draw/issues/39). Replacing a populated canvas returns `NEEDS_CONFIRMATION` with a one-use token; approve or deny it in Draw, then retry `open_document` with the token. Editor-side sync, acknowledgements and approval require the active tab's secret; the MCP-facing loopback API itself remains unauthenticated as described above.
 
 Every scene mutation should include `documentId` and the latest `expectedDocumentRevision` from `get_current_canvas`. Viewport commands use `expectedViewRevision`. This detects stale agent context before changing the active document.
 

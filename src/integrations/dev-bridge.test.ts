@@ -1,4 +1,7 @@
 import { Readable } from "node:stream";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ViteDevServer } from "vite";
 import { describe, expect, it, vi } from "vitest";
 import { createEmptyDocument } from "../document/document";
@@ -7,18 +10,20 @@ import { createDrawMcpPlugin, type DrawMcpBridgeOptions } from "./dev-bridge";
 type CapturedResponse = { status: number; body: any };
 type Middleware = (request: any, response: any, next: (error?: unknown) => void) => void;
 
-function createBridgeHarness(options: DrawMcpBridgeOptions = {}) {
+function createBridgeHarness(options: DrawMcpBridgeOptions = {}, config: { mode?: string; host?: string; isProduction?: boolean; useFileStore?: boolean } = {}) {
   let middleware: Middleware | undefined;
   const events: Array<{ event: string; data: any }> = [];
   let launchCode = "";
   const sessions = new Map<string, { clientId: string; editorSecret: string }>();
   let authState = { failedAttempts: 0, lockedUntil: 0 };
-  const bridgePlugin = createDrawMcpPlugin({ ...options, editorAuthForTests: {
-    displayLaunchCode: (code) => { launchCode = code; return true; },
-    store: { load: async () => ({ ...authState }), save: async (state) => { authState = { ...state }; } },
-  } });
+  const injectedAuth = config.useFileStore ? {} : { editorAuthForTests: {
+    displayLaunchCode: (code: string) => { launchCode = code; return true; },
+    store: { load: async () => ({ ...authState }), save: async (state: { failedAttempts: number; lockedUntil: number }) => { authState = { ...state }; } },
+  } };
+  const bridgePlugin = createDrawMcpPlugin({ ...options, ...injectedAuth });
   const server = {
-    config: { server: { port: 5173 } },
+    config: { mode: config.mode ?? "development", isProduction: config.isProduction ?? false, server: { port: 5173, host: config.host ?? "127.0.0.1" }, logger: { warn: vi.fn() } },
+    httpServer: { once: vi.fn() },
     middlewares: { use: (fn: Middleware) => (middleware = fn) },
     ws: { send: (event: string, data: unknown) => events.push({ event, data }) },
   } as unknown as ViteDevServer;
@@ -65,7 +70,8 @@ function createBridgeHarness(options: DrawMcpBridgeOptions = {}) {
     if (!session) throw new Error(`No authenticated session for ${clientId}`);
     return request(method, path, body, "127.0.0.1", { "x-draw-editor-secret": session.editorSecret });
   };
-  return { request, editorRequest, registerClient, events };
+  const reissueCode = () => request("POST", "/__draw/api/editor/reissue-code", {}, "127.0.0.1", { origin: "http://127.0.0.1:5173" });
+  return { request, editorRequest, registerClient, reissueCode, events, getLaunchCode: () => launchCode, getSession: (clientId: string) => sessions.get(clientId) };
 }
 
 describe("Draw MCP Vite bridge", () => {
@@ -93,6 +99,55 @@ describe("Draw MCP Vite bridge", () => {
 
     expect(response.status).toBe(403);
     expect(response.body.error).toMatch(/configured loopback host/i);
+
+    const active = await bridge.registerClient("host-check-tab");
+    expect(active.response.status).toBe(200);
+    const document = createEmptyDocument("Host check");
+    await bridge.editorRequest("host-check-tab", "PUT", "/__draw/api/document", { clientId: "host-check-tab", document });
+    const forgedOriginWithSecret = await bridge.request("PUT", "/__draw/api/document", { clientId: "host-check-tab", document }, "127.0.0.1", {
+      host: "127.0.0.1:5173", origin: "http://attacker.example", "x-draw-editor-secret": active.session!.editorSecret,
+    });
+    expect(forgedOriginWithSecret.status).toBe(403);
+    const forgedHostWithSecret = await bridge.request("PUT", "/__draw/api/document", { clientId: "host-check-tab", document }, "127.0.0.1", {
+      host: "evil.example:5173", origin: "http://evil.example:5173", "x-draw-editor-secret": active.session!.editorSecret,
+    });
+    expect(forgedHostWithSecret.status).toBe(403);
+  });
+
+  it("enables the isolated E2E provider only on loopback in test mode and writes lockout state only under temp", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "draw-e2e-auth-isolation-"));
+    const statePath = join(directory, "e2e-auth-state.json");
+    const fallbackConfig = join(directory, "fallback-config");
+    vi.stubEnv("DRAW_E2E_EDITOR_CODE", "ABCDEF123456");
+    vi.stubEnv("DRAW_E2E_AUTH_STATE_PATH", statePath);
+    vi.stubEnv("XDG_CONFIG_HOME", fallbackConfig);
+    try {
+      for (const config of [
+        { mode: "development", host: "127.0.0.1" },
+        { mode: "e2e", host: "0.0.0.0" },
+        { mode: "e2e", host: "127.0.0.1", isProduction: true },
+      ]) {
+        const disabled = createBridgeHarness({}, { ...config, useFileStore: true });
+        const response = await disabled.request("POST", "/__draw/api/editor/bootstrap", { clientId: "tab", launchCode: "ABCDEF123456" });
+        expect(response.status).toBe(503);
+        expect(response.body.status).toBe("UNAVAILABLE");
+        expect((await disabled.request("GET", "/__draw/api/e2e/active-launch-code", undefined, "127.0.0.1", { origin: "http://127.0.0.1:5173" })).status).toBe(404);
+      }
+
+      const e2e = createBridgeHarness({}, { mode: "e2e", host: "127.0.0.1", useFileStore: true });
+      expect((await e2e.request("GET", "/__draw/api/e2e/active-launch-code", undefined, "127.0.0.1", { origin: "http://127.0.0.1:5173" })).status).toBe(200);
+      expect((await e2e.request("GET", "/__draw/api/e2e/active-launch-code")).status).toBe(403);
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const response = await e2e.request("POST", "/__draw/api/editor/bootstrap", { clientId: "attacker", launchCode: "WRONG0000000" });
+        expect(response.status).toBe(attempt === 4 ? 429 : 401);
+      }
+      expect(JSON.parse(await readFile(statePath, "utf8"))).toMatchObject({ failedAttempts: 5 });
+      await expect(access(join(fallbackConfig, "draw", "editor-auth-state.json"))).rejects.toThrow();
+      expect(e2e.events).toHaveLength(0);
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("delivers a command to the active canvas and stores its acknowledged scene", async () => {
@@ -161,6 +216,7 @@ describe("Draw MCP Vite bridge", () => {
 
     expect((await bridge.request("PUT", "/__draw/api/client", { clientId: "attacker" })).status).toBe(401);
     expect((await bridge.request("PUT", "/__draw/api/document", { clientId: "tab-1", document: createEmptyDocument("Spoofed") })).status).toBe(401);
+    expect((await bridge.request("PUT", "/__draw/api/document", { clientId: "tab-1", document: createEmptyDocument("Wrong token") }, "127.0.0.1", { "x-draw-editor-secret": "b".repeat(64) })).status).toBe(401);
 
     const commandPromise = bridge.request("POST", "/__draw/api/commands", { operation: "create_diagram", input: { nodes: [{ id: "node", label: "Node", x: 0, y: 0 }], edges: [] } });
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -169,6 +225,12 @@ describe("Draw MCP Vite bridge", () => {
     const ackBody = { id: command.id, clientId: "tab-1", document: active, result: { background: "white" } };
     const spoofedAck = await bridge.request("POST", `/__draw/api/commands/${command.id}/ack`, ackBody);
     expect(spoofedAck.status).toBe(401);
+    const wrongSecretAck = await bridge.request("POST", `/__draw/api/commands/${command.id}/ack`, ackBody, "127.0.0.1", { "x-draw-editor-secret": "c".repeat(64) });
+    expect(wrongSecretAck.status).toBe(401);
+    const forgedHostAck = await bridge.request("POST", `/__draw/api/commands/${command.id}/ack`, ackBody, "127.0.0.1", {
+      host: "evil.example:5173", origin: "http://evil.example:5173", "x-draw-editor-secret": bridge.getSession("tab-1")?.editorSecret ?? "",
+    });
+    expect(forgedHostAck.status).toBe(403);
     const validAck = await bridge.editorRequest("tab-1", "POST", `/__draw/api/commands/${command.id}/ack`, ackBody);
     expect(validAck.status).toBe(200);
     expect((await commandPromise).status).toBe(200);
@@ -178,6 +240,7 @@ describe("Draw MCP Vite bridge", () => {
     const flush = bridge.events.find(({ event }) => event === "draw:flush-document")?.data;
     const flushBody = { id: flush.id, clientId: "tab-1", document: active };
     expect((await bridge.request("POST", `/__draw/api/document/flush/${flush.id}`, flushBody)).status).toBe(401);
+    expect((await bridge.request("POST", `/__draw/api/document/flush/${flush.id}`, flushBody, "127.0.0.1", { "x-draw-editor-secret": "d".repeat(64) })).status).toBe(401);
     expect((await bridge.editorRequest("tab-1", "POST", `/__draw/api/document/flush/${flush.id}`, flushBody)).status).toBe(200);
     expect((await flushPromise).status).toBe(200);
 
@@ -188,6 +251,61 @@ describe("Draw MCP Vite bridge", () => {
     const replacement = createEmptyDocument("Replacement tab");
     expect((await bridge.editorRequest("tab-2", "PUT", "/__draw/api/document", { clientId: "tab-2", document: replacement })).status).toBe(200);
     expect((await bridge.request("GET", "/__draw/api/document")).body.document.title).toBe("Replacement tab");
+  });
+
+  it("keeps an authenticated editor and its pending work alive through five junk bootstrap requests", async () => {
+    const bridge = createBridgeHarness({ commandTimeoutMs: 1_000, flushTimeoutMs: 1_000 });
+    const document = createEmptyDocument("Live authenticated tab");
+    const registered = await bridge.registerClient("live-tab");
+    expect(registered.response.status).toBe(200);
+    await bridge.editorRequest("live-tab", "PUT", "/__draw/api/document", { clientId: "live-tab", document });
+
+    const pendingCommand = bridge.request("POST", "/__draw/api/commands", {
+      operation: "create_diagram", input: { nodes: [{ id: "pending", label: "Pending", x: 0, y: 0 }], edges: [] },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const command = bridge.events.find(({ event }) => event === "draw:mcp-command")?.data;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const response = await bridge.request("POST", "/__draw/api/editor/bootstrap", { clientId: "attacker", launchCode: "000000000000" });
+      expect(response.status).toBe(attempt === 4 ? 429 : 401);
+    }
+    expect(bridge.events.some(({ event, data }) => event === "draw:editor-lease-revoked" && data.clientId === "live-tab")).toBe(false);
+    expect((await bridge.editorRequest("live-tab", "PUT", "/__draw/api/document", { clientId: "live-tab", document })).status).toBe(200);
+    expect((await bridge.editorRequest("live-tab", "POST", `/__draw/api/commands/${command.id}/ack`, {
+      id: command.id, clientId: "live-tab", document, result: { survived: true },
+    })).status).toBe(200);
+    expect((await pendingCommand).body.result).toEqual({ survived: true });
+
+    const confirmation = await bridge.request("POST", "/__draw/api/confirmations", {
+      action: "open_document", documentId: document.document.id, expectedDocumentRevision: 0,
+      filename: "preserve.draw", fingerprint: "e".repeat(64),
+    });
+    const token = confirmation.body.confirmationToken;
+    expect((await bridge.request("POST", `/__draw/api/confirmations/${token}/respond`, { clientId: "live-tab", approved: true })).status).toBe(401);
+    expect((await bridge.request("POST", `/__draw/api/confirmations/${token}/respond`, { clientId: "live-tab", approved: true }, "127.0.0.1", { "x-draw-editor-secret": "f".repeat(64) })).status).toBe(401);
+    expect((await bridge.editorRequest("live-tab", "POST", `/__draw/api/confirmations/${token}/respond`, { clientId: "live-tab", approved: true })).body.status).toBe("APPROVED");
+  });
+
+  it("prints a fresh code only to the trusted terminal without returning it over HTTP", async () => {
+    const bridge = createBridgeHarness();
+    const initial = await bridge.registerClient("tab-a");
+    expect(initial.response.status).toBe(200);
+    const activeSecret = initial.session!.editorSecret;
+    const oldCode = bridge.getLaunchCode();
+    expect((await bridge.request("POST", "/__draw/api/editor/reissue-code", {})).status).toBe(403);
+
+    const requested = await bridge.reissueCode();
+    expect(requested.status).toBe(200);
+    expect(requested.body).toEqual({ status: "ISSUED" });
+    const freshCode = bridge.getLaunchCode();
+    expect(freshCode).not.toBe(oldCode);
+    expect(JSON.stringify(requested.body)).not.toContain(freshCode);
+    expect((await bridge.editorRequest("tab-a", "PUT", "/__draw/api/document", { clientId: "tab-a", document: createEmptyDocument("Still active") })).status).toBe(200);
+
+    const takeover = await bridge.registerClient("tab-b");
+    expect(takeover.response.status).toBe(200);
+    expect((await bridge.editorRequest("tab-a", "PUT", "/__draw/api/document", { clientId: "tab-a", document: createEmptyDocument("Revoked") })).status).toBe(401);
+    expect(takeover.session?.editorSecret).not.toBe(activeSecret);
   });
 
   it("binds dirty-open confirmation tokens to the active document revision and consumes them once", async () => {

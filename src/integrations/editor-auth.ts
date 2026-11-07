@@ -16,10 +16,11 @@ export type EditorAuthStore = {
 
 export type EditorAuthResult =
   | { status: "AUTHENTICATED"; clientId: string; editorSecret: string }
-  | { status: "INVALID" | "LOCKED" | "UNAVAILABLE" };
+  | { status: "INVALID" | "EXPIRED" | "LOCKED" | "UNAVAILABLE" };
 
 export type EditorAuthManager = {
   exchangeLaunchCode: (code: unknown, clientId: string) => Promise<EditorAuthResult>;
+  requestFreshLaunchCode: () => Promise<"ISSUED" | "LOCKED" | "UNAVAILABLE">;
   authorize: (clientId: unknown, editorSecret: unknown) => boolean;
   getActiveClientId: () => string | null;
   revokeEditorSession: () => void;
@@ -103,6 +104,20 @@ export async function createEditorAuthManager(options: EditorAuthOptions): Promi
       exchangeQueue = next.then(() => undefined, () => undefined);
       return next;
     },
+    requestFreshLaunchCode() {
+      const next = exchangeQueue.then(async () => {
+        const currentTime = now();
+        if (persisted.lockedUntil !== 0 && currentTime >= persisted.lockedUntil) {
+          persisted = { failedAttempts: 0, lockedUntil: 0 };
+          await store.save(persisted);
+        }
+        if (now() < persisted.lockedUntil) return "LOCKED" as const;
+        issueLaunchCode();
+        return launchCodeAvailable ? "ISSUED" as const : "UNAVAILABLE" as const;
+      });
+      exchangeQueue = next.then(() => undefined, () => undefined);
+      return next;
+    },
     authorize(clientId, editorSecret) {
       return Boolean(active && clientId === active.clientId && equalSecret(editorSecret, active.secret));
     },
@@ -112,18 +127,21 @@ export async function createEditorAuthManager(options: EditorAuthOptions): Promi
 
   async function exchangeLaunchCodeSerialized(code: unknown, clientId: string): Promise<EditorAuthResult> {
       const currentTime = now();
-      if (currentTime < persisted.lockedUntil) return { status: "LOCKED" };
-      if (!launchCodeAvailable) {
-        issueLaunchCode();
-        if (!launchCodeAvailable) return { status: "UNAVAILABLE" };
-      }
       if (persisted.lockedUntil !== 0 && currentTime >= persisted.lockedUntil) {
         persisted = { failedAttempts: 0, lockedUntil: 0 };
         await store.save(persisted);
-        issueLaunchCode();
       }
-      const codeWasValidAtRequestTime = Boolean(launchCode && currentTime < launchCodeExpiresAt && equalSecret(code, launchCode));
-      if (launchCode && currentTime >= launchCodeExpiresAt) issueLaunchCode();
+      if (currentTime < persisted.lockedUntil) return { status: "LOCKED" };
+      if (launchCode && currentTime >= launchCodeExpiresAt) {
+        launchCode = null;
+        launchCodeExpiresAt = 0;
+        launchCodeAvailable = false;
+        return { status: "EXPIRED" };
+      }
+      if (!launchCodeAvailable) {
+        return { status: "UNAVAILABLE" };
+      }
+      const codeWasValidAtRequestTime = Boolean(launchCode && equalSecret(code, launchCode));
       if (!codeWasValidAtRequestTime || typeof clientId !== "string" || clientId.length < 1 || clientId.length > 200) {
         persisted = { ...persisted, failedAttempts: persisted.failedAttempts + 1 };
         if (persisted.failedAttempts >= MAX_FAILED_ATTEMPTS) {
@@ -131,7 +149,6 @@ export async function createEditorAuthManager(options: EditorAuthOptions): Promi
           launchCode = null;
           launchCodeExpiresAt = 0;
           launchCodeAvailable = false;
-          active = null;
           await store.save(persisted);
           return { status: "LOCKED" };
         }

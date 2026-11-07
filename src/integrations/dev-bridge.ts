@@ -1,5 +1,8 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
+import { isAbsolute, relative, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import type { Plugin, ViteDevServer } from "vite";
 import type { DrawDocument } from "../document/document";
 import { parseDrawFile, validateDrawDocument } from "../document/document";
@@ -67,6 +70,15 @@ function isLoopbackAddress(address: string | undefined): boolean {
   return address === "::1" || address === "127.0.0.1" || address.startsWith("127.") || address.startsWith("::ffff:127.");
 }
 
+function isLoopbackHost(host: unknown): boolean {
+  return host === "127.0.0.1" || host === "localhost" || host === "::1";
+}
+
+function isWithinDirectory(directory: string, candidate: string): boolean {
+  const relativePath = relative(resolve(directory), resolve(candidate));
+  return relativePath !== "" && !relativePath.startsWith("..") && !isAbsolute(relativePath);
+}
+
 function isDrawDocument(value: unknown): value is DrawDocumentBridgeValue {
   try {
     validateDrawDocument(value);
@@ -130,14 +142,27 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
     name: "draw-local-mcp-bridge",
     configureServer(server: ViteDevServer) {
       const testAuth = options.editorAuthForTests;
-      const isE2ETestMode = server.config.mode === "e2e" && typeof process.env.DRAW_E2E_EDITOR_CODE === "string";
+      const e2eCode = process.env.DRAW_E2E_EDITOR_CODE;
+      const e2eAuthStatePath = process.env.DRAW_E2E_AUTH_STATE_PATH;
+      const isE2ETestMode = server.config.mode === "e2e"
+        && !server.config.isProduction
+        && isLoopbackHost(server.config.server.host)
+        && typeof e2eCode === "string"
+        && /^[A-F\d]{12}$/i.test(e2eCode)
+        && typeof e2eAuthStatePath === "string"
+        && isWithinDirectory(tmpdir(), e2eAuthStatePath);
       let e2eLaunchCodeSequence = 0n;
+      let activeE2ELaunchCode: string | null = null;
       const generateE2ELaunchCode = () => {
-        const base = BigInt(`0x${process.env.DRAW_E2E_EDITOR_CODE}`);
+        const base = BigInt(`0x${e2eCode}`);
         const code = (base + e2eLaunchCodeSequence).toString(16).toUpperCase().slice(-12).padStart(12, "0");
         e2eLaunchCodeSequence += 1n;
+        activeE2ELaunchCode = code;
         return code;
       };
+      if (isE2ETestMode) {
+        server.config.logger.warn("Draw E2E-only editor auth provider is active on loopback. Its per-run test code and test endpoint are for isolated automation only; never use this mode with real drawings or outside an isolated test run.");
+      }
       const displayLaunchCode = testAuth?.displayLaunchCode ?? (isE2ETestMode ? (() => true) : ((code: string) => {
         // Never put authentication material in Vite's logger, browser traffic,
         // command arguments, or tool output. Pairing requires a trusted TTY.
@@ -151,8 +176,13 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
         ...(testAuth?.now ? { now: testAuth.now } : {}),
         ...(testAuth?.generateLaunchCode ? { generateLaunchCode: testAuth.generateLaunchCode } : {}),
         ...(testAuth?.generateSecret ? { generateSecret: testAuth.generateSecret } : {}),
-        ...(testAuth?.store ? { store: testAuth.store } : { store: createFileEditorAuthStore() }),
+        ...(testAuth?.store
+          ? { store: testAuth.store }
+          : { store: createFileEditorAuthStore(isE2ETestMode ? e2eAuthStatePath : undefined) }),
       });
+      if (isE2ETestMode && e2eAuthStatePath) {
+        server.httpServer?.once("close", () => { void rm(e2eAuthStatePath, { force: true }); });
+      }
       const getAuth = () => {
         if (!editorAuth) throw new Error("Editor authentication is unavailable.");
         return editorAuth;
@@ -202,6 +232,34 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
             return;
           }
 
+          // This endpoint exists only for isolated, loopback Playwright runs.
+          // Production builds and normal Vite modes never expose test credentials.
+          if (isE2ETestMode && request.method === "GET" && path === `${API_ROOT}/e2e/active-launch-code`) {
+            if (origin !== `http://${host}` || !activeE2ELaunchCode) {
+              sendJson(response, 403, { error: "The isolated E2E launch code is unavailable." });
+              return;
+            }
+            sendJson(response, 200, { code: activeE2ELaunchCode });
+            return;
+          }
+
+          if (request.method === "POST" && path === `${API_ROOT}/editor/reissue-code`) {
+            if (origin !== `http://${host}`) {
+              sendJson(response, 403, { error: "A fresh editor code can be requested only from Draw." });
+              return;
+            }
+            const result = await authManager.requestFreshLaunchCode();
+            if (result !== "ISSUED") {
+              sendJson(response, result === "LOCKED" ? 429 : 503, {
+                status: result,
+                error: "No fresh code was issued. Start Draw from a trusted interactive terminal and check that terminal.",
+              });
+              return;
+            }
+            sendJson(response, 200, { status: "ISSUED" });
+            return;
+          }
+
           if (request.method === "POST" && path === `${API_ROOT}/editor/bootstrap`) {
             const body = await readJsonBody(request, maxBodyBytes);
             const clientId = isRecord(body) && typeof body.clientId === "string" ? body.clientId : "";
@@ -212,8 +270,11 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
             }
             const result = await authManager.exchangeLaunchCode(launchCode, clientId);
             if (result.status !== "AUTHENTICATED") {
-              const statusCode = result.status === "LOCKED" ? 429 : result.status === "UNAVAILABLE" ? 503 : 401;
-              sendJson(response, statusCode, { status: result.status, error: "Could not authenticate this Draw editor session. Check the trusted terminal and retry." });
+              const statusCode = result.status === "LOCKED" ? 429 : result.status === "UNAVAILABLE" ? 503 : result.status === "EXPIRED" ? 410 : 401;
+              const error = result.status === "EXPIRED"
+                ? "This code may have expired. Request a fresh code and check the trusted terminal."
+                : "Could not authenticate this Draw editor session. Check the trusted terminal and retry.";
+              sendJson(response, statusCode, { status: result.status, error });
               return;
             }
             if (activeClientId) {

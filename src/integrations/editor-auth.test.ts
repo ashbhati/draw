@@ -35,20 +35,30 @@ describe("editor session authentication", () => {
     expect(store.save).toHaveBeenCalled();
   });
 
-  it("does not issue a tab secret for an expired launch code", async () => {
+  it("expires codes without charging a failed attempt and permits a human-requested reissue", async () => {
     let now = 1_000;
-    const codes = ["ABCDEF123456", "FEDCBA654321"];
+    const codes = ["ABCDEF123456", "FEDCBA654321", "C0FFEE123456", "A1A2A3A4A5A6"];
+    const displayed: string[] = [];
+    const store = createMemoryStore();
     const auth = await createEditorAuthManager({
       now: () => now,
       generateLaunchCode: () => codes.shift()!,
-      generateSecret: () => "never-issued",
-      displayLaunchCode: () => undefined,
-      store: createMemoryStore(),
+      generateSecret: () => "tab-secret",
+      displayLaunchCode: (code) => { displayed.push(code); },
+      store,
     });
+    const connected = await auth.exchangeLaunchCode("ABCDEF123456", "tab-a");
+    expect(connected.status).toBe("AUTHENTICATED");
     now += 60_001;
 
-    expect(await auth.exchangeLaunchCode("ABCDEF123456", "tab-a")).toEqual({ status: "INVALID" });
-    expect(auth.authorize("tab-a", "never-issued")).toBe(false);
+    expect(await auth.exchangeLaunchCode("FEDCBA654321", "tab-b")).toEqual({ status: "EXPIRED" });
+    expect(store.save).toHaveBeenCalledTimes(1);
+    expect(store.save).toHaveBeenLastCalledWith({ failedAttempts: 0, lockedUntil: 0 });
+    expect(auth.authorize("tab-a", "tab-secret")).toBe(true);
+    expect(await auth.requestFreshLaunchCode()).toBe("ISSUED");
+    expect(displayed).toEqual(["ABCDEF123456", "FEDCBA654321", "C0FFEE123456"]);
+    expect(await auth.exchangeLaunchCode("C0FFEE123456", "tab-b")).toMatchObject({ status: "AUTHENTICATED", clientId: "tab-b" });
+    expect(auth.authorize("tab-a", "tab-secret")).toBe(false);
   });
 
   it("fails closed when no trusted interactive terminal is available", async () => {
@@ -61,6 +71,7 @@ describe("editor session authentication", () => {
     });
 
     expect(await auth.exchangeLaunchCode("ABCDEF123456", "tab-a")).toEqual({ status: "UNAVAILABLE" });
+    expect(await auth.requestFreshLaunchCode()).toBe("UNAVAILABLE");
     expect(store.save).not.toHaveBeenCalled();
     expect(auth.authorize("tab-a", "never-issued")).toBe(false);
   });
@@ -76,12 +87,14 @@ describe("editor session authentication", () => {
       displayLaunchCode: display,
       store,
     });
+    expect((await first.exchangeLaunchCode("ABCDEF123456", "tab-a")).status).toBe("AUTHENTICATED");
 
     const failures: Awaited<ReturnType<typeof first.exchangeLaunchCode>>[] = [];
     for (let attempt = 0; attempt < 5; attempt += 1) failures.push(await first.exchangeLaunchCode("WRONGCODE000", "tab-a"));
     expect(failures.map((result) => result.status)).toEqual(["INVALID", "INVALID", "INVALID", "INVALID", "LOCKED"]);
     expect(store.save).toHaveBeenLastCalledWith({ failedAttempts: 5, lockedUntil: now + 15 * 60_000 });
-    expect(first.authorize("tab-a", "unused")).toBe(false);
+    expect(first.authorize("tab-a", "unused")).toBe(true);
+    expect(await first.requestFreshLaunchCode()).toBe("LOCKED");
 
     const restarted = await createEditorAuthManager({
       now: () => now,
@@ -90,7 +103,7 @@ describe("editor session authentication", () => {
       displayLaunchCode: display,
       store,
     });
-    expect(display).toHaveBeenCalledTimes(1);
+    expect(display).toHaveBeenCalledTimes(2);
     expect((await restarted.exchangeLaunchCode("SECOND000000", "tab-b")).status).toBe("LOCKED");
   });
 

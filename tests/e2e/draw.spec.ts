@@ -5,7 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
-import { nextE2EEditorLaunchCode, isBundledFontURL, isSameOriginURL } from "./config";
+import { isBundledFontURL, isSameOriginURL } from "./config";
 
 const documentApi = "/__draw/api/document";
 const commandApi = "/__draw/api/commands";
@@ -100,9 +100,18 @@ async function countPixelsNear(page: Page, image: Buffer, target: [number, numbe
   }, { bytes: Array.from(image), color: target, limit: tolerance, mime: mimeType });
 }
 
-async function connectEditorToMcp(page: Page) {
+async function connectEditorToMcp(page: Page, requestFreshCode = false) {
   await page.getByRole("button", { name: "Connect MCP" }).click();
-  await page.getByLabel("Launch code").fill(nextE2EEditorLaunchCode());
+  if (requestFreshCode) {
+    await page.getByRole("button", { name: "Request fresh code" }).click();
+    await expect(page.getByText(/fresh code was printed in the trusted terminal/i)).toBeVisible();
+  }
+  const codeResponse = await page.request.get("/__draw/api/e2e/active-launch-code", {
+    headers: { Origin: new URL(page.url()).origin },
+  });
+  expect(codeResponse.ok(), "the isolated E2E server should provide its current launch code to Playwright").toBeTruthy();
+  const { code } = await codeResponse.json();
+  await page.getByLabel("Launch code").fill(code);
   await page.getByRole("button", { name: "Connect", exact: true }).click();
   await expect(page.getByRole("button", { name: "MCP connected", exact: true })).toBeVisible();
   expect(new URL(page.url()).search).toBe("");
@@ -706,6 +715,7 @@ test("MCP create and update stay editable through save, reload, open, and image 
   await page.locator(".excalidraw canvas").first().waitFor();
   await expect(page.getByRole("button", { name: "Whiteboard", exact: true })).toHaveAttribute("aria-pressed", "true");
   expect((await readLocalDocument(page)).document.elements.some((element: any) => element.originalText === longText)).toBeTruthy();
+  await connectEditorToMcp(page, true);
 
   page.once("dialog", (dialog) => dialog.accept());
   await page.locator('input[type="file"][accept^=".draw"]').setInputFiles({
@@ -1059,7 +1069,7 @@ test("blackboard background survives reload and is present in PNG and JPEG expor
   await page.locator(".excalidraw canvas").first().waitFor();
   await expect(page.getByRole("button", { name: "Blackboard", exact: true })).toHaveAttribute("aria-pressed", "true");
   await expect(page.getByRole("button", { name: "Connect MCP", exact: true })).toBeEnabled();
-  await connectEditorToMcp(page);
+  await connectEditorToMcp(page, true);
 });
 
 test("fresh MCP canvas reads flush a just-drawn freehand edit", async ({ page }) => {
@@ -1389,7 +1399,21 @@ test("the supplied reference fixture keeps chalk, layout, and editable nodes aft
     mimeType: "application/vnd.draw+json",
     buffer: reference,
   });
-  await expect.poll(async () => (await freshBridgeDocument(page)).document.elements.filter((element: any) => ["rectangle", "ellipse", "diamond"].includes(element.type)).length).toBe(3);
+  await expect.poll(async () => {
+    const local = await readLocalDocument(page);
+    return local.document.elements.filter((element: any) => ["rectangle", "ellipse", "diamond"].includes(element.type)).length;
+  }).toBe(3);
+  await expect.poll(async () => {
+    const health = await (await page.request.get("/__draw/api/health")).json();
+    const local = await readLocalDocument(page);
+    return health.clientReady && health.documentReady && typeof local.document.documentRevision === "number";
+  }).toBe(true);
+  await expect.poll(async () => {
+    const local = await readLocalDocument(page);
+    const live = await freshBridgeDocument(page);
+    return live.document.documentRevision === local.document.documentRevision &&
+      live.document.elements.filter((element: any) => ["rectangle", "ellipse", "diamond"].includes(element.type)).length === 3;
+  }).toBe(true);
   const initial = await freshBridgeDocument(page);
   expect(initial.document.canvas.background.preset).toBe("blackboard");
   const nodes = initial.document.elements.filter((element: any) => ["rectangle", "ellipse", "diamond"].includes(element.type));
