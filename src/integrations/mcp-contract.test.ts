@@ -193,6 +193,15 @@ describe("MCP tool input contract", () => {
     ] })).toThrow(/zero-length/i);
   });
 
+  it("allows unbound arrows and requires both endpoints for a bound arrow", () => {
+    expect(parseMcpToolInput("create_elements", { elements: [
+      { id: "free", type: "arrow", x: 10, y: 20, points: [[0, 0], [80, 20]] },
+    ] })).toMatchObject({ input: { elements: [{ id: "free", type: "arrow" }] } });
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "partial", type: "arrow", x: 10, y: 20, points: [[0, 0], [80, 20]], start: "shape" },
+    ] })).toThrow(/must supply both start and end/i);
+  });
+
   it("rejects malformed primitive geometry and duplicate input IDs", () => {
     expect(() => parseMcpToolInput("create_elements", { elements: [] })).toThrow(/at least one element/i);
     expect(() => parseMcpToolInput("create_elements", { elements: [

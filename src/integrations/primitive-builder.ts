@@ -10,7 +10,8 @@ export function buildPrimitiveSkeletons(
   const onBlackboard = background === "blackboard";
   const defaultStroke = onBlackboard ? "#f6f2e9" : "#1e1e1e";
   const elementIds = Object.fromEntries(input.elements.map((element) => [element.id, createId()]));
-  const skeletons = input.elements.map((element) => buildPrimitive(element, onBlackboard, defaultStroke, elementIds));
+  const inputElementsById = Object.fromEntries(input.elements.map((element) => [element.id, element]));
+  const skeletons = input.elements.map((element) => buildPrimitive(element, onBlackboard, defaultStroke, elementIds, inputElementsById));
   return { skeletons, elementIds };
 }
 
@@ -19,6 +20,7 @@ function buildPrimitive(
   onBlackboard: boolean,
   defaultStroke: string,
   elementIds: Record<string, string>,
+  inputElementsById: Record<string, DrawPrimitiveInput>,
 ): Record<string, unknown> {
   const id = elementIds[element.id];
   const strokeColor = element.strokeColor ?? defaultStroke;
@@ -44,18 +46,36 @@ function buildPrimitive(
     skeleton.fontSize = element.fontSize ?? 20;
     skeleton.maxWidth = element.maxWidth ?? 600;
   } else {
-    const points = element.points ?? [];
+    let points = element.points ?? [];
+    let pathX = element.x;
+    let pathY = element.y;
+    if (element.type === "arrow" && element.start && element.end) {
+      const center = (id: string) => {
+        const shape = inputElementsById[id];
+        return [shape.x + (shape.width ?? 180) / 2, shape.y + (shape.height ?? 72) / 2] as const;
+      };
+      const start = center(element.start);
+      const end = center(element.end);
+      const minX = Math.min(start[0], end[0]);
+      const minY = Math.min(start[1], end[1]);
+      points = [[start[0] - minX, start[1] - minY], [end[0] - minX, end[1] - minY]];
+      pathX = minX;
+      pathY = minY;
+    }
     const minX = Math.min(...points.map(([x]) => x));
     const minY = Math.min(...points.map(([, y]) => y));
     const maxX = Math.max(...points.map(([x]) => x));
     const maxY = Math.max(...points.map(([, y]) => y));
-    skeleton.x = element.x + minX;
-    skeleton.y = element.y + minY;
+    skeleton.x = pathX + minX;
+    skeleton.y = pathY + minY;
     skeleton.width = Math.max(maxX - minX, 1);
     skeleton.height = Math.max(maxY - minY, 1);
-    skeleton.points = points.map(([x, y, pressure]) => element.type === "freedraw"
-      ? [x - minX, y - minY, pressure ?? 0.5]
-      : [x - minX, y - minY]);
+    skeleton.points = points.map(([x, y]) => [x - minX, y - minY]);
+    if (element.type === "freedraw") {
+      const hasExplicitPressure = element.points?.some(([, , pressure]) => pressure !== undefined) ?? false;
+      skeleton.pressures = hasExplicitPressure ? element.points!.map(([, , pressure]) => pressure ?? 0.5) : [];
+      skeleton.simulatePressure = !hasExplicitPressure;
+    }
     skeleton.strokeWidth = element.strokeWidth ?? 2;
     skeleton.roughness = element.roughness ?? 1;
     if (element.strokeStyle) skeleton.strokeStyle = element.strokeStyle;

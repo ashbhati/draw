@@ -153,7 +153,7 @@ function createServer() {
   server.registerTool(
     "create_elements",
     {
-      description: "Create editable native Draw shapes, text, lines, arrows, and freehand strokes on the open canvas. Use local canvas coordinates; line and freedraw points are offsets from each element's x/y. Returns input IDs mapped to Draw element IDs.",
+      description: "Create editable native Draw shapes, text, lines, arrows, and freehand strokes on the open canvas. Use canvas coordinates; path points are offsets from x/y. Freedraw supports optional per-point pressure. Arrows may bind both endpoints to shapes created in the call; bound arrows derive their path from the shapes and ignore supplied x/y/points. Returns input IDs mapped to Draw element IDs and relationships.",
       inputSchema: createElementsSchema,
     },
     async (input) => {

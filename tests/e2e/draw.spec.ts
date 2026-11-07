@@ -1032,7 +1032,10 @@ test("MCP creates rendered editable primitives with relationships that stay edit
   expect(response.ok(), await response.text()).toBeTruthy();
   const created = await response.json();
   expect(created.result.elementIds).toMatchObject({ box: expect.any(String), oval: expect.any(String), decision: expect.any(String), caption: expect.any(String), connector: expect.any(String), flow: expect.any(String), chalk: expect.any(String) });
-  expect(created.result.addedElementIds).toHaveLength(7);
+  expect(created.result.addedElementIds).toHaveLength(10);
+  expect(created.result.addedElementIds).toEqual(expect.arrayContaining([
+    ...Object.values(created.result.elementIds), ...Object.values(created.result.labelElementIds),
+  ]));
 
   const current = await freshBridgeDocument(page);
   const byInputId = Object.fromEntries(Object.entries(created.result.elementIds).map(([key, id]) => [key, current.document.elements.find((element: any) => element.id === id)]));
@@ -1048,7 +1051,9 @@ test("MCP creates rendered editable primitives with relationships that stay edit
   expect(byInputId.chalk.points).toHaveLength(3);
   expect(byInputId.chalk.width).toBeGreaterThan(0);
   expect(byInputId.chalk.height).toBeGreaterThan(0);
-  expect(byInputId.chalk.points.every((point: number[]) => point.length === 3 && point[2] > 0)).toBe(true);
+  expect(byInputId.chalk.points.every((point: number[]) => point.length === 2)).toBe(true);
+  expect(byInputId.chalk.pressures).toEqual([0.5, 0.5, 0.7]);
+  expect(byInputId.chalk.simulatePressure).toBe(false);
 
   const sourceLabelId = created.result.labelElementIds.box;
   const arrowLabelId = created.result.labelElementIds.flow;
@@ -1088,7 +1093,7 @@ test("MCP creates rendered editable primitives with relationships that stay edit
   const canvas = page.locator(".excalidraw canvas").last();
   const bounds = await canvas.boundingBox();
   if (!bounds) throw new Error("Could not locate the drawing canvas.");
-  const view = current.document.document.appState;
+  const view = current.document.appState;
   const zoom = typeof view.zoom?.value === "number" ? view.zoom.value : 1;
   const screenX = bounds.x + (byInputId.caption.x + (view.scrollX ?? 0) + 10) * zoom;
   const screenY = bounds.y + (byInputId.caption.y + (view.scrollY ?? 0) + 10) * zoom;
