@@ -43,4 +43,47 @@ describe("MCP scene operations", () => {
     const result = applySceneEdit(base, { action: "bring_to_front", ids: ["a", "c"] }, () => "unused");
     expect(result.elements.map((element) => element.id)).toEqual(["b", "a", "a-label", "c"]);
   });
+
+  it("moves bound labels with aligned nodes and reroutes arrows", () => {
+    const connected = [
+      { id: "left", type: "rectangle", x: 100, y: 40, width: 100, height: 80, boundElements: [{ id: "left-label", type: "text" }, { id: "flow", type: "arrow" }] },
+      { id: "left-label", type: "text", x: 120, y: 60, width: 60, height: 30, containerId: "left" },
+      { id: "right", type: "ellipse", x: 360, y: 180, width: 120, height: 80, boundElements: [{ id: "right-label", type: "text" }, { id: "flow", type: "arrow" }] },
+      { id: "right-label", type: "text", x: 380, y: 205, width: 80, height: 30, containerId: "right" },
+      { id: "flow", type: "arrow", x: 150, y: 80, width: 270, height: 140, points: [[0, 0], [270, 140]], startBinding: { elementId: "left" }, endBinding: { elementId: "right" } },
+    ];
+    const aligned = applySceneEdit(connected, { action: "align", alignment: "left", ids: ["left", "right"] }, () => "unused");
+    expect(aligned.elements.find((element) => element.id === "right")).toMatchObject({ x: 100, y: 180 });
+    expect(aligned.elements.find((element) => element.id === "right-label")).toMatchObject({ x: 120, y: 205 });
+    const arrow = aligned.elements.find((element) => element.id === "flow")!;
+    const arrowStart = { x: (arrow.x ?? 0) + (arrow.points?.[0]?.[0] ?? 0), y: (arrow.y ?? 0) + (arrow.points?.[0]?.[1] ?? 0) };
+    const arrowEnd = { x: (arrow.x ?? 0) + (arrow.points?.[1]?.[0] ?? 0), y: (arrow.y ?? 0) + (arrow.points?.[1]?.[1] ?? 0) };
+    expect(arrowStart.y).toBeCloseTo(120);
+    expect(arrowStart.x).toBeGreaterThanOrEqual(100);
+    expect(arrowStart.x).toBeLessThanOrEqual(200);
+    expect(arrowEnd.y).toBeCloseTo(180, 1);
+    expect(arrowEnd.x).toBeGreaterThanOrEqual(100);
+    expect(arrowEnd.x).toBeLessThanOrEqual(220);
+  });
+
+  it("moves labels while distributing and clears arrow bindings when a shape is deleted", () => {
+    const connected = [
+      { id: "a", type: "rectangle", x: 0, y: 0, width: 100, height: 60, boundElements: [{ id: "a-label", type: "text" }, { id: "ab", type: "arrow" }] },
+      { id: "a-label", type: "text", x: 20, y: 20, width: 60, height: 20, containerId: "a" },
+      { id: "b", type: "rectangle", x: 180, y: 90, width: 100, height: 60, boundElements: [{ id: "b-label", type: "text" }, { id: "ab", type: "arrow" }, { id: "bc", type: "arrow" }] },
+      { id: "b-label", type: "text", x: 200, y: 110, width: 60, height: 20, containerId: "b" },
+      { id: "c", type: "rectangle", x: 500, y: 0, width: 100, height: 60, boundElements: [{ id: "c-label", type: "text" }, { id: "bc", type: "arrow" }] },
+      { id: "c-label", type: "text", x: 520, y: 20, width: 60, height: 20, containerId: "c" },
+      { id: "ab", type: "arrow", x: 50, y: 30, width: 180, height: 90, points: [[0, 0], [180, 90]], startBinding: { elementId: "a" }, endBinding: { elementId: "b" } },
+      { id: "bc", type: "arrow", x: 230, y: 120, width: 320, height: -90, points: [[0, 0], [320, -90]], startBinding: { elementId: "b" }, endBinding: { elementId: "c" } },
+    ];
+    const distributed = applySceneEdit(connected, { action: "distribute", axis: "horizontal", ids: ["a", "b", "c"] }, () => "unused");
+    expect(distributed.elements.find((element) => element.id === "b-label")!.x).toBe(270);
+    const deleted = applySceneEdit(distributed.elements, { action: "delete", ids: ["b"] }, () => "unused");
+    const ab = deleted.elements.find((element) => element.id === "ab")!;
+    expect(ab.endBinding).toBeNull();
+    expect(ab.startBinding).toEqual({ elementId: "a" });
+    expect(deleted.elements.find((element) => element.id === "a")!.boundElements).toContainEqual({ id: "ab", type: "arrow" });
+    expect(deleted.elements.filter((element) => element.isDeleted !== true).flatMap((element) => [element.startBinding?.elementId, element.endBinding?.elementId])).not.toContain("b");
+  });
 });

@@ -1,8 +1,8 @@
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadDrawFile, writeNewArtifact } from "./mcp-file-access";
+import { loadDrawFile, loadDrawFileSnapshot, writeNewArtifact } from "./mcp-file-access";
 import { serializeDrawFile, createEmptyDocument } from "../document/document";
 
 const roots: string[] = [];
@@ -24,6 +24,17 @@ describe("MCP document file access", () => {
     const reopened = await loadDrawFile(root, "round-trip.draw");
     expect(reopened.document.elements).toEqual(source.document.elements);
     expect(reopened.document.id).toBe(source.document.id);
+    const snapshot = await loadDrawFileSnapshot(root, "round-trip.draw");
+    expect(snapshot.document.document.id).toBe(source.document.id);
+    expect(snapshot.fingerprint).toMatch(/^[\da-f]{64}$/);
+  });
+
+  it("rejects an oversized file from its open-handle stat before reading it", async () => {
+    const root = await makeRoot();
+    const oversized = join(root, "oversized.draw");
+    await writeFile(oversized, "x");
+    await truncate(oversized, 100 * 1024 * 1024 + 1);
+    await expect(loadDrawFile(root, "oversized.draw")).rejects.toThrow(/100 MiB limit/i);
   });
 
   it("refuses traversal, absolute paths and a symbolic link target", async () => {

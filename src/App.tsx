@@ -22,6 +22,8 @@ import { wrapTextToWidth } from "./integrations/scene-updates";
 import { persistAppliedDocument } from "./integrations/command-persistence";
 import { createBridgeSynchronizer } from "./integrations/bridge-sync";
 import { applySceneEdit } from "./integrations/scene-operations";
+import { hasSceneContentChanged, sceneElementsChanged } from "./integrations/scene-revision";
+import { rebaseOpenedDocument, shouldRequireOpenConfirmation } from "./document/open-safety";
 
 type Status = "loading" | "ready" | "saving" | "saved" | "error";
 type BridgeCommand = { id: string; clientId: string; operation: string; input: any; document?: DrawDocument };
@@ -136,6 +138,7 @@ export default function App() {
   const fileInput = useRef<HTMLInputElement>(null);
   const lastMcpOperation = useRef<{ id: string; revision: number } | null>(null);
   const lastUndoneOperation = useRef<{ id: string; revision: number } | null>(null);
+  const viewRevisionTimer = useRef<number | null>(null);
   const onEditorReady = useCallback((api: ExcalidrawImperativeAPI) => {
     apiRef.current = api;
     const viewport = docRef.current?.document.canvas.viewport;
@@ -145,6 +148,24 @@ export default function App() {
         captureUpdate: CaptureUpdateAction.NEVER,
       });
     }
+  }, []);
+
+  useEffect(() => {
+    const invalidateMcpHistoryOnHumanAction = (event: Event) => {
+      if (!event.isTrusted) return;
+      lastMcpOperation.current = null;
+      lastUndoneOperation.current = null;
+    };
+    window.addEventListener("pointerdown", invalidateMcpHistoryOnHumanAction, true);
+    window.addEventListener("keydown", invalidateMcpHistoryOnHumanAction, true);
+    return () => {
+      window.removeEventListener("pointerdown", invalidateMcpHistoryOnHumanAction, true);
+      window.removeEventListener("keydown", invalidateMcpHistoryOnHumanAction, true);
+    };
+  }, []);
+
+  useEffect(() => () => {
+    if (viewRevisionTimer.current !== null) window.clearTimeout(viewRevisionTimer.current);
   }, []);
 
   useEffect(() => {
@@ -253,9 +274,7 @@ export default function App() {
     const background = backgroundPreset === "blackboard"
       ? { preset: "blackboard" as const, styleVersion: 1, color: DEFAULT_COLOR.blackboard, texture: "chalk-smudge-v1" }
       : { preset: "white" as const, styleVersion: 1, color: DEFAULT_COLOR.white };
-    const sceneChanged = JSON.stringify(current.document.elements) !== JSON.stringify(elements)
-      || JSON.stringify(current.document.assets) !== JSON.stringify(files)
-      || current.document.canvas.background.preset !== background.preset;
+    const sceneChanged = hasSceneContentChanged(current, elements, files, background.preset);
     if (sceneChanged) {
       // A human scene edit makes a delayed MCP undo/redo ineligible. The live
       // editor history is shared, so an agent must never consume newer work.
@@ -272,11 +291,24 @@ export default function App() {
       id: current.document.id,
       title: current.document.title,
       documentRevision: current.document.documentRevision + (sceneChanged ? 1 : 0),
-      viewRevision: current.document.viewRevision + (viewChanged ? 1 : 0),
+      viewRevision: current.document.viewRevision,
       background,
       viewport,
     });
     setDocument(next);
+    if (viewChanged) {
+      if (viewRevisionTimer.current !== null) window.clearTimeout(viewRevisionTimer.current);
+      viewRevisionTimer.current = window.setTimeout(() => {
+        const latest = docRef.current;
+        if (!latest) return;
+        const settled = { ...latest, document: { ...latest.document, viewRevision: latest.document.viewRevision + 1 } };
+        setDocument(settled);
+        if (!autosaveBlocked) {
+          autosave.schedule(settled);
+          bridgeAutosave.schedule(settled);
+        }
+      }, 250);
+    }
     if (autosaveBlocked) {
       setStatus("error");
       return;
@@ -315,13 +347,20 @@ export default function App() {
     }
     if (autosave.isBusy()) await autosave.flush();
     if (bridgeAutosave.isBusy()) await bridgeAutosave.flush();
-    setDocument(next);
+    if (viewRevisionTimer.current !== null) {
+      window.clearTimeout(viewRevisionTimer.current);
+      viewRevisionTimer.current = null;
+    }
+    const opened = rebaseOpenedDocument(docRef.current ?? next, next);
+    lastMcpOperation.current = null;
+    lastUndoneOperation.current = null;
+    setDocument(opened);
     setStatus("ready"); setMessage(""); setEditorKey((key) => key + 1);
     setAutosaveBlocked(false);
     try {
-      await saveCurrentDocument(next);
+      await saveCurrentDocument(opened);
       setStatus("saved");
-      await syncBridgeDocument(next);
+      await syncBridgeDocument(opened);
     } catch (error) {
       setAutosaveBlocked(true);
       setStatus("error");
@@ -331,7 +370,7 @@ export default function App() {
 
   const openFile = async (file?: File) => {
     if (!file) return;
-    if (docRef.current?.document.elements.some((element) => !element.isDeleted) &&
+    if (docRef.current && shouldRequireOpenConfirmation(docRef.current) &&
       !window.confirm("Open this file and replace the current canvas? Save an editable .draw copy first if you need to keep both.")) {
       if (fileInput.current) fileInput.current.value = "";
       return;
@@ -428,10 +467,22 @@ export default function App() {
       if (!writerOwned.current) throw new Error("This Draw tab is read-only because another tab owns the autosave lock.");
       if (autosaveBlocked) throw new Error("Local autosave is unavailable; open a saved .draw file before using MCP edits.");
       let elements = [...api.getSceneElementsIncludingDeleted()] as any[];
+      const liveState = api.getAppState() as any;
+      const liveBackground = liveState.viewBackgroundColor === "transparent" ? "blackboard" : liveState.viewBackgroundColor === DEFAULT_COLOR.white ? "white" : current.document.canvas.background.preset;
+      if (hasSceneContentChanged(current, elements, api.getFiles(), liveBackground)) {
+        lastMcpOperation.current = null;
+        lastUndoneOperation.current = null;
+        throw new Error("CONFLICT: The live editor has unsynchronized changes. Read the current canvas and retry with its latest revision.");
+      }
+      if (typeof event.input.expectedDocumentRevision === "number" && event.input.expectedDocumentRevision !== current.document.documentRevision) {
+        throw new Error("CONFLICT: The expected document revision is stale. Read the current canvas and retry.");
+      }
       let result: Record<string, unknown>;
       let nextDocument: DrawDocument | null = null;
       let captureUpdate: any = CaptureUpdateAction.IMMEDIATELY;
       if (event.operation === "set_selection") {
+        lastMcpOperation.current = null;
+        lastUndoneOperation.current = null;
         const selected = Object.fromEntries(event.input.ids.map((id: string) => [id, true]));
         api.updateScene({ appState: { selectedElementIds: selected }, captureUpdate: CaptureUpdateAction.NEVER });
         result = { selectedElementIds: event.input.ids };
@@ -506,6 +557,9 @@ export default function App() {
         elements = changed.elements;
         result = { affectedElementIds: changed.affectedIds, addedElementIds: changed.createdIds, failures: changed.failed };
       } else if (event.operation === "set_canvas_settings") {
+        lastMcpOperation.current = null;
+        lastUndoneOperation.current = null;
+        captureUpdate = CaptureUpdateAction.NEVER;
         const preset = event.input.background ?? current.document.canvas.background.preset;
         elements = event.input.background
           ? recolorForBackgroundPreset(elements as any, current.document.canvas.background.preset, preset) as any[]
@@ -532,6 +586,7 @@ export default function App() {
           await new Promise((resolve) => setTimeout(resolve, 40));
         } else {
           api.updateScene({ appState: { scrollX: event.input.x, scrollY: event.input.y, zoom: { value: event.input.zoom } }, captureUpdate: CaptureUpdateAction.NEVER });
+          await new Promise((resolve) => setTimeout(resolve, 40));
         }
         const state = api.getAppState() as any;
         const viewport = {
@@ -545,11 +600,17 @@ export default function App() {
       } else if (event.operation === "undo_operation" || event.operation === "redo_operation") {
         const target = event.operation === "undo_operation" ? lastMcpOperation.current : lastUndoneOperation.current;
         if (!target || target.id !== event.input.operationId) throw new Error(`CONFLICT: ${event.operation} may only affect the latest eligible MCP operation.`);
+        const beforeElements = structuredClone(elements);
         const key = event.operation === "undo_operation" ? "z" : "z";
         const undoEvent = new KeyboardEvent("keydown", { key, ctrlKey: true, metaKey: true, shiftKey: event.operation === "redo_operation", bubbles: true, cancelable: true });
-        window.dispatchEvent(undoEvent);
+        (document.querySelector(".excalidraw") ?? document.activeElement ?? window).dispatchEvent(undoEvent);
         await new Promise((resolve) => setTimeout(resolve, 50));
         elements = [...api.getSceneElementsIncludingDeleted()] as any[];
+        if (!sceneElementsChanged(beforeElements, elements)) {
+          lastMcpOperation.current = null;
+          lastUndoneOperation.current = null;
+          throw new Error(`CONFLICT: ${event.operation} did not produce a verifiable scene change.`);
+        }
         nextDocument = fromExcalidrawScene({ elements, appState: api.getAppState() as any, files: api.getFiles() }, {
           id: current.document.id,
           title: current.document.title,
@@ -610,7 +671,7 @@ export default function App() {
         api.updateScene({ elements, ...(event.operation === "set_canvas_settings" ? { appState: { viewBackgroundColor: nextDocument.document.appState.viewBackgroundColor, currentItemStrokeColor: nextDocument.document.appState.currentItemStrokeColor } as any } : {}), captureUpdate: captureUpdate });
       }
       result = { ...result, operationId: event.id, documentRevision: nextDocument.document.documentRevision, viewRevision: nextDocument.document.viewRevision };
-      if (!isTransient && ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "set_canvas_settings"].includes(event.operation)) {
+      if (!isTransient && ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements"].includes(event.operation)) {
         lastMcpOperation.current = { id: event.id, revision: nextDocument.document.documentRevision };
         lastUndoneOperation.current = null;
       }

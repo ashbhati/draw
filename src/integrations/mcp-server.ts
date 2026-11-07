@@ -2,7 +2,9 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import * as z from "zod/v4";
 import { parseMcpToolInput, summarizeCurrentCanvas } from "./mcp-contract";
-import { drawFileFingerprint, loadDrawFile, writeNewArtifact } from "./mcp-file-access";
+import { loadDrawFileSnapshot, writeNewArtifact } from "./mcp-file-access";
+import { assertInlineArtifactSize } from "./mcp-result-limits";
+import { shouldRequireOpenConfirmation } from "../document/open-safety";
 import { serializeDrawFile } from "../document/document";
 
 const defaultBaseUrl = "http://127.0.0.1:5173";
@@ -239,9 +241,8 @@ function createServer() {
     if (command.operation !== "open_document") throw new Error("Invalid open_document command.");
     const current = await bridgeRequest("/__draw/api/document?flush=1");
     assertDocumentContext(current, command.input.documentId, command.input.expectedDocumentRevision);
-    const document = await loadDrawFile(fileRoot(), command.input.path);
-    const fingerprint = await drawFileFingerprint(fileRoot(), command.input.path);
-    const needsConfirmation = current.document.elements.some((element: any) => element.isDeleted !== true);
+    const { document, fingerprint } = await loadDrawFileSnapshot(fileRoot(), command.input.path);
+    const needsConfirmation = shouldRequireOpenConfirmation(current);
     if (needsConfirmation && !command.input.confirmationToken) {
       const confirmation = await bridgeRequest("/__draw/api/confirmations", { method: "POST", body: JSON.stringify({
         action: "open_document", documentId: command.input.documentId,
@@ -274,8 +275,9 @@ function createServer() {
     const fileName = command.input.path ?? `${document.document.title.trim().replace(/[\\/:*?"<>|]+/g, "-").replace(/\s+/g, "-").slice(0, 80) || "Untitled-drawing"}.draw`;
     if (command.input.path) {
       await writeNewArtifact(fileRoot(), fileName, new TextEncoder().encode(drawFile), "draw");
-      return textResult({ saved: true, fileName, documentId: document.document.id, documentRevision: document.document.documentRevision, directory: fileRoot() });
+      return textResult({ saved: true, fileName, documentId: document.document.id, documentRevision: document.document.documentRevision });
     }
+    assertInlineArtifactSize(new TextEncoder().encode(drawFile).byteLength, "Draw file");
     return textResult({ saved: true, fileName, mimeType: "application/vnd.draw+json", documentId: document.document.id, documentRevision: document.document.documentRevision, drawFile });
   });
 
@@ -289,13 +291,14 @@ function createServer() {
     const exported = result.result as Record<string, unknown> | null;
     if (typeof exported?.imageData !== "string") throw new Error("Draw did not return an image artifact.");
     const bytes = Buffer.from(exported.imageData, "base64");
+    if (!command.input.path) assertInlineArtifactSize(bytes.byteLength, "Image export");
     const mimeType = command.input.format === "png" ? "image/png" : "image/jpeg";
     const name = command.input.path ?? `${Date.now()}-draw.${command.input.format === "png" ? "png" : "jpg"}`;
     if (command.input.path) await writeNewArtifact(fileRoot(), name, bytes, command.input.format);
     return {
       content: [
-        { type: "text" as const, text: JSON.stringify({ exported: true, fileName: name, mimeType, bytes: bytes.byteLength, ...(command.input.path ? { directory: fileRoot() } : {}) }, null, 2) },
-        { type: "image" as const, mimeType, data: bytes.toString("base64") },
+        { type: "text" as const, text: JSON.stringify({ exported: true, fileName: name, mimeType, bytes: bytes.byteLength }, null, 2) },
+        ...(!command.input.path ? [{ type: "image" as const, mimeType, data: bytes.toString("base64") }] : []),
       ],
     };
   });

@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { link, lstat, open, readFile, realpath, unlink } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { parseDrawFile, serializeDrawFile, type DrawDocument } from "../document/document";
+import { DrawDocumentError, parseDrawFile, serializeDrawFile, type DrawDocument } from "../document/document";
 
 const MAX_DRAW_BYTES = 100 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
@@ -40,11 +40,27 @@ async function targetInRoot(root: string, name: string, kind: "draw" | "png" | "
   return { root: canonicalRoot, target };
 }
 
-export async function loadDrawFile(root: string, filename: string): Promise<DrawDocument> {
+export async function loadDrawFileSnapshot(root: string, filename: string): Promise<{ document: DrawDocument; fingerprint: string }> {
   const { target } = await targetInRoot(root, filename, "draw", false);
-  const file = await readFile(target);
-  if (file.byteLength > MAX_DRAW_BYTES) throw new Error("Draw file exceeds the 100 MiB limit.");
-  return parseDrawFile(file.toString("utf8"));
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error("MCP file target must be a regular file.");
+    if (stat.size > MAX_DRAW_BYTES) throw new Error("Draw file exceeds the 100 MiB limit.");
+    const file = await handle.readFile();
+    if (file.byteLength > MAX_DRAW_BYTES) throw new Error("Draw file exceeds the 100 MiB limit.");
+    return { document: parseDrawFile(file.toString("utf8")), fingerprint: createHash("sha256").update(file).digest("hex") };
+  } catch (error) {
+    if (error instanceof DrawDocumentError || (error instanceof Error && /Draw file exceeds|regular file/.test(error.message))) throw error;
+    throw new Error("Could not safely read the requested Draw file.");
+  } finally {
+    await handle?.close();
+  }
+}
+
+export async function loadDrawFile(root: string, filename: string): Promise<DrawDocument> {
+  return (await loadDrawFileSnapshot(root, filename)).document;
 }
 
 export async function drawFileFingerprint(root: string, filename: string): Promise<string> {
@@ -76,7 +92,7 @@ export async function writeNewArtifact(root: string, filename: string, bytes: Ui
     return filename;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`PATH_EXISTS: File "${filename}" already exists; choose a new filename. Existing files are never overwritten by MCP.`);
-    throw error;
+    throw new Error("Could not safely write the requested artifact inside the configured Draw folder.");
   } finally {
     await fileHandle?.close().catch(() => undefined);
     await unlink(temporary).catch(() => undefined);

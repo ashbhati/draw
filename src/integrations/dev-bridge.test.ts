@@ -1,6 +1,6 @@
 import { Readable } from "node:stream";
 import type { Plugin, ViteDevServer } from "vite";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createEmptyDocument } from "../document/document";
 import { createDrawMcpPlugin } from "./dev-bridge";
 
@@ -173,6 +173,45 @@ describe("Draw MCP Vite bridge", () => {
       filename: "incoming.draw", fingerprint: "b".repeat(64),
     });
     expect(takenOver.body.status).toBe("STALE");
+  });
+
+  it("documents the known dev-bridge gap: a local caller can spoof the clientId approval UX guard", async () => {
+    const bridge = createBridgeHarness(createDrawMcpPlugin());
+    const document = createEmptyDocument("Active canvas");
+    await bridge.request("PUT", "/__draw/api/client", { clientId: "active-tab" });
+    await bridge.request("PUT", "/__draw/api/document", { clientId: "active-tab", document });
+    const challenge = await bridge.request("POST", "/__draw/api/confirmations", {
+      action: "open_document", documentId: document.document.id, expectedDocumentRevision: 0,
+      filename: "incoming.draw", fingerprint: "c".repeat(64),
+    });
+    // This is a deliberate vulnerability reproduction, not a security guarantee:
+    // /__draw is loopback-only and the clientId is caller supplied. Issue #41 tracks auth.
+    const spoofedApproval = await bridge.request("POST", `/__draw/api/confirmations/${challenge.body.confirmationToken}/respond`, {
+      clientId: "active-tab", approved: true,
+    });
+    expect(spoofedApproval.body.status).toBe("APPROVED");
+  });
+
+  it("expires dirty-open confirmation tokens at the two-minute deadline", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const bridge = createBridgeHarness(createDrawMcpPlugin());
+      const document = createEmptyDocument("Active canvas");
+      await bridge.request("PUT", "/__draw/api/client", { clientId: "tab-1" });
+      await bridge.request("PUT", "/__draw/api/document", { clientId: "tab-1", document });
+      const challenge = await bridge.request("POST", "/__draw/api/confirmations", {
+        action: "open_document", documentId: document.document.id, expectedDocumentRevision: 0,
+        filename: "incoming.draw", fingerprint: "d".repeat(64),
+      });
+      vi.setSystemTime(Number(challenge.body.expiresAt) + 1);
+      const expired = await bridge.request("POST", `/__draw/api/confirmations/${challenge.body.confirmationToken}/consume`, {
+        action: "open_document", documentId: document.document.id, expectedDocumentRevision: 0,
+        filename: "incoming.draw", fingerprint: "d".repeat(64),
+      });
+      expect(expired.body.status).toBe("EXPIRED");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("flushes the active tab before a freshness-requested canvas read", async () => {

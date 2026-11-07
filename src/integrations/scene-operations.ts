@@ -1,4 +1,5 @@
 import type { DrawElement } from "../document/document";
+import { routeBoundArrows } from "./scene-updates";
 
 export type SceneEditInput = {
   action: "delete" | "duplicate" | "group" | "ungroup" | "bring_to_front" | "send_to_back" | "align" | "distribute";
@@ -65,9 +66,20 @@ export function applySceneEdit(
     const deletion = new Set(validIds);
     for (const element of elements) if (!element.isDeleted && element.containerId && deletion.has(element.containerId)) deletion.add(element.id);
     elements = elements.map((element) => {
-      if (!deletion.has(element.id) || element.isDeleted) return element;
+      if (element.isDeleted) return element;
+      if (deletion.has(element.id)) {
+        affectedIds.add(element.id);
+        return touch(element, { isDeleted: true });
+      }
+      let patch: Partial<SceneElement> | null = null;
+      if (element.boundElements?.some((bound) => deletion.has(bound.id))) {
+        patch = { ...(patch ?? {}), boundElements: element.boundElements.filter((bound) => !deletion.has(bound.id)) };
+      }
+      if (element.startBinding?.elementId && deletion.has(element.startBinding.elementId)) patch = { ...(patch ?? {}), startBinding: null };
+      if (element.endBinding?.elementId && deletion.has(element.endBinding.elementId)) patch = { ...(patch ?? {}), endBinding: null };
+      if (!patch) return element;
       affectedIds.add(element.id);
-      return touch(element, { isDeleted: true });
+      return touch(element, patch);
     });
   } else if (input.action === "duplicate") {
     const duplicateSet = new Set(validIds);
@@ -139,8 +151,8 @@ export function applySceneEdit(
     } else {
       const selected = validIds.map((id) => available.get(id)!);
       const rect = bounds(selected);
-      elements = elements.map((element) => {
-        if (!validSet.has(element.id)) return element;
+      const positions = new Map<string, { x: number; y: number }>();
+      for (const element of selected) {
         const width = element.width ?? 0;
         const height = element.height ?? 0;
         const position = {
@@ -151,9 +163,9 @@ export function applySceneEdit(
           center_x: { x: (rect.left + rect.right - width) / 2 },
           center_y: { y: (rect.top + rect.bottom - height) / 2 },
         }[input.alignment!];
-        affectedIds.add(element.id);
-        return touch(element, position);
-      });
+        positions.set(element.id, { x: position.x ?? element.x ?? 0, y: position.y ?? element.y ?? 0 });
+      }
+      elements = moveShapesAndLabels(elements, positions, affectedIds);
     }
   } else if (input.action === "distribute") {
     if (validIds.length < 3 || !input.axis) {
@@ -169,18 +181,50 @@ export function applySceneEdit(
       const occupied = sorted.reduce((sum, element) => sum + (horizontal ? element.width ?? 0 : element.height ?? 0), 0);
       const gap = (end - start - occupied) / (sorted.length - 1);
       let cursor = start;
-      const nextPositions = new Map<string, number>();
+      const positions = new Map<string, { x: number; y: number }>();
       for (const element of sorted) {
-        nextPositions.set(element.id, cursor);
+        positions.set(element.id, horizontal ? { x: cursor, y: element.y ?? 0 } : { x: element.x ?? 0, y: cursor });
         cursor += (horizontal ? element.width ?? 0 : element.height ?? 0) + gap;
       }
-      elements = elements.map((element) => {
-        if (!nextPositions.has(element.id)) return element;
-        affectedIds.add(element.id);
-        return touch(element, horizontal ? { x: nextPositions.get(element.id)! } : { y: nextPositions.get(element.id)! });
-      });
+      elements = moveShapesAndLabels(elements, positions, affectedIds);
+    }
+  }
+
+  if (["delete", "align", "distribute"].includes(input.action)) {
+    const beforeRouting = elements;
+    elements = routeBoundArrows(elements as any[]) as SceneElement[];
+    const previousById = new Map(beforeRouting.map((element) => [element.id, element]));
+    for (const element of elements) {
+      if (element.type === "arrow" && JSON.stringify(previousById.get(element.id)) !== JSON.stringify(element)) affectedIds.add(element.id);
     }
   }
 
   return { elements, affectedIds: [...affectedIds], createdIds, failed };
+}
+
+function moveShapesAndLabels(
+  elements: SceneElement[],
+  positions: Map<string, { x: number; y: number }>,
+  affectedIds: Set<string>,
+): SceneElement[] {
+  const shapePositions = new Map<string, { x: number; y: number; dx: number; dy: number }>();
+  for (const [id, position] of positions) {
+    const shape = elements.find((element) => element.id === id);
+    if (!shape) continue;
+    const x = position.x;
+    const y = position.y;
+    shapePositions.set(id, { x, y, dx: x - (shape.x ?? 0), dy: y - (shape.y ?? 0) });
+  }
+  return elements.map((element) => {
+    const position = shapePositions.get(element.id);
+    if (position) {
+      if (position.dx === 0 && position.dy === 0) return element;
+      affectedIds.add(element.id);
+      return touch(element, { x: position.x, y: position.y });
+    }
+    const parent = element.containerId ? shapePositions.get(element.containerId) : undefined;
+    if (!parent || (parent.dx === 0 && parent.dy === 0)) return element;
+    affectedIds.add(element.id);
+    return touch(element, { x: (element.x ?? 0) + parent.dx, y: (element.y ?? 0) + parent.dy });
+  });
 }

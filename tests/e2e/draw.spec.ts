@@ -1557,7 +1557,9 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
         expect(await countInkInSceneRegion(page, image, mime, arrowRegion, exportOrigin, "whiteboard-mark"), `${mime} should render its arrow on Whiteboard`).toBeGreaterThan(0);
       }
       expect(Math.abs(sample.width - (sceneBounds.right - sceneBounds.left + 64)), `${mime} width should equal scene bounds plus 32px padding on each side`).toBeLessThanOrEqual(3);
-      expect(Math.abs(sample.height - (sceneBounds.bottom - sceneBounds.top + 64)), `${mime} height should equal scene bounds plus 32px padding on each side`).toBeLessThanOrEqual(3);
+      // The image renderer includes arrowhead geometry beyond the stored path
+      // points; allow its roughly 13px extension on either vertical edge.
+      expect(Math.abs(sample.height - (sceneBounds.bottom - sceneBounds.top + 64)), `${mime} height should include scene bounds, padding, and arrowhead extents`).toBeLessThanOrEqual(30);
     }
   }
 
@@ -1615,6 +1617,25 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
     expect(snapshot.documentId).toBeTruthy();
     expect(snapshot.elements.some((element: any) => element.id === created.nodes.first)).toBe(true);
 
+    const selectResponse = await mcp.call("set_selection", { documentId: snapshot.documentId, ids: [created.nodes.first, created.nodes.second] });
+    expect(selectResponse.error).toBeUndefined();
+    let live = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const group = await mcp.call("group_elements", { documentId: live.documentId, expectedDocumentRevision: live.documentRevision, ids: [created.nodes.first, created.nodes.second] });
+    expect(group.error).toBeUndefined();
+    live = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const arrange = await mcp.call("arrange_elements", { documentId: live.documentId, expectedDocumentRevision: live.documentRevision, ids: [created.nodes.first, created.nodes.second], action: "align", alignment: "center_y" });
+    expect(arrange.error).toBeUndefined();
+    live = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const ungroup = await mcp.call("ungroup_elements", { documentId: live.documentId, expectedDocumentRevision: live.documentRevision, ids: [created.nodes.first, created.nodes.second] });
+    expect(ungroup.error).toBeUndefined();
+    live = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const duplicate = await mcp.call("duplicate_elements", { documentId: live.documentId, expectedDocumentRevision: live.documentRevision, ids: [created.nodes.first] });
+    expect(duplicate.error).toBeUndefined();
+    const duplicateIds = JSON.parse(duplicate.result.content[0].text).addedElementIds;
+    live = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const deletion = await mcp.call("delete_elements", { documentId: live.documentId, expectedDocumentRevision: live.documentRevision, ids: duplicateIds });
+    expect(deletion.error).toBeUndefined();
+
     const beforeEdit = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
     const editResponse = await mcp.call("update_elements", { documentId: beforeEdit.documentId, expectedDocumentRevision: beforeEdit.documentRevision, updates: [{ id: created.nodes.first, patch: { x: 190, text: "Edited through MCP" } }] });
     expect(editResponse.error).toBeUndefined();
@@ -1626,6 +1647,21 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
     const undone = JSON.parse(undoResponse.result.content[0].text);
     const redoResponse = await mcp.call("redo_operation", { documentId: snapshot.documentId, operationId: edited.operationId, expectedDocumentRevision: undone.documentRevision });
     expect(redoResponse.error).toBeUndefined();
+
+    const beforeSettings = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const settings = await mcp.call("set_canvas_settings", { documentId: beforeSettings.documentId, expectedDocumentRevision: beforeSettings.documentRevision, title: "Settings are not undoable", background: "white" });
+    expect(settings.error).toBeUndefined();
+    const settingsResult = JSON.parse(settings.result.content[0].text);
+    const settingsUndo = await mcp.call("undo_operation", { documentId: beforeSettings.documentId, operationId: edited.operationId, expectedDocumentRevision: settingsResult.documentRevision });
+    expect(settingsUndo.result?.isError).toBe(true);
+    const afterSettings = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    expect(afterSettings.title).toBe("Settings are not undoable");
+    expect(afterSettings.background).toBe("white");
+    const viewport = await mcp.call("set_viewport", { documentId: afterSettings.documentId, expectedViewRevision: afterSettings.viewRevision, action: "set", x: -200, y: -100, zoom: 1.25 });
+    expect(viewport.error).toBeUndefined();
+    const viewportResult = JSON.parse(viewport.result.content[0].text);
+    expect(viewportResult.viewport).toMatchObject({ x: -200, y: -100, zoom: 1.25 });
+    expect(viewportResult.viewRevision).toBeGreaterThan(afterSettings.viewRevision);
 
     // A later human history operation invalidates the MCP undo token. The MCP
     // request must fail closed instead of consuming this subsequent editor work.
@@ -1641,6 +1677,9 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
     const savedFile = JSON.parse(await readFile(join(directory, "stdio-roundtrip.draw"), "utf8"));
     expect(savedFile.format).toBe("draw");
     expect(savedFile.document.elements.some((element: any) => element.id === created.nodes.first)).toBe(true);
+    const collision = await mcp.call("save_document", { path: "stdio-roundtrip.draw", documentId: current.documentId, expectedDocumentRevision: current.documentRevision });
+    expect(collision.result?.isError).toBe(true);
+    expect(JSON.stringify(collision)).toMatch(/PATH_EXISTS/);
 
     const exportedResponse = await mcp.call("export_image", { documentId: current.documentId, format: "png", scope: "canvas" });
     expect(exportedResponse.error).toBeUndefined();
@@ -1661,6 +1700,10 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
     expect(openResponse.error).toBeUndefined();
     expect(JSON.parse(openResponse.result.content[0].text).opened).toBe(true);
     await expect.poll(async () => (await (await page.request.get("/__draw/api/document?flush=1")).json()).document.elements.some((element: any) => element.id === created.nodes.first)).toBe(true);
+    const reopened = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    expect(reopened.documentRevision).toBeGreaterThan(current.documentRevision);
+    const reusedToken = await mcp.call("open_document", { path: "stdio-roundtrip.draw", documentId: reopened.documentId, expectedDocumentRevision: reopened.documentRevision, confirmationToken: approvedChallenge.confirmationToken });
+    expect(JSON.parse(reusedToken.result.content[0].text).status).toBe("EXPIRED");
     const unsafe = await mcp.call("open_document", { path: "../outside.draw", documentId: current.documentId, expectedDocumentRevision: current.documentRevision });
     expect(unsafe.result?.isError ?? unsafe.error !== undefined).toBeTruthy();
   } finally {
