@@ -250,9 +250,11 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
             }
             const result = await authManager.requestFreshLaunchCode();
             if (result !== "ISSUED") {
-              sendJson(response, result === "LOCKED" ? 429 : 503, {
+              sendJson(response, result === "LOCKED" || result === "THROTTLED" ? 429 : 503, {
                 status: result,
-                error: "No fresh code was issued. Start Draw from a trusted interactive terminal and check that terminal.",
+                error: result === "THROTTLED"
+                  ? "A code was requested recently. Wait before requesting another code."
+                  : "No code was issued. Start Draw from a trusted interactive terminal and check that terminal.",
               });
               return;
             }

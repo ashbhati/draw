@@ -4,6 +4,8 @@ import { dirname, join } from "node:path";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 
 const LAUNCH_CODE_TTL_MS = 60_000;
+const REISSUE_THROTTLE_MS = 5_000;
+const RETIRED_CODE_TTL_MS = 5 * 60_000;
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCKOUT_MS = 15 * 60_000;
 
@@ -20,7 +22,7 @@ export type EditorAuthResult =
 
 export type EditorAuthManager = {
   exchangeLaunchCode: (code: unknown, clientId: string) => Promise<EditorAuthResult>;
-  requestFreshLaunchCode: () => Promise<"ISSUED" | "LOCKED" | "UNAVAILABLE">;
+  requestFreshLaunchCode: () => Promise<"ISSUED" | "LOCKED" | "THROTTLED" | "UNAVAILABLE">;
   authorize: (clientId: unknown, editorSecret: unknown) => boolean;
   getActiveClientId: () => string | null;
   revokeEditorSession: () => void;
@@ -77,8 +79,22 @@ export async function createEditorAuthManager(options: EditorAuthOptions): Promi
   let launchCode: string | null = null;
   let launchCodeExpiresAt = 0;
   let launchCodeAvailable = false;
+  let lastReissueAt: number | null = null;
+  const retiredLaunchCodes = new Map<string, number>();
   let active: { clientId: string; secret: string } | null = null;
   let exchangeQueue = Promise.resolve();
+
+  const retireLaunchCode = (code: string | null, retiredAt = now()) => {
+    if (code) retiredLaunchCodes.set(code, retiredAt + RETIRED_CODE_TTL_MS);
+    for (const [retiredCode, expiresAt] of retiredLaunchCodes) {
+      if (expiresAt <= retiredAt) retiredLaunchCodes.delete(retiredCode);
+    }
+    while (retiredLaunchCodes.size > 256) {
+      const oldest = retiredLaunchCodes.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      retiredLaunchCodes.delete(oldest);
+    }
+  };
 
   const issueLaunchCode = () => {
     launchCode = null;
@@ -112,7 +128,18 @@ export async function createEditorAuthManager(options: EditorAuthOptions): Promi
           await store.save(persisted);
         }
         if (now() < persisted.lockedUntil) return "LOCKED" as const;
+        if (lastReissueAt !== null && currentTime - lastReissueAt < REISSUE_THROTTLE_MS) return "THROTTLED" as const;
+        if (launchCodeAvailable && launchCode && currentTime < launchCodeExpiresAt) {
+          if (options.displayLaunchCode(launchCode) === false) return "UNAVAILABLE" as const;
+          lastReissueAt = currentTime;
+          return "ISSUED" as const;
+        }
+        if (launchCode) retireLaunchCode(launchCode, currentTime);
+        launchCode = null;
+        launchCodeExpiresAt = 0;
+        launchCodeAvailable = false;
         issueLaunchCode();
+        if (launchCodeAvailable) lastReissueAt = currentTime;
         return launchCodeAvailable ? "ISSUED" as const : "UNAVAILABLE" as const;
       });
       exchangeQueue = next.then(() => undefined, () => undefined);
@@ -132,7 +159,10 @@ export async function createEditorAuthManager(options: EditorAuthOptions): Promi
         await store.save(persisted);
       }
       if (currentTime < persisted.lockedUntil) return { status: "LOCKED" };
+      retireLaunchCode(null, currentTime);
+      if (typeof code === "string" && retiredLaunchCodes.has(code)) return { status: "EXPIRED" };
       if (launchCode && currentTime >= launchCodeExpiresAt) {
+        retireLaunchCode(launchCode, currentTime);
         launchCode = null;
         launchCodeExpiresAt = 0;
         launchCodeAvailable = false;
@@ -146,6 +176,7 @@ export async function createEditorAuthManager(options: EditorAuthOptions): Promi
         persisted = { ...persisted, failedAttempts: persisted.failedAttempts + 1 };
         if (persisted.failedAttempts >= MAX_FAILED_ATTEMPTS) {
           persisted = { failedAttempts: MAX_FAILED_ATTEMPTS, lockedUntil: currentTime + LOCKOUT_MS };
+          retireLaunchCode(launchCode, currentTime);
           launchCode = null;
           launchCodeExpiresAt = 0;
           launchCodeAvailable = false;
@@ -157,6 +188,7 @@ export async function createEditorAuthManager(options: EditorAuthOptions): Promi
       }
 
       // Consume before rotating. A successful bootstrap cannot be replayed.
+      retireLaunchCode(launchCode, currentTime);
       launchCode = null;
       launchCodeExpiresAt = 0;
       active = { clientId, secret: generateSecret() };

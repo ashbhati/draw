@@ -30,9 +30,34 @@ describe("editor session authentication", () => {
     expect(auth.authorize("tab-a", "tab-secret-256-bit")).toBe(true);
     expect(auth.authorize("tab-b", "tab-secret-256-bit")).toBe(false);
     expect(auth.authorize("tab-a", "wrong-secret")).toBe(false);
-    expect((await auth.exchangeLaunchCode("ABCDEF123456", "tab-a")).status).toBe("INVALID");
+    expect(await auth.exchangeLaunchCode("ABCDEF123456", "tab-a")).toEqual({ status: "EXPIRED" });
+    expect(store.save).toHaveBeenLastCalledWith({ failedAttempts: 0, lockedUntil: 0 });
     expect(terminalCodes).toEqual(["ABCDEF123456", "FEDCBA654321"]);
     expect(store.save).toHaveBeenCalled();
+  });
+
+  it("reprints a live code without rotating it and throttles repeated reissue requests", async () => {
+    let now = 1_000;
+    const generated = vi.fn().mockReturnValueOnce("ABCDEF123456").mockReturnValueOnce("FEDCBA654321");
+    const displayed: string[] = [];
+    const auth = await createEditorAuthManager({
+      now: () => now,
+      generateLaunchCode: generated,
+      generateSecret: () => "tab-secret",
+      displayLaunchCode: (code) => { displayed.push(code); },
+      store: createMemoryStore(),
+    });
+
+    expect(await auth.requestFreshLaunchCode()).toBe("ISSUED");
+    expect(displayed).toEqual(["ABCDEF123456", "ABCDEF123456"]);
+    expect(generated).toHaveBeenCalledTimes(1);
+    expect(await auth.requestFreshLaunchCode()).toBe("THROTTLED");
+    expect(displayed).toEqual(["ABCDEF123456", "ABCDEF123456"]);
+    expect(generated).toHaveBeenCalledTimes(1);
+
+    expect((await auth.exchangeLaunchCode("ABCDEF123456", "tab-a")).status).toBe("AUTHENTICATED");
+    expect(displayed.at(-1)).toBe("FEDCBA654321");
+    expect(await auth.exchangeLaunchCode("ABCDEF123456", "tab-b")).toEqual({ status: "EXPIRED" });
   });
 
   it("expires codes without charging a failed attempt and permits a human-requested reissue", async () => {

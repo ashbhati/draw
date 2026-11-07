@@ -286,7 +286,7 @@ describe("Draw MCP Vite bridge", () => {
     expect((await bridge.editorRequest("live-tab", "POST", `/__draw/api/confirmations/${token}/respond`, { clientId: "live-tab", approved: true })).body.status).toBe("APPROVED");
   });
 
-  it("prints a fresh code only to the trusted terminal without returning it over HTTP", async () => {
+  it("reprints the active code without rotating it, throttles repeated reissue, and keeps it off HTTP", async () => {
     const bridge = createBridgeHarness();
     const initial = await bridge.registerClient("tab-a");
     expect(initial.response.status).toBe(200);
@@ -298,9 +298,14 @@ describe("Draw MCP Vite bridge", () => {
     expect(requested.status).toBe(200);
     expect(requested.body).toEqual({ status: "ISSUED" });
     const freshCode = bridge.getLaunchCode();
-    expect(freshCode).not.toBe(oldCode);
+    expect(freshCode).toBe(oldCode);
     expect(JSON.stringify(requested.body)).not.toContain(freshCode);
     expect((await bridge.editorRequest("tab-a", "PUT", "/__draw/api/document", { clientId: "tab-a", document: createEmptyDocument("Still active") })).status).toBe(200);
+
+    const repeated = await bridge.reissueCode();
+    expect(repeated.status).toBe(429);
+    expect(repeated.body.status).toBe("THROTTLED");
+    expect(bridge.getLaunchCode()).toBe(oldCode);
 
     const takeover = await bridge.registerClient("tab-b");
     expect(takeover.response.status).toBe(200);
