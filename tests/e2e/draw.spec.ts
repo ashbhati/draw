@@ -211,8 +211,8 @@ async function inspectBlackboardImage(page: Page, image: Buffer, mimeType: "imag
   }, { encodedImage: image.toString("base64"), mime: mimeType, checkHorizontalSeam: includeHorizontalSeam });
 }
 
-async function inspectCompactBlackboardImage(page: Page, image: Buffer, mimeType: "image/png" | "image/jpeg") {
-  return page.evaluate(async ({ encodedImage, mime }) => {
+async function inspectCompactBlackboardImage(page: Page, image: Buffer, mimeType: "image/png" | "image/jpeg", matchingLivePatch = false) {
+  return page.evaluate(async ({ encodedImage, mime, matchingLivePatch }) => {
     const binary = atob(encodedImage);
     const bytes = new Uint8Array(binary.length);
     for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
@@ -229,9 +229,12 @@ async function inspectCompactBlackboardImage(page: Page, image: Buffer, mimeType
       return data[offset] * 0.2126 + data[offset + 1] * 0.7152 + data[offset + 2] * 0.0722;
     };
     const board: number[] = [];
-    // Sample horizontal canvas bands above and below the compact flow. This
-    // avoids diagram strokes and tests the exposed texture itself.
-    for (const [left, right, top, bottom] of [[0.03, 0.97, 0.03, 0.14], [0.03, 0.97, 0.86, 0.97]] as const) {
+    // When comparing live and exported texture, sample the same empty top-right
+    // board patch. Otherwise, sample bands above and below a compact flow.
+    const boardRegions = matchingLivePatch
+      ? [[0.82, 0.95, 0.05, 0.16]] as const
+      : [[0.03, 0.97, 0.03, 0.14], [0.03, 0.97, 0.86, 0.97]] as const;
+    for (const [left, right, top, bottom] of boardRegions) {
       for (let y = Math.floor(bitmap.height * top); y < Math.floor(bitmap.height * bottom); y += 3) {
         for (let x = Math.floor(bitmap.width * left); x < Math.floor(bitmap.width * right); x += 3) board.push(luma(x, y));
       }
@@ -247,7 +250,7 @@ async function inspectCompactBlackboardImage(page: Page, image: Buffer, mimeType
       return count;
     });
     return { width: bitmap.width, height: bitmap.height, mean, standardDeviation, palettePixels };
-  }, { encodedImage: image.toString("base64"), mime: mimeType });
+  }, { encodedImage: image.toString("base64"), mime: mimeType, matchingLivePatch });
 }
 
 function maxChannelDifference(a: readonly number[], b: readonly number[]): number {
@@ -517,6 +520,10 @@ test("natural Blackboard texture stays subdued behind a compact three-node flow 
     return current.document.elements.filter((element: any) => element.type === "arrow").length;
   }).toBe(2);
 
+  await page.setViewportSize({ width: 1280, height: 360 });
+  await page.locator(".draw-app").evaluate((element) => { (element as HTMLElement).style.minHeight = "0"; });
+  await page.addStyleTag({ content: ".editor-shell button,.editor-shell [role=button],.editor-shell [role=toolbar],.editor-shell .App-menu_top,.editor-shell .App-menu_bottom{visibility:hidden!important}" });
+  await page.waitForTimeout(100);
   const textureURL = await page.locator(".editor-shell").evaluate((element) => getComputedStyle(element).backgroundImage);
   expect(textureURL, "live canvas uses the bundled natural texture").toContain("blackboard-texture");
   const liveShot = await page.locator(".editor-shell").screenshot();
@@ -528,21 +535,30 @@ test("natural Blackboard texture stays subdued behind a compact three-node flow 
   await page.locator("button.export-main").click();
   const jpeg = await readFile(await (await jpegDownloadWait).path());
 
-  const [pngPixels, jpegPixels] = await Promise.all([
-    inspectCompactBlackboardImage(page, png, "image/png"),
-    inspectCompactBlackboardImage(page, jpeg, "image/jpeg"),
+  const [livePixels, pngPixels, jpegPixels] = await Promise.all([
+    inspectCompactBlackboardImage(page, liveShot, "image/png", true),
+    inspectCompactBlackboardImage(page, png, "image/png", true),
+    inspectCompactBlackboardImage(page, jpeg, "image/jpeg", true),
   ]);
-  expect(liveShot.length, "live Blackboard preview is captured").toBeGreaterThan(10000);
-  for (const [format, pixels] of [["PNG", pngPixels], ["JPEG", jpegPixels]] as const) {
+  expect(livePixels.width / livePixels.height, "live preview and exports use comparable cover scales").toBeGreaterThan(pngPixels.width / pngPixels.height - 1);
+  expect(livePixels.width / livePixels.height, "live preview and exports use comparable cover scales").toBeLessThan(pngPixels.width / pngPixels.height + 1);
+  for (const [format, pixels] of [["live", livePixels], ["PNG", pngPixels], ["JPEG", jpegPixels]] as const) {
     expect(pixels.width, `${format} is a compact diagram export`).toBeLessThan(1800);
     expect(pixels.height).toBeLessThan(1200);
   }
-  for (const [format, pixels] of [["PNG", pngPixels], ["JPEG", jpegPixels]] as const) {
+  for (const [format, pixels] of [["live", livePixels], ["PNG", pngPixels], ["JPEG", jpegPixels]] as const) {
     expect(pixels.mean, `${format} remains a dark slate`).toBeGreaterThan(18);
     expect(pixels.mean, `${format} remains a dark slate`).toBeLessThan(90);
     expect(pixels.standardDeviation, `${format} exposed slate is not flat`).toBeGreaterThan(2.5);
+    expect(pixels.standardDeviation, `${format} slate texture remains subdued`).toBeLessThan(25);
+  }
+  for (const [format, pixels] of [["PNG", pngPixels], ["JPEG", jpegPixels]] as const) {
     expect(pixels.palettePixels.every((count) => count > 8), `${format} keeps colored strokes and connectors visible`).toBe(true);
   }
+  expect(Math.abs(pngPixels.mean - livePixels.mean), "PNG and live share the same board tone").toBeLessThan(14);
+  expect(Math.abs(jpegPixels.mean - livePixels.mean), "JPEG and live share the same board tone").toBeLessThan(14);
+  expect(Math.abs(pngPixels.standardDeviation - livePixels.standardDeviation), "PNG and live share the same texture strength").toBeLessThan(8);
+  expect(Math.abs(jpegPixels.standardDeviation - livePixels.standardDeviation), "JPEG and live share the same texture strength").toBeLessThan(8);
   expect(Math.abs(pngPixels.mean - jpegPixels.mean), "PNG and JPEG retain similar board tone").toBeLessThan(8);
   expect(Math.abs(pngPixels.standardDeviation - jpegPixels.standardDeviation), "PNG and JPEG retain similar texture strength").toBeLessThan(6);
 });
