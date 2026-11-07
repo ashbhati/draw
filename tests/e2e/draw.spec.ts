@@ -1036,9 +1036,10 @@ test("blackboard background survives reload and is present in PNG and JPEG expor
   expect(response.ok()).toBeTruthy();
 
   for (const [mimeType, signature] of [["image/png", "89504e470d0a1a0a"], ["image/jpeg", "ffd8ff"]] as const) {
-    await page.getByLabel("Image export format").selectOption(mimeType);
+    const formatControl = page.getByLabel("Image export format");
     const downloadWait = page.waitForEvent("download");
-    await page.locator("button.export-main").click();
+    if (await formatControl.inputValue() === mimeType) await page.locator("button.export-main").click();
+    else await formatControl.selectOption(mimeType); // Changing format exports immediately.
     const download = await downloadWait;
     const image = await readFile(await download.path());
     expect(image.subarray(0, signature.length / 2).toString("hex")).toBe(signature);
@@ -1665,7 +1666,14 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
 
     // A later human history operation invalidates the MCP undo token. The MCP
     // request must fail closed instead of consuming this subsequent editor work.
+    const preHumanAction = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
     await page.getByRole("button", { name: "Undo" }).click();
+    const staleAfterHumanUndo = await mcp.call("update_elements", {
+      documentId: preHumanAction.documentId,
+      expectedDocumentRevision: preHumanAction.documentRevision,
+      updates: [{ id: created.nodes.first, patch: { x: 333 } }],
+    });
+    expect(staleAfterHumanUndo.result?.isError).toBe(true);
     const afterHumanUndo = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
     const unsafeUndo = await mcp.call("undo_operation", { documentId: afterHumanUndo.documentId, operationId: edited.operationId, expectedDocumentRevision: afterHumanUndo.documentRevision });
     expect(unsafeUndo.result?.isError).toBe(true);
