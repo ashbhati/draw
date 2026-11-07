@@ -140,4 +140,88 @@ describe("MCP tool input contract", () => {
       }),
     ).toThrow(/unsupported update field/i);
   });
+
+  it("accepts native standalone text, line, arrow, and freehand elements", () => {
+    expect(parseMcpToolInput("create_elements", {
+      elements: [
+        { id: "title", type: "text", x: 20, y: 30, text: "Decision point", fontSize: 24 },
+        { id: "connector", type: "line", x: 10, y: 80, points: [[0, 0], [120, 30]] },
+        { id: "flow", type: "arrow", x: 10, y: 140, points: [[0, 0], [120, 30]], endArrowhead: "arrow" },
+        { id: "chalk", type: "freedraw", x: 10, y: 200, points: [[0, 0], [24, 12], [48, 0]] },
+      ],
+    })).toEqual({
+      operation: "create_elements",
+      input: { elements: [
+        { id: "title", type: "text", x: 20, y: 30, text: "Decision point", fontSize: 24 },
+        { id: "connector", type: "line", x: 10, y: 80, points: [[0, 0], [120, 30]] },
+        { id: "flow", type: "arrow", x: 10, y: 140, points: [[0, 0], [120, 30]], endArrowhead: "arrow" },
+        { id: "chalk", type: "freedraw", x: 10, y: 200, points: [[0, 0], [24, 12], [48, 0]] },
+      ] },
+    });
+  });
+
+  it("accepts wrapped text, shape labels, arrow labels, and endpoint bindings", () => {
+    const command = parseMcpToolInput("create_elements", { elements: [
+      { id: "source", type: "rectangle", x: 0, y: 0, label: "Source" },
+      { id: "target", type: "ellipse", x: 260, y: 0 },
+      { id: "note", type: "text", x: 0, y: 120, text: "A long note", maxWidth: 320 },
+      { id: "connection", type: "arrow", x: 180, y: 36, points: [[0, 0], [80, 0]], start: "source", end: "target", label: "feeds" },
+    ] });
+    expect(command).toMatchObject({
+      operation: "create_elements",
+      input: { elements: [
+        { id: "source", type: "rectangle", label: "Source" },
+        { id: "target", type: "ellipse" },
+        { id: "note", type: "text", maxWidth: 320 },
+        { id: "connection", type: "arrow", start: "source", end: "target", label: "feeds" },
+      ] },
+    });
+  });
+
+  it("rejects pressure values on lines and arrows and rejects zero-length paths", () => {
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "line", type: "line", x: 0, y: 0, points: [[0, 0, 0.5], [10, 10, 0.5]] },
+    ] })).toThrow(/pressure is only supported for freedraw/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "arrow", type: "arrow", x: 0, y: 0, points: [[0, 0], [10, 10, 0.5]] },
+    ] })).toThrow(/pressure is only supported for freedraw/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "line", type: "line", x: 0, y: 0, points: [[5, 5], [5, 5]] },
+    ] })).toThrow(/zero-length/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "arrow", type: "arrow", x: 0, y: 0, points: [[5, 5], [5, 5]] },
+    ] })).toThrow(/zero-length/i);
+  });
+
+  it("allows unbound arrows and requires both endpoints for a bound arrow", () => {
+    expect(parseMcpToolInput("create_elements", { elements: [
+      { id: "free", type: "arrow", x: 10, y: 20, points: [[0, 0], [80, 20]] },
+    ] })).toMatchObject({ input: { elements: [{ id: "free", type: "arrow" }] } });
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "partial", type: "arrow", x: 10, y: 20, points: [[0, 0], [80, 20]], start: "shape" },
+    ] })).toThrow(/must supply both start and end/i);
+  });
+
+  it("rejects malformed primitive geometry and duplicate input IDs", () => {
+    expect(() => parseMcpToolInput("create_elements", { elements: [] })).toThrow(/at least one element/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "dup", type: "text", x: 0, y: 0, text: "A" },
+      { id: "dup", type: "text", x: 0, y: 0, text: "B" },
+    ] })).toThrow(/duplicate/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "bad", type: "freedraw", x: 0, y: 0, points: [[0, 0]] },
+    ] })).toThrow(/between 2 and/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "bad", type: "shape", x: 0, y: 0, width: 20, height: 20 },
+    ] })).toThrow(/type is unsupported/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "bad", type: "text", x: 0, y: 0, text: "A", strokeWidth: 2 },
+    ] })).toThrow(/unsupported field/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "bad", type: "rectangle", x: 0, y: 0, strokeColor: "transparent" },
+    ] })).toThrow(/six-digit hex/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "bad", type: "arrow", x: 0, y: 0, points: [[0, 0], [10, 0]], start: "missing", end: "also-missing" },
+    ] })).toThrow(/reference valid shapes/i);
+  });
 });

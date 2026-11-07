@@ -24,6 +24,32 @@ export type CreateDiagramInput = {
   edges: DiagramEdgeInput[];
 };
 
+export type DrawPrimitiveType = "rectangle" | "ellipse" | "diamond" | "text" | "line" | "arrow" | "freedraw";
+export type PrimitivePoint = [number, number] | [number, number, number];
+export type DrawPrimitiveInput = {
+  id: string;
+  type: DrawPrimitiveType;
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+  text?: string;
+  fontSize?: number;
+  maxWidth?: number;
+  label?: string;
+  start?: string;
+  end?: string;
+  points?: PrimitivePoint[];
+  strokeColor?: string;
+  backgroundColor?: string;
+  strokeWidth?: number;
+  strokeStyle?: "solid" | "dashed" | "dotted";
+  fillStyle?: "solid" | "hachure" | "cross-hatch" | "zigzag" | "dots";
+  roughness?: 0 | 1 | 2;
+  endArrowhead?: "arrow" | "bar" | "dot" | "triangle" | null;
+};
+export type CreateElementsInput = { elements: DrawPrimitiveInput[] };
+
 export type ElementUpdateInput = {
   id: string;
   patch: {
@@ -41,6 +67,7 @@ export type UpdateElementsInput = { updates: ElementUpdateInput[] };
 
 export type McpCommand =
   | { operation: "create_diagram"; input: CreateDiagramInput }
+  | { operation: "create_elements"; input: CreateElementsInput }
   | { operation: "update_elements"; input: UpdateElementsInput };
 
 export class McpValidationError extends Error {
@@ -52,6 +79,8 @@ export class McpValidationError extends Error {
 
 const MAX_NODES = 100;
 const MAX_EDGES = 200;
+const MAX_PRIMITIVES = 100;
+const MAX_POINTS = 2_000;
 const MAX_TEXT_LENGTH = 500;
 const MAX_COORDINATE = 100_000;
 const COLOR_PATTERN = /^#[\da-f]{6}$/i;
@@ -97,6 +126,153 @@ function optionalColor(value: unknown, label: string): string | undefined {
     throw new McpValidationError(`${label} must be a six-digit hex color such as #f3c94c.`);
   }
   return value;
+}
+
+function optionalBackgroundColor(value: unknown, label: string): string | undefined {
+  if (value === undefined || value === "transparent") return value;
+  return optionalColor(value, label);
+}
+
+function parsePrimitivePoints(value: unknown, label: string, allowPressure: boolean): PrimitivePoint[] {
+  if (!Array.isArray(value) || value.length < 2 || value.length > MAX_POINTS) {
+    throw new McpValidationError(`${label} must contain between 2 and ${MAX_POINTS} points.`);
+  }
+  const points = value.map((rawPoint, index): PrimitivePoint => {
+    if (!Array.isArray(rawPoint) || (rawPoint.length !== 2 && rawPoint.length !== 3)) {
+      throw new McpValidationError(`${label}[${index}] must contain x, y, and optional pressure values.`);
+    }
+    if (rawPoint.length === 3 && !allowPressure) {
+      throw new McpValidationError(`${label}[${index}] pressure is only supported for freedraw elements.`);
+    }
+    const x = requireFiniteCoordinate(rawPoint[0], `${label}[${index}].x`);
+    const y = requireFiniteCoordinate(rawPoint[1], `${label}[${index}].y`);
+    if (rawPoint.length === 3) {
+      if (typeof rawPoint[2] !== "number" || !Number.isFinite(rawPoint[2]) || rawPoint[2] < 0 || rawPoint[2] > 1) {
+        throw new McpValidationError(`${label}[${index}].pressure must be a finite number between 0 and 1.`);
+      }
+      return [x, y, rawPoint[2]];
+    }
+    return [x, y];
+  });
+  if (new Set(points.map(([x, y]) => `${x},${y}`)).size < 2) {
+    throw new McpValidationError(`${label} must describe a non-zero-length path.`);
+  }
+  return points;
+}
+
+function parseCreateElements(value: unknown): CreateElementsInput {
+  const input = requireRecord(value, "create_elements input");
+  if (!Array.isArray(input.elements) || input.elements.length < 1 || input.elements.length > MAX_PRIMITIVES) {
+    throw new McpValidationError(`elements must contain at least one element and no more than ${MAX_PRIMITIVES} items.`);
+  }
+  const ids = new Set<string>();
+  const elements = input.elements.map((rawElement, index): DrawPrimitiveInput => {
+    const element = requireRecord(rawElement, `elements[${index}]`);
+    const id = requireString(element.id, `elements[${index}].id`, 100);
+    if (ids.has(id)) throw new McpValidationError(`duplicate element id "${id}".`);
+    ids.add(id);
+    const type = element.type;
+    const supportedTypes: DrawPrimitiveType[] = ["rectangle", "ellipse", "diamond", "text", "line", "arrow", "freedraw"];
+    if (typeof type !== "string" || !supportedTypes.includes(type as DrawPrimitiveType)) {
+      throw new McpValidationError(`elements[${index}].type is unsupported. Use rectangle, ellipse, diamond, text, line, arrow, or freedraw.`);
+    }
+    const baseFields = ["id", "type", "x", "y", "strokeColor"];
+    const shapeFields = ["width", "height", "strokeWidth", "strokeStyle", "roughness", "backgroundColor", "fillStyle", "label"];
+    const pathFields = ["points", "strokeWidth", "strokeStyle", "roughness"];
+    const allowedFields = new Set([
+      ...baseFields,
+      ...(type === "rectangle" || type === "ellipse" || type === "diamond" ? shapeFields : []),
+      ...(type === "text" ? ["text", "fontSize", "maxWidth"] : []),
+      ...(type === "line" || type === "freedraw" ? pathFields : []),
+      ...(type === "arrow" ? [...pathFields, "endArrowhead", "start", "end", "label"] : []),
+    ]);
+    for (const field of Object.keys(element)) {
+      if (!allowedFields.has(field)) throw new McpValidationError(`elements[${index}] has unsupported field "${field}" for ${type}.`);
+    }
+    const parsed: DrawPrimitiveInput = {
+      id,
+      type: type as DrawPrimitiveType,
+      x: requireFiniteCoordinate(element.x, `elements[${index}].x`),
+      y: requireFiniteCoordinate(element.y, `elements[${index}].y`),
+    };
+    if (element.width !== undefined) parsed.width = optionalDimension(element.width, `elements[${index}].width`);
+    if (element.height !== undefined) parsed.height = optionalDimension(element.height, `elements[${index}].height`);
+    if (element.strokeColor !== undefined) parsed.strokeColor = optionalColor(element.strokeColor, `elements[${index}].strokeColor`);
+    if (element.backgroundColor !== undefined) parsed.backgroundColor = optionalBackgroundColor(element.backgroundColor, `elements[${index}].backgroundColor`);
+    if (element.strokeWidth !== undefined) {
+      if (typeof element.strokeWidth !== "number" || !Number.isFinite(element.strokeWidth) || element.strokeWidth < 1 || element.strokeWidth > 8) {
+        throw new McpValidationError(`elements[${index}].strokeWidth must be between 1 and 8.`);
+      }
+      parsed.strokeWidth = element.strokeWidth;
+    }
+    if (element.strokeStyle !== undefined) {
+      if (element.strokeStyle !== "solid" && element.strokeStyle !== "dashed" && element.strokeStyle !== "dotted") {
+        throw new McpValidationError(`elements[${index}].strokeStyle must be solid, dashed, or dotted.`);
+      }
+      parsed.strokeStyle = element.strokeStyle;
+    }
+    if (element.fillStyle !== undefined) {
+      if (!["solid", "hachure", "cross-hatch", "zigzag", "dots"].includes(element.fillStyle as string)) {
+        throw new McpValidationError(`elements[${index}].fillStyle is unsupported.`);
+      }
+      parsed.fillStyle = element.fillStyle as DrawPrimitiveInput["fillStyle"];
+    }
+    if (element.roughness !== undefined) {
+      if (element.roughness !== 0 && element.roughness !== 1 && element.roughness !== 2) {
+        throw new McpValidationError(`elements[${index}].roughness must be 0, 1, or 2.`);
+      }
+      parsed.roughness = element.roughness;
+    }
+    if (type === "text") {
+      if (element.width !== undefined || element.height !== undefined || element.backgroundColor !== undefined || element.fillStyle !== undefined || element.points !== undefined || element.endArrowhead !== undefined || element.strokeWidth !== undefined || element.strokeStyle !== undefined || element.roughness !== undefined) {
+        throw new McpValidationError(`elements[${index}] has fields that are not valid for text.`);
+      }
+      parsed.text = requireString(element.text, `elements[${index}].text`);
+      if (element.fontSize !== undefined) {
+        if (typeof element.fontSize !== "number" || !Number.isFinite(element.fontSize) || element.fontSize < 8 || element.fontSize > 128) {
+          throw new McpValidationError(`elements[${index}].fontSize must be between 8 and 128.`);
+        }
+        parsed.fontSize = element.fontSize;
+      }
+      if (element.maxWidth !== undefined) parsed.maxWidth = optionalDimension(element.maxWidth, `elements[${index}].maxWidth`);
+    } else if (type === "rectangle" || type === "ellipse" || type === "diamond") {
+      if (element.label !== undefined) parsed.label = requireString(element.label, `elements[${index}].label`);
+    } else if (type === "line" || type === "arrow" || type === "freedraw") {
+      if (element.width !== undefined || element.height !== undefined || element.backgroundColor !== undefined || element.fillStyle !== undefined || element.text !== undefined || element.fontSize !== undefined) {
+        throw new McpValidationError(`elements[${index}] has fields that are not valid for ${type}.`);
+      }
+      parsed.points = parsePrimitivePoints(element.points, `elements[${index}].points`, type === "freedraw");
+      if (element.endArrowhead !== undefined) {
+        if (type !== "arrow") throw new McpValidationError(`elements[${index}].endArrowhead is only valid for arrow elements.`);
+        if (element.endArrowhead !== null && !["arrow", "bar", "dot", "triangle"].includes(element.endArrowhead as string)) {
+          throw new McpValidationError(`elements[${index}].endArrowhead is unsupported.`);
+        }
+        parsed.endArrowhead = element.endArrowhead as DrawPrimitiveInput["endArrowhead"];
+      }
+      if (type === "arrow") {
+        if ((element.start === undefined) !== (element.end === undefined)) {
+          throw new McpValidationError(`elements[${index}] must supply both start and end when binding arrow endpoints.`);
+        }
+        if (element.start !== undefined) parsed.start = requireString(element.start, `elements[${index}].start`, 100);
+        if (element.end !== undefined) parsed.end = requireString(element.end, `elements[${index}].end`, 100);
+        if (element.label !== undefined) parsed.label = requireString(element.label, `elements[${index}].label`);
+      }
+    } else if (element.text !== undefined || element.points !== undefined || element.fontSize !== undefined || element.endArrowhead !== undefined) {
+      throw new McpValidationError(`elements[${index}] has fields that are not valid for ${type}.`);
+    }
+    return parsed;
+  });
+  const typeById = new Map(elements.map(({ id, type }) => [id, type]));
+  for (const element of elements) {
+    if (element.type !== "arrow" || element.start === undefined || element.end === undefined) continue;
+    const startType = typeById.get(element.start);
+    const endType = typeById.get(element.end);
+    const isShape = (candidate: DrawPrimitiveType | undefined) => candidate === "rectangle" || candidate === "ellipse" || candidate === "diamond";
+    if (!isShape(startType) || !isShape(endType)) {
+      throw new McpValidationError(`Arrow "${element.id}" endpoints must reference valid shapes from this create_elements call.`);
+    }
+  }
+  return { elements };
 }
 
 function parseCreateDiagram(value: unknown): CreateDiagramInput {
@@ -199,6 +375,9 @@ export function parseMcpToolInput(
 ): McpCommand {
   if (name === "create_diagram") {
     return { operation: "create_diagram", input: parseCreateDiagram(input) };
+  }
+  if (name === "create_elements") {
+    return { operation: "create_elements", input: parseCreateElements(input) };
   }
   if (name === "update_elements") {
     return { operation: "update_elements", input: parseUpdateElements(input) };

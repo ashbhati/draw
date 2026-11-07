@@ -129,7 +129,7 @@ function refreshUpdatedText(
   }
 }
 
-function wrapTextToWidth(text: string, maxWidth: number, measureLine: (text: string) => number): string {
+export function wrapTextToWidth(text: string, maxWidth: number, measureLine: (text: string) => number): string {
   return text.split("\n").map((paragraph) => {
     const words = paragraph.split(/\s+/).filter(Boolean);
     if (words.length === 0) return "";

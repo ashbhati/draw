@@ -1015,6 +1015,112 @@ test("fresh MCP canvas reads flush a just-drawn freehand edit", async ({ page })
   expect(current.document.elements.some((element: any) => element.type === "freedraw" && element.isDeleted !== true)).toBe(true);
 });
 
+test("MCP creates rendered editable primitives with relationships that stay editable after reopen", async ({ page }) => {
+  await page.getByRole("button", { name: "Whiteboard", exact: true }).click();
+  const response = await page.request.post(commandApi, { data: {
+    operation: "create_elements",
+    input: { elements: [
+      { id: "box", type: "rectangle", x: 100, y: 100, width: 140, height: 72, strokeColor: "#e64b45", label: "Source" },
+      { id: "oval", type: "ellipse", x: 400, y: 100, width: 120, height: 72, strokeColor: "#54ae66", label: "Target" },
+      { id: "decision", type: "diamond", x: 600, y: 100, width: 120, height: 72, fillStyle: "hachure", strokeColor: "#2f86c9" },
+      { id: "caption", type: "text", x: 100, y: 250, text: "A long agent-authored note that wraps within its maximum width", maxWidth: 220, fontSize: 24, strokeColor: "#d946ef" },
+      { id: "connector", type: "line", x: 100, y: 360, points: [[0, 0], [120, 40]], strokeStyle: "dashed", strokeColor: "#0077cc" },
+      { id: "flow", type: "arrow", x: 170, y: 136, points: [[0, 0], [290, 0]], start: "box", end: "oval", label: "feeds", endArrowhead: "triangle", strokeColor: "#ca52de" },
+      { id: "chalk", type: "freedraw", x: 300, y: 360, points: [[-10, 5], [0, 12], [10, 25, 0.7]], strokeColor: "#00a86b" },
+    ] },
+  } });
+  expect(response.ok(), await response.text()).toBeTruthy();
+  const created = await response.json();
+  expect(created.result.elementIds).toMatchObject({ box: expect.any(String), oval: expect.any(String), decision: expect.any(String), caption: expect.any(String), connector: expect.any(String), flow: expect.any(String), chalk: expect.any(String) });
+  expect(created.result.addedElementIds).toHaveLength(10);
+  expect(created.result.addedElementIds).toEqual(expect.arrayContaining([
+    ...Object.values(created.result.elementIds), ...Object.values(created.result.labelElementIds),
+  ]));
+
+  const current = await freshBridgeDocument(page);
+  const byInputId = Object.fromEntries(Object.entries(created.result.elementIds).map(([key, id]) => [key, current.document.elements.find((element: any) => element.id === id)]));
+  expect(byInputId.box).toMatchObject({ type: "rectangle", width: 140, height: 72, strokeColor: "#e64b45", backgroundColor: "#ffffff" });
+  expect(byInputId.oval).toMatchObject({ type: "ellipse", width: 120, height: 72, strokeColor: "#54ae66", backgroundColor: "#ffffff" });
+  expect(byInputId.decision).toMatchObject({ type: "diamond", fillStyle: "hachure", strokeColor: "#2f86c9", backgroundColor: "#ffffff" });
+  expect(byInputId.caption).toMatchObject({ type: "text", originalText: "A long agent-authored note that wraps within its maximum width", fontSize: 24 });
+  expect(byInputId.caption.text).toContain("\n");
+  expect(byInputId.caption.width).toBeLessThanOrEqual(222);
+  expect(byInputId.connector).toMatchObject({ type: "line", strokeStyle: "dashed", width: 120, height: 40, strokeColor: "#0077cc" });
+  expect(byInputId.flow).toMatchObject({ type: "arrow", endArrowhead: "triangle", startBinding: { elementId: created.result.elementIds.box }, endBinding: { elementId: created.result.elementIds.oval } });
+  expect(byInputId.chalk).toMatchObject({ type: "freedraw" });
+  expect(byInputId.chalk.points).toHaveLength(3);
+  expect(byInputId.chalk.width).toBeGreaterThan(0);
+  expect(byInputId.chalk.height).toBeGreaterThan(0);
+  expect(byInputId.chalk.points.every((point: number[]) => point.length === 2)).toBe(true);
+  expect(byInputId.chalk.pressures).toEqual([0.5, 0.5, 0.7]);
+  expect(byInputId.chalk.simulatePressure).toBe(false);
+
+  const sourceLabelId = created.result.labelElementIds.box;
+  const arrowLabelId = created.result.labelElementIds.flow;
+  expect(sourceLabelId).toBeTruthy();
+  expect(arrowLabelId).toBeTruthy();
+  expect(current.document.elements.find((element: any) => element.id === sourceLabelId)).toMatchObject({ type: "text", containerId: created.result.elementIds.box, text: "Source" });
+  expect(current.document.elements.find((element: any) => element.id === arrowLabelId)).toMatchObject({ type: "text", containerId: created.result.elementIds.flow, text: "feeds" });
+  expect(byInputId.box.boundElements).toContainEqual({ id: sourceLabelId, type: "text" });
+  expect(created.result.elements.find((element: any) => element.id === "flow")).toMatchObject({ startElementId: created.result.elementIds.box, endElementId: created.result.elementIds.oval, labelElementId: arrowLabelId });
+
+  await page.getByRole("button", { name: "Undo" }).click();
+  await expect.poll(async () => {
+    const undone = await freshBridgeDocument(page);
+    return Object.values(created.result.elementIds).some((id: any) => undone.document.elements.some((element: any) => element.id === id && element.isDeleted !== true));
+  }).toBe(false);
+  await page.getByRole("button", { name: "Redo" }).click();
+  await expect.poll(async () => {
+    const redone = await freshBridgeDocument(page);
+    return Object.values(created.result.elementIds).every((id: any) => redone.document.elements.some((element: any) => element.id === id && element.isDeleted !== true));
+  }).toBe(true);
+
+  const downloadWait = page.waitForEvent("download");
+  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  const drawBuffer = await readFile(await (await downloadWait).path());
+  const saved = JSON.parse(drawBuffer.toString("utf8"));
+  expect(saved.format).toBe("draw");
+  for (const id of Object.values(created.result.elementIds)) {
+    expect(saved.document.elements.some((element: any) => element.id === id && element.isDeleted !== true)).toBe(true);
+  }
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.locator('input[type="file"]').setInputFiles({ name: "mcp-primitives.draw", mimeType: "application/vnd.draw+json", buffer: drawBuffer });
+  await expect.poll(async () => {
+    const reopened = await freshBridgeDocument(page);
+    return Object.values(created.result.elementIds).every((id: any) => reopened.document.elements.some((element: any) => element.id === id && element.isDeleted !== true));
+  }).toBe(true);
+
+  const canvas = page.locator(".excalidraw canvas").last();
+  const bounds = await canvas.boundingBox();
+  if (!bounds) throw new Error("Could not locate the drawing canvas.");
+  const view = current.document.appState;
+  const zoom = typeof view.zoom?.value === "number" ? view.zoom.value : 1;
+  const screenX = bounds.x + (byInputId.caption.x + (view.scrollX ?? 0) + 10) * zoom;
+  const screenY = bounds.y + (byInputId.caption.y + (view.scrollY ?? 0) + 10) * zoom;
+  await page.mouse.click(screenX, screenY);
+  await expect.poll(async () => (await freshBridgeDocument(page)).document.appState.selectedElementIds?.[created.result.elementIds.caption]).toBe(true);
+  await page.keyboard.press("Enter");
+  const editor = page.locator(".excalidraw textarea").last();
+  await expect(editor).toBeVisible();
+  await editor.fill("Edited by a human after reopening");
+  await page.keyboard.press("Control+Enter");
+  await expect.poll(async () => {
+    const edited = await freshBridgeDocument(page);
+    return edited.document.elements.some((element: any) => element.id === created.result.elementIds.caption && element.text === "Edited by a human after reopening");
+  }).toBe(true);
+
+  const pngWait = page.waitForEvent("download");
+  await page.locator("button.export-main").click();
+  const image = await readFile(await (await pngWait).path());
+  const swatches: Array<[string, [number, number, number]]> = [
+    ["rectangle", [230, 75, 69]], ["ellipse", [84, 174, 102]], ["diamond", [47, 134, 201]],
+    ["text", [217, 70, 239]], ["line", [0, 119, 204]], ["arrow", [202, 82, 222]], ["freedraw", [0, 168, 107]],
+  ];
+  for (const [name, rgb] of swatches) {
+    expect(await countPixelsNear(page, image, rgb, 26), `${name} is visibly rendered in the PNG`).toBeGreaterThan(8);
+  }
+});
+
 test("one infinite canvas pans and zooms across multiple independent diagrams", async ({ page }) => {
   const response = await page.request.post(commandApi, { data: {
     operation: "create_diagram",

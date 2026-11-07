@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { applyElementUpdates, routeBoundArrows } from "./scene-updates";
+import { applyElementUpdates, routeBoundArrows, wrapTextToWidth } from "./scene-updates";
 
 describe("MCP scene updates", () => {
+  it("wraps standalone text within an explicit maximum width while preserving paragraphs", () => {
+    const measure = (text: string) => text.length * 10;
+    const wrapped = wrapTextToWidth("A long label that should wrap\nsecond paragraph", 100, measure);
+    expect(wrapped.split("\n").every((line) => measure(line) <= 100)).toBe(true);
+    expect(wrapped.replace(/\n/g, " ").replace(/\s+/g, " ")).toBe("A long label that should wrap second paragraph");
+    expect(wrapTextToWidth("supercalifragilistic", 50, measure).split("\n").every((line) => measure(line) <= 50)).toBe(true);
+  });
+
   it("moves container labels and recomputes both ends of connected arrows", () => {
     const scene = [
       { id: "a", type: "rectangle", x: 0, y: 0, width: 100, height: 80, version: 1, versionNonce: 10, boundElements: [{ id: "label-a", type: "text" }, { id: "arrow", type: "arrow" }] },
