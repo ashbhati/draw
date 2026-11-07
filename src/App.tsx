@@ -126,6 +126,8 @@ export default function App() {
   const [message, setMessage] = useState("");
   const [confirmation, setConfirmation] = useState<BridgeConfirmation | null>(null);
   const [autosaveBlocked, setAutosaveBlocked] = useState(false);
+  const autosaveBlockedRef = useRef(autosaveBlocked);
+  autosaveBlockedRef.current = autosaveBlocked;
   const [canWrite, setCanWrite] = useState(false);
   const [editorKey, setEditorKey] = useState(0);
   const [exportScope, setExportScope] = useState<"canvas" | "selection">("canvas");
@@ -303,7 +305,7 @@ export default function App() {
         if (!latest) return;
         const settled = { ...latest, document: { ...latest.document, viewRevision: latest.document.viewRevision + 1 } };
         setDocument(settled);
-        if (!autosaveBlocked) {
+        if (!autosaveBlockedRef.current) {
           autosave.schedule(settled);
           bridgeAutosave.schedule(settled);
         }

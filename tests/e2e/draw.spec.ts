@@ -1207,6 +1207,37 @@ test("one infinite canvas pans and zooms across multiple independent diagrams", 
   expect(panned.document.elements.some((element: any) => element.id === created.result.nodes.far)).toBe(true);
 });
 
+test("rapid Chrome pan events debounce viewport revision and preserve scene revision", async ({ page }) => {
+  await freshBridgeDocument(page);
+  const initial = await currentBridgeDocument(page);
+  await page.clock.install();
+  const canvas = page.locator(".excalidraw canvas").first();
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error("The editor canvas is not visible.");
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  for (let index = 0; index < 8; index += 1) await page.mouse.wheel(0, 60);
+
+  await page.clock.runFor(249);
+  const beforeSettle = await currentBridgeDocument(page);
+  expect(beforeSettle.document.documentRevision).toBe(initial.document.documentRevision);
+  expect(beforeSettle.document.viewRevision).toBe(initial.document.viewRevision);
+
+  await page.clock.runFor(351);
+  const settled = await currentBridgeDocument(page);
+  expect(settled.document.documentRevision).toBe(initial.document.documentRevision);
+  expect(settled.document.viewRevision).toBe(initial.document.viewRevision + 1);
+  expect(settled.document.canvas.viewport).not.toEqual(initial.document.canvas.viewport);
+
+  await page.mouse.wheel(0, 90);
+  await page.clock.runFor(249);
+  const beforeSecondSettle = await currentBridgeDocument(page);
+  expect(beforeSecondSettle.document.viewRevision).toBe(settled.document.viewRevision);
+  await page.clock.runFor(351);
+  const secondSettled = await currentBridgeDocument(page);
+  expect(secondSettled.document.documentRevision).toBe(initial.document.documentRevision);
+  expect(secondSettled.document.viewRevision).toBe(settled.document.viewRevision + 1);
+});
+
 test("a reloaded .draw node remains selectable and manually editable", async ({ page }) => {
   const response = await page.request.post(commandApi, { data: {
     operation: "create_diagram",
@@ -1502,13 +1533,13 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
   await expect.poll(async () => Object.keys((await freshBridgeDocument(page)).document.appState.selectedElementIds ?? {}).length).toBeGreaterThan(0);
   const exportScene = await freshBridgeDocument(page);
   const liveElements = exportScene.document.elements.filter((element: any) => element.isDeleted !== true);
-  const sceneBounds = liveElements.reduce((bounds: { left: number; top: number; right: number; bottom: number }, element: any) => {
-    const left = Math.min(element.x, element.x + element.width, ...(element.points ?? []).map((point: number[]) => element.x + point[0]));
-    const top = Math.min(element.y, element.y + element.height, ...(element.points ?? []).map((point: number[]) => element.y + point[1]));
-    const right = Math.max(element.x, element.x + element.width, ...(element.points ?? []).map((point: number[]) => element.x + point[0]));
-    const bottom = Math.max(element.y, element.y + element.height, ...(element.points ?? []).map((point: number[]) => element.y + point[1]));
-    return { left: Math.min(bounds.left, left), top: Math.min(bounds.top, top), right: Math.max(bounds.right, right), bottom: Math.max(bounds.bottom, bottom) };
-  }, { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity });
+  const sceneBounds = await page.evaluate(async (elements) => {
+    // Use Excalidraw's renderer bounds so curved paths, line caps and
+    // arrowheads match the same geometry used by exportToSvg.
+    const { getCommonBounds } = await import("/node_modules/.vite/deps/@excalidraw_excalidraw.js");
+    const [left, top, right, bottom] = getCommonBounds(elements as any);
+    return { left, top, right, bottom };
+  }, liveElements);
   const exportOrigin = { x: sceneBounds.left - 32, y: sceneBounds.top - 32 };
   const nodeLabels = ["First node", "Second node"].map((label) => {
     const element = liveElements.find((candidate: any) => candidate.type === "text" && candidate.text?.includes(label));
@@ -1558,9 +1589,7 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
         expect(await countInkInSceneRegion(page, image, mime, arrowRegion, exportOrigin, "whiteboard-mark"), `${mime} should render its arrow on Whiteboard`).toBeGreaterThan(0);
       }
       expect(Math.abs(sample.width - (sceneBounds.right - sceneBounds.left + 64)), `${mime} width should equal scene bounds plus 32px padding on each side`).toBeLessThanOrEqual(3);
-      // The image renderer includes arrowhead geometry beyond the stored path
-      // points; allow its roughly 13px extension on either vertical edge.
-      expect(Math.abs(sample.height - (sceneBounds.bottom - sceneBounds.top + 64)), `${mime} height should include scene bounds, padding, and arrowhead extents`).toBeLessThanOrEqual(30);
+      expect(Math.abs(sample.height - (sceneBounds.bottom - sceneBounds.top + 64)), `${mime} height should equal renderer scene bounds plus 32px padding on each side`).toBeLessThanOrEqual(3);
     }
   }
 
