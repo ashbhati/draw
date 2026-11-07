@@ -22,6 +22,7 @@ export type CreateDiagramInput = {
   title?: string;
   documentId?: string;
   expectedDocumentRevision?: number;
+  idempotencyKey: string;
   nodes: DiagramNodeInput[];
   edges: DiagramEdgeInput[];
 };
@@ -50,7 +51,7 @@ export type DrawPrimitiveInput = {
   roughness?: 0 | 1 | 2;
   endArrowhead?: "arrow" | "bar" | "dot" | "triangle" | null;
 };
-export type CreateElementsInput = { elements: DrawPrimitiveInput[]; documentId?: string; expectedDocumentRevision?: number };
+export type CreateElementsInput = { elements: DrawPrimitiveInput[]; documentId?: string; expectedDocumentRevision?: number; idempotencyKey: string };
 
 export type ElementUpdateInput = {
   id: string;
@@ -65,19 +66,19 @@ export type ElementUpdateInput = {
   };
 };
 
-export type UpdateElementsInput = { updates: ElementUpdateInput[]; documentId?: string; expectedDocumentRevision?: number };
+export type UpdateElementsInput = { updates: ElementUpdateInput[]; documentId?: string; expectedDocumentRevision?: number; idempotencyKey: string };
 
-export type SceneIdsInput = { documentId: string; expectedDocumentRevision: number; ids: string[] };
+export type SceneIdsInput = { documentId: string; expectedDocumentRevision: number; idempotencyKey: string; ids: string[] };
 export type ArrangeElementsInput = SceneIdsInput & {
   action: "bring_to_front" | "send_to_back" | "align" | "distribute";
   alignment?: "left" | "right" | "top" | "bottom" | "center_x" | "center_y";
   axis?: "horizontal" | "vertical";
 };
 export type CanvasSettingsInput = {
-  documentId: string; expectedDocumentRevision: number; title?: string; background?: "blackboard" | "white";
+  documentId: string; expectedDocumentRevision: number; idempotencyKey: string; title?: string; background?: "blackboard" | "white";
 };
 export type ViewportInput = {
-  documentId: string; expectedViewRevision: number;
+  documentId: string; expectedViewRevision: number; idempotencyKey: string;
   action: "fit_content" | "set"; x?: number; y?: number; zoom?: number;
 };
 export type OpenDocumentInput = { path: string; documentId: string; expectedDocumentRevision: number; confirmationToken?: string };
@@ -97,7 +98,7 @@ export type McpCommand =
   | { operation: "group_elements"; input: SceneIdsInput }
   | { operation: "ungroup_elements"; input: SceneIdsInput }
   | { operation: "arrange_elements"; input: ArrangeElementsInput }
-  | { operation: "undo_operation" | "redo_operation"; input: { documentId: string; operationId: string; expectedDocumentRevision: number } }
+  | { operation: "undo_operation" | "redo_operation"; input: { documentId: string; operationId: string; expectedDocumentRevision: number; idempotencyKey: string } }
   | { operation: "set_canvas_settings"; input: CanvasSettingsInput }
   | { operation: "set_viewport"; input: ViewportInput }
   | { operation: "open_document"; input: OpenDocumentInput; document?: DrawDocument }
@@ -134,6 +135,10 @@ function requireString(value: unknown, label: string, maxLength = MAX_TEXT_LENGT
   }
   if (value.length > maxLength) throw new McpValidationError(`${label} exceeds ${maxLength} characters.`);
   return value;
+}
+
+function requireIdempotencyKey(input: Record<string, unknown>, label: string): string {
+  return requireString(input.idempotencyKey, `${label}.idempotencyKey`, 200);
 }
 
 function requireFiniteCoordinate(value: unknown, label: string): number {
@@ -315,7 +320,7 @@ function parseCreateElements(value: unknown): CreateElementsInput {
       throw new McpValidationError(`Arrow "${element.id}" endpoints must reference valid shapes from this create_elements call.`);
     }
   }
-  return { ...optionalRevisionContext(input, "create_elements"), elements };
+  return { ...optionalRevisionContext(input, "create_elements"), idempotencyKey: requireIdempotencyKey(input, "create_elements"), elements };
 }
 
 function parseCreateDiagram(value: unknown): CreateDiagramInput {
@@ -365,7 +370,7 @@ function parseCreateDiagram(value: unknown): CreateDiagramInput {
     };
   });
 
-  return { ...optionalRevisionContext(input, "create_diagram"), ...(title !== undefined ? { title } : {}), nodes, edges };
+  return { ...optionalRevisionContext(input, "create_diagram"), idempotencyKey: requireIdempotencyKey(input, "create_diagram"), ...(title !== undefined ? { title } : {}), nodes, edges };
 }
 
 const UPDATE_FIELDS = new Set(["text", "x", "y", "width", "height", "strokeColor", "backgroundColor"]);
@@ -409,7 +414,7 @@ function parseUpdateElements(value: unknown): UpdateElementsInput {
     }
     return { id, patch: normalized };
   });
-  return { ...optionalRevisionContext(input, "update_elements"), updates };
+  return { ...optionalRevisionContext(input, "update_elements"), idempotencyKey: requireIdempotencyKey(input, "update_elements"), updates };
 }
 
 function parseSceneIds(value: unknown, label: string, allowEmpty = false): SceneIdsInput & { ids: string[] } {
@@ -423,7 +428,7 @@ function parseSceneIds(value: unknown, label: string, allowEmpty = false): Scene
   }
   const ids = input.ids.map((id, index) => requireString(id, `${label}.ids[${index}]`, 200));
   if (new Set(ids).size !== ids.length) throw new McpValidationError(`${label}.ids cannot contain duplicates.`);
-  return { documentId, expectedDocumentRevision: input.expectedDocumentRevision as number, ids };
+  return { documentId, expectedDocumentRevision: input.expectedDocumentRevision as number, idempotencyKey: requireIdempotencyKey(input, label), ids };
 }
 
 function parseRelativeFileName(value: unknown, label: string, allowedExtensions: string[]): string {
@@ -479,6 +484,7 @@ function parseSceneTool(name: string, value: unknown): McpCommand | null {
       documentId: requireString(input.documentId, `${name}.documentId`, 200),
       operationId: requireString(input.operationId, `${name}.operationId`, 200),
       expectedDocumentRevision: input.expectedDocumentRevision as number,
+      idempotencyKey: requireIdempotencyKey(input, name),
     } };
   }
   if (name === "set_canvas_settings") {
@@ -493,6 +499,7 @@ function parseSceneTool(name: string, value: unknown): McpCommand | null {
     return { operation: name, input: {
       documentId: requireString(input.documentId, `${name}.documentId`, 200),
       expectedDocumentRevision: input.expectedDocumentRevision as number,
+      idempotencyKey: requireIdempotencyKey(input, name),
       ...(input.title !== undefined ? { title: requireString(input.title, `${name}.title`, 200) } : {}),
       ...(input.background !== undefined ? { background: input.background as CanvasSettingsInput["background"] } : {}),
     } };
@@ -513,6 +520,7 @@ function parseSceneTool(name: string, value: unknown): McpCommand | null {
     return { operation: name, input: {
       documentId: requireString(input.documentId, `${name}.documentId`, 200),
       expectedViewRevision: input.expectedViewRevision as number,
+      idempotencyKey: requireIdempotencyKey(input, name),
       action: input.action,
       ...(input.action === "set" ? { x: input.x as number, y: input.y as number, zoom: input.zoom as number } : {}),
     } };

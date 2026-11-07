@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { parseMcpToolInput, summarizeCurrentCanvas } from "./mcp-contract";
+import { parseMcpToolInput as parseMcpToolInputImpl, summarizeCurrentCanvas } from "./mcp-contract";
+
+function parseMcpToolInput(name: string, input: any) {
+  const mutating = ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "undo_operation", "redo_operation", "set_canvas_settings"].includes(name);
+  return parseMcpToolInputImpl(name, mutating && input && input.idempotencyKey === undefined ? { ...input, idempotencyKey: "test-idempotency-key" } : input);
+}
 
 describe("MCP tool input contract", () => {
   it("summarizes active elements and keeps the newest IDs in large canvases", () => {
@@ -91,6 +96,7 @@ describe("MCP tool input contract", () => {
     ).toEqual({
       operation: "create_diagram",
       input: {
+        idempotencyKey: "test-idempotency-key",
         title: "Spec to validation",
         nodes: [
           { id: "spec", label: "Specification\nWhat & why", x: 40, y: 60, shape: "rectangle", color: "#f3c94c" },
@@ -136,7 +142,7 @@ describe("MCP tool input contract", () => {
       }),
     ).toEqual({
       operation: "update_elements",
-      input: { updates: [{ id: "el-1", patch: { text: "Validation", x: 220, strokeColor: "#f3c94c" } }] },
+      input: { idempotencyKey: "test-idempotency-key", updates: [{ id: "el-1", patch: { text: "Validation", x: 220, strokeColor: "#f3c94c" } }] },
     });
     expect(() =>
       parseMcpToolInput("update_elements", {
@@ -148,7 +154,7 @@ describe("MCP tool input contract", () => {
   it("validates scene editing inputs with explicit document revisions", () => {
     expect(parseMcpToolInput("delete_elements", {
       documentId: "doc-1", expectedDocumentRevision: 4, ids: ["a", "b"],
-    })).toEqual({ operation: "delete_elements", input: { documentId: "doc-1", expectedDocumentRevision: 4, ids: ["a", "b"] } });
+    })).toEqual({ operation: "delete_elements", input: { documentId: "doc-1", expectedDocumentRevision: 4, idempotencyKey: "test-idempotency-key", ids: ["a", "b"] } });
     expect(() => parseMcpToolInput("delete_elements", {
       documentId: "doc-1", expectedDocumentRevision: 4, ids: ["a", "a"],
     })).toThrow(/duplicates/i);
@@ -162,11 +168,14 @@ describe("MCP tool input contract", () => {
       documentId: "doc-1", expectedDocumentRevision: 2, background: "white", title: "Updated",
     })).toMatchObject({ operation: "set_canvas_settings", input: { background: "white", title: "Updated" } });
     expect(parseMcpToolInput("set_viewport", {
-      documentId: "doc-1", expectedViewRevision: 1, action: "set", x: -120, y: 30, zoom: 1.25,
+      documentId: "doc-1", expectedViewRevision: 1, idempotencyKey: "viewport-1", action: "set", x: -120, y: 30, zoom: 1.25,
     })).toMatchObject({ operation: "set_viewport", input: { x: -120, y: 30, zoom: 1.25 } });
     expect(() => parseMcpToolInput("set_viewport", {
-      documentId: "doc-1", expectedViewRevision: 1, action: "set", x: 0, y: 0, zoom: 20,
+      documentId: "doc-1", expectedViewRevision: 1, idempotencyKey: "viewport-invalid", action: "set", x: 0, y: 0, zoom: 20,
     })).toThrow(/zoom/i);
+    expect(() => parseMcpToolInput("set_viewport", {
+      documentId: "doc-1", expectedViewRevision: 1, action: "set", x: 0, y: 0, zoom: 1,
+    })).toThrow(/idempotencyKey/i);
   });
 
   it("rejects absolute paths, traversal and mismatched file extensions", () => {
@@ -188,7 +197,7 @@ describe("MCP tool input contract", () => {
       ],
     })).toEqual({
       operation: "create_elements",
-      input: { elements: [
+      input: { idempotencyKey: "test-idempotency-key", elements: [
         { id: "title", type: "text", x: 20, y: 30, text: "Decision point", fontSize: 24 },
         { id: "connector", type: "line", x: 10, y: 80, points: [[0, 0], [120, 30]] },
         { id: "flow", type: "arrow", x: 10, y: 140, points: [[0, 0], [120, 30]], endArrowhead: "arrow" },

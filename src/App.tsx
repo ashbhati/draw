@@ -12,7 +12,7 @@ import {
 } from "./document/document";
 import { composeBackgroundSvg, hasSelectedExportElements, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorForBackgroundPreset } from "./export/background-recolor";
-import { saveCurrentDocument, loadCurrentDocument } from "./ui/storage";
+import { saveCurrentDocument, loadCurrentDocument, commitMcpOperation, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation } from "./ui/storage";
 import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
 import { createDebouncedSaver } from "./ui/autosave";
@@ -25,6 +25,7 @@ import { applySceneEdit } from "./integrations/scene-operations";
 import { hasSceneContentChanged, sceneElementsChanged } from "./integrations/scene-revision";
 import { rebaseOpenedDocument, shouldRequireOpenConfirmation } from "./document/open-safety";
 import { canRestoreCancelledMcpCommand } from "./integrations/mcp-cancellation";
+import { canRedoMcpOperation, canUndoMcpOperation, hashMcpOperation, resolveOperationReplay, type DurableMcpOperation } from "./integrations/operation-ledger";
 
 type Status = "loading" | "ready" | "saving" | "saved" | "error";
 type BridgeCommand = { id: string; clientId: string; clientIdentity: string; operation: string; input: any; document?: DrawDocument };
@@ -266,6 +267,13 @@ export default function App() {
           const stored = await loadCurrentDocument();
           if (!live) return;
           setDocument(stored ?? createEmptyDocument());
+          if (stored) {
+            const latestUndo = await loadLatestMcpUndoOperation(stored.document.id);
+            if (!live) return;
+            if (latestUndo && canUndoMcpOperation(latestUndo, latestUndo.clientIdentity, { id: stored.document.id, documentRevision: stored.document.documentRevision })) {
+              lastMcpOperation.current = { id: latestUndo.operationId, revision: latestUndo.resultingRevision };
+            }
+          }
           setStatus(lock.acquired ? "ready" : "error");
         } catch (error) {
           if (!live) return;
@@ -398,7 +406,7 @@ export default function App() {
     setStatus("ready"); setMessage(""); setEditorKey((key) => key + 1);
     setAutosaveBlocked(false);
     try {
-      await saveCurrentDocument(opened);
+      await saveCurrentDocument(opened, { replaceDocument: true });
       setStatus("saved");
       await syncBridgeDocument(opened);
     } catch (error) {
@@ -615,11 +623,61 @@ export default function App() {
       return;
     }
     const api = apiRef.current;
-    const current = docRef.current;
+    let current = docRef.current;
     if (!api || !current || !editorSecret.current || event.clientId !== clientId.current) return;
+    const durableMutation = ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "set_canvas_settings", "set_viewport", "undo_operation", "redo_operation"].includes(event.operation);
+    let operationHash: string | null = null;
+    try {
+      if (durableMutation) {
+        await Promise.all([autosave.flush(), bridgeAutosave.flush()]);
+        current = docRef.current;
+        if (!current) throw new Error("The active Draw document changed before the MCP operation could commit.");
+        if (typeof event.input.idempotencyKey !== "string" || !event.input.idempotencyKey) throw new Error("A stable idempotencyKey is required for this mutation; reuse it only when retrying the same request.");
+        operationHash = await hashMcpOperation(event.operation, event.input);
+        const existing = await loadMcpOperation(current.document.id, event.clientIdentity, event.input.idempotencyKey);
+        const replay = resolveOperationReplay(existing, {
+          clientIdentity: event.clientIdentity,
+          idempotencyKey: event.input.idempotencyKey,
+          payloadHash: operationHash,
+          now: Date.now(),
+        });
+        if (replay.kind === "conflict") throw new Error("IDEMPOTENCY_KEY_REUSE: This key was already used with a different operation payload.");
+        if (replay.kind === "unknown") throw new Error("OUTCOME_UNKNOWN: This operation result expired. Read the current canvas and reconcile before creating a new request.");
+        if (replay.kind === "replay") {
+          const acknowledgement = await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
+            method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current },
+            body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, document: current, result: replay.result }),
+          });
+          if (!acknowledgement.ok) throw new Error(`Draw MCP bridge rejected the replay acknowledgement (HTTP ${acknowledgement.status}).`);
+          return;
+        }
+        if (event.operation === "set_viewport" && event.input.expectedViewRevision !== current.document.viewRevision) {
+          throw new Error(`CONFLICT: Current view revision is ${current.document.viewRevision}, expected ${event.input.expectedViewRevision}.`);
+        }
+      }
+    } catch (error) {
+      await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
+        method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current },
+        body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, error: error instanceof Error ? error.message : String(error) }),
+      }).catch(() => undefined);
+      return;
+    }
     const commandStartElements = structuredClone([...api.getSceneElementsIncludingDeleted()]) as any[];
     const commandStartAppState = api.getAppState() as any;
     const commandStartSelection = structuredClone(commandStartAppState.selectedElementIds ?? {});
+    let commandAppState: Record<string, unknown> = { selectedElementIds: commandStartSelection };
+    let filesToRestore: any[] | null = null;
+    let committedOperationId: string | null = null;
+    const restoreCommandStartViewport = () => {
+      api.updateScene({
+        appState: {
+          scrollX: commandStartAppState.scrollX,
+          scrollY: commandStartAppState.scrollY,
+          zoom: commandStartAppState.zoom,
+        },
+        captureUpdate: CaptureUpdateAction.NEVER,
+      });
+    };
     const restoreRevokedCommand = async (commandResult: DrawDocument | null) => {
       const liveState = api.getAppState() as any;
       const liveViewport = {
@@ -628,7 +686,14 @@ export default function App() {
         zoom: typeof liveState.zoom?.value === "number" ? liveState.zoom.value : current.document.canvas.viewport.zoom,
       };
       const liveSelection = (liveState.selectedElementIds ?? {}) as Record<string, boolean>;
-      if (!commandResult || !canRestoreCancelledMcpCommand(current, commandResult, docRef.current, liveViewport, liveSelection)) return false;
+      const guardAllowsRestore = Boolean(commandResult && canRestoreCancelledMcpCommand(current, commandResult, docRef.current, liveViewport, liveSelection));
+      if (!guardAllowsRestore || !commandResult || !committedOperationId) return false;
+      const restoredStorage = await restoreMcpCommandSnapshot(current, commandResult, {
+        clientIdentity: event.clientIdentity,
+        idempotencyKey: event.input.idempotencyKey,
+        operationId: committedOperationId,
+      }, { preserveHistory: event.operation === "set_viewport" });
+      if (!restoredStorage) return false;
       // Update the mounted scene in place. Remounting Excalidraw resets its
       // history and selection; CaptureUpdateAction.NEVER keeps rollback out
       // of the user's undo stack. The MCP edit's own history entry can make
@@ -649,10 +714,25 @@ export default function App() {
       autosave.schedule(current);
       bridgeAutosave.schedule(current);
       await Promise.all([autosave.flush(), bridgeAutosave.flush()]).catch(() => undefined);
+      await syncBridgeDocument(current).catch(() => undefined);
+      setMessage("The revoked MCP command was rolled back; your selection and undo history were preserved.");
       return true;
     };
     let applied: { document: DrawDocument; result: Record<string, unknown> } | null = null;
     let commandResult: DrawDocument | null = null;
+    let editorLockedForCommit = false;
+    const unlockEditorAfterCommit = async () => {
+      if (!editorLockedForCommit) return;
+      api.updateScene({ appState: { viewModeEnabled: false }, captureUpdate: CaptureUpdateAction.NEVER });
+      editorLockedForCommit = false;
+      if (Object.values(commandStartSelection).some(Boolean)) {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        const activeSelection = (api.getAppState() as any).selectedElementIds ?? {};
+        if (!Object.values(activeSelection).some(Boolean)) {
+          api.updateScene({ appState: { selectedElementIds: commandStartSelection }, captureUpdate: CaptureUpdateAction.NEVER });
+        }
+      }
+    };
     try {
       if (!writerOwned.current) throw new Error("This Draw tab is read-only because another tab owns the autosave lock.");
       if (autosaveBlocked) throw new Error("Local autosave is unavailable; open a saved .draw file before using MCP edits.");
@@ -769,6 +849,8 @@ export default function App() {
         });
         result = { title: nextDocument.document.title, background: nextDocument.document.canvas.background.preset };
       } else if (event.operation === "set_viewport") {
+        api.updateScene({ appState: { viewModeEnabled: true }, captureUpdate: CaptureUpdateAction.NEVER });
+        editorLockedForCommit = true;
         if (event.input.action === "fit_content") {
           const visible = api.getSceneElements();
           if (!visible.length) throw new Error("Cannot fit the viewport because the canvas has no elements.");
@@ -788,20 +870,50 @@ export default function App() {
         result = { viewport: nextDocument.document.canvas.viewport };
         captureUpdate = CaptureUpdateAction.NEVER;
       } else if (event.operation === "undo_operation" || event.operation === "redo_operation") {
-        const target = event.operation === "undo_operation" ? lastMcpOperation.current : lastUndoneOperation.current;
-        if (!target || target.id !== event.input.operationId) throw new Error(`CONFLICT: ${event.operation} may only affect the latest eligible MCP operation.`);
-        const beforeElements = structuredClone(elements);
-        const key = event.operation === "undo_operation" ? "z" : "z";
-        const undoEvent = new KeyboardEvent("keydown", { key, ctrlKey: true, metaKey: true, shiftKey: event.operation === "redo_operation", bubbles: true, cancelable: true });
-        (document.querySelector(".excalidraw") ?? document.activeElement ?? window).dispatchEvent(undoEvent);
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        elements = [...api.getSceneElementsIncludingDeleted()] as any[];
-        if (!sceneElementsChanged(beforeElements, elements)) {
-          lastMcpOperation.current = null;
+        if (event.operation === "redo_operation") {
+          const redoState = await loadLatestMcpRedoOperation(current.document.id);
+          if (!redoState || redoState.operation.operationId !== event.input.operationId || !canRedoMcpOperation(redoState, event.clientIdentity, { id: current.document.id, documentRevision: current.document.documentRevision })) {
+            throw new Error("CONFLICT: This MCP identity cannot redo that operation after a later scene change or another actor's operation.");
+          }
+          const afterScene = toExcalidrawScene(redoState.operation.afterDocument);
+          const liveAppState = api.getAppState() as any;
+          elements = afterScene.elements as any[];
+          filesToRestore = Object.values(afterScene.files);
+          commandAppState = {
+            ...afterScene.appState,
+            selectedElementIds: commandStartSelection,
+            scrollX: liveAppState.scrollX,
+            scrollY: liveAppState.scrollY,
+            zoom: liveAppState.zoom,
+          };
+          nextDocument = fromExcalidrawScene({ elements, appState: commandAppState, files: afterScene.files }, {
+            id: current.document.id,
+            title: redoState.operation.afterDocument.document.title,
+            documentRevision: current.document.documentRevision + 1,
+            viewRevision: current.document.viewRevision,
+            background: redoState.operation.afterDocument.document.canvas.background,
+            viewport: current.document.canvas.viewport,
+          });
+          result = { operationId: redoState.operation.operationId, redone: true, documentRevision: nextDocument.document.documentRevision };
+          lastMcpOperation.current = { id: redoState.operation.operationId, revision: nextDocument.document.documentRevision };
           lastUndoneOperation.current = null;
-          throw new Error(`CONFLICT: ${event.operation} did not produce a verifiable scene change.`);
+        } else {
+        const target = await loadLatestMcpUndoOperation(current.document.id);
+        if (!target || target.operationId !== event.input.operationId || !canUndoMcpOperation(target, event.clientIdentity, { id: current.document.id, documentRevision: current.document.documentRevision })) {
+          throw new Error("CONFLICT: This MCP identity cannot undo that operation because it is no longer the latest eligible change.");
         }
-        nextDocument = fromExcalidrawScene({ elements, appState: api.getAppState() as any, files: api.getFiles() }, {
+        const beforeScene = toExcalidrawScene(target.beforeDocument);
+        const liveAppState = api.getAppState() as any;
+        elements = beforeScene.elements as any[];
+        filesToRestore = Object.values(beforeScene.files);
+        commandAppState = {
+          ...beforeScene.appState,
+          selectedElementIds: commandStartSelection,
+          scrollX: liveAppState.scrollX,
+          scrollY: liveAppState.scrollY,
+          zoom: liveAppState.zoom,
+        };
+        nextDocument = fromExcalidrawScene({ elements, appState: commandAppState, files: beforeScene.files }, {
           id: current.document.id,
           title: current.document.title,
           documentRevision: current.document.documentRevision + 1,
@@ -809,13 +921,9 @@ export default function App() {
           background: current.document.canvas.background,
           viewport: current.document.canvas.viewport,
         });
-        result = { operationId: target.id, undone: event.operation === "undo_operation", documentRevision: nextDocument.document.documentRevision };
-        if (event.operation === "undo_operation") {
-          lastUndoneOperation.current = { id: target.id, revision: nextDocument.document.documentRevision };
-          lastMcpOperation.current = null;
-        } else {
-          lastMcpOperation.current = { id: target.id, revision: nextDocument.document.documentRevision };
-          lastUndoneOperation.current = null;
+        result = { operationId: target.operationId, undone: true, documentRevision: nextDocument.document.documentRevision };
+        lastUndoneOperation.current = { id: target.operationId, revision: nextDocument.document.documentRevision };
+        lastMcpOperation.current = null;
         }
       } else if (event.operation === "open_document") {
         if (!event.document) throw new Error("Open document command is missing its validated Draw file.");
@@ -857,16 +965,61 @@ export default function App() {
       if (!nextDocument) nextDocument = current;
       commandResult = nextDocument;
       if (revokedMcpCommandIds.current.has(event.id)) {
+        if (event.operation === "set_viewport") restoreCommandStartViewport();
         if (!await restoreRevokedCommand(commandResult)) setMessage("MCP client revoked after a newer canvas edit; that edit was preserved.");
         return;
       }
       const isTransient = event.operation === "export_image";
+      const durableOperationId = durableMutation ? randomId() : event.id;
+      result = {
+        ...result,
+        ...(event.operation === "undo_operation" ? {} : { operationId: durableOperationId }),
+        documentRevision: nextDocument.document.documentRevision,
+        viewRevision: nextDocument.document.viewRevision,
+      };
+      const undoEligible = ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "redo_operation"].includes(event.operation);
+      let persistenceWarning: string | undefined;
+      if (durableMutation) {
+        const record: DurableMcpOperation = {
+          documentId: nextDocument.document.id,
+          clientIdentity: event.clientIdentity,
+          idempotencyKey: event.input.idempotencyKey,
+          payloadHash: operationHash!,
+          operationId: durableOperationId,
+          actor: event.clientIdentity,
+          baseRevision: current.document.documentRevision,
+          resultingRevision: nextDocument.document.documentRevision,
+          baseViewRevision: current.document.viewRevision,
+          resultingViewRevision: nextDocument.document.viewRevision,
+          result: { ...result, persisted: true },
+          beforeDocument: current,
+          afterDocument: nextDocument,
+          undoEligible,
+          completedAt: Date.now(),
+        };
+        // Temporarily make the mounted editor read-only while the atomic local
+        // commit is pending, so a human edit cannot race the revision snapshot.
+        api.updateScene({ appState: { viewModeEnabled: true }, captureUpdate: CaptureUpdateAction.NEVER });
+        editorLockedForCommit = true;
+        await commitMcpOperation(nextDocument, record, event.operation === "undo_operation"
+          ? { undoTarget: { operationId: event.input.operationId, clientIdentity: event.clientIdentity } }
+          : event.operation === "redo_operation"
+            ? { redoTarget: { operationId: event.input.operationId, clientIdentity: event.clientIdentity } }
+            : { invalidateUndo: !undoEligible && event.operation !== "set_viewport" });
+        committedOperationId = durableOperationId;
+        if (undoEligible) lastMcpOperation.current = { id: durableOperationId, revision: nextDocument.document.documentRevision };
+        else if (event.operation === "set_canvas_settings" || event.operation === "undo_operation") lastMcpOperation.current = null;
+        if (event.operation !== "undo_operation") lastUndoneOperation.current = null;
+      }
       setDocument(nextDocument);
-      if (event.operation !== "open_document" && event.operation !== "undo_operation" && event.operation !== "redo_operation") {
+      if (event.operation !== "open_document") {
+        if (filesToRestore) api.addFiles(filesToRestore as any);
         api.updateScene({
           elements,
           appState: {
-            selectedElementIds: commandStartSelection,
+            ...commandAppState,
+            viewModeEnabled: false,
+          selectedElementIds: commandStartSelection,
             ...(event.operation === "set_canvas_settings" ? {
               viewBackgroundColor: nextDocument.document.appState.viewBackgroundColor,
               currentItemStrokeColor: nextDocument.document.appState.currentItemStrokeColor,
@@ -875,40 +1028,65 @@ export default function App() {
           captureUpdate,
         });
       }
-      result = { ...result, operationId: event.id, documentRevision: nextDocument.document.documentRevision, viewRevision: nextDocument.document.viewRevision };
-      if (!isTransient && ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements"].includes(event.operation)) {
-        lastMcpOperation.current = { id: event.id, revision: nextDocument.document.documentRevision };
-        lastUndoneOperation.current = null;
+      if (!durableMutation) {
+        applied = { document: nextDocument, result };
+        persistenceWarning = await persistAppliedDocument(nextDocument, saveCurrentDocument, syncBridgeDocument);
+      } else applied = { document: nextDocument, result };
+      // The IndexedDB transaction is the durable commit point. Once that
+      // scene is installed, let the human keep editing while bridge sync and
+      // acknowledgement are in flight; revocation rollback uses semantic
+      // scene and selection guards to preserve any newer human state.
+      if (editorLockedForCommit) {
+        await unlockEditorAfterCommit();
       }
-      applied = { document: nextDocument, result };
-      const warning = await persistAppliedDocument(
-        nextDocument,
-        saveCurrentDocument,
-        syncBridgeDocument,
-      );
+      if (durableMutation) {
+        try {
+          await syncBridgeDocument(nextDocument);
+        } catch (error) {
+          persistenceWarning = `MCP bridge sync failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      }
       if (revokedMcpCommandIds.current.has(event.id)) {
+        await unlockEditorAfterCommit();
         if (!await restoreRevokedCommand(commandResult)) setMessage("MCP client revoked after a newer canvas edit; that edit was preserved.");
         return;
       }
-      if (warning) {
+      editorLockedForCommit = false;
+      if (persistenceWarning) {
         setStatus("error");
-        setMessage(warning);
+        setMessage(persistenceWarning);
       } else setStatus("saved");
       const acknowledgement = await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
         method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
-        body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, document: nextDocument, result, ...(warning ? { warning } : {}) }),
+        body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, document: nextDocument, result: { ...result, persisted: durableMutation || !persistenceWarning }, ...(persistenceWarning ? { warning: persistenceWarning } : {}) }),
       });
       const acknowledgementBody = await acknowledgement.json().catch(() => ({})) as { revoked?: boolean };
       if (revokedMcpCommandIds.current.has(event.id) || acknowledgement.status === 410 && acknowledgementBody.revoked === true) {
         revokedMcpCommandIds.current.add(event.id);
-        if (!await restoreRevokedCommand(commandResult)) setMessage("MCP client revoked after a newer canvas edit; that edit was preserved.");
+        const restored = await restoreRevokedCommand(commandResult);
+        if (!restored) setMessage("MCP client revoked after a newer canvas edit; that edit was preserved.");
         return;
       }
       if (!acknowledgement.ok) throw new Error(`Draw MCP bridge rejected the command acknowledgement (HTTP ${acknowledgement.status}).`);
     } catch (error) {
+      await unlockEditorAfterCommit();
+      if (event.operation === "set_viewport" && !committedOperationId) restoreCommandStartViewport();
       if (revokedMcpCommandIds.current.has(event.id)) {
         if (!await restoreRevokedCommand(commandResult)) setMessage("MCP client revoked after a newer canvas edit; that edit was preserved.");
         return;
+      }
+      if (error instanceof Error && error.message.startsWith("IDEMPOTENCY_REPLAY:") && durableMutation) {
+        const [savedOperation, savedDocument] = await Promise.all([
+          loadMcpOperation(current.document.id, event.clientIdentity, event.input.idempotencyKey),
+          loadCurrentDocument(),
+        ]);
+        if (savedOperation && !("tombstone" in savedOperation) && savedDocument) {
+          const acknowledgement = await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
+            method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
+            body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, document: savedDocument, result: savedOperation.result }),
+          });
+          if (acknowledgement.ok) return;
+        }
       }
       if (applied) {
         const warning = `The edit was applied but the MCP acknowledgement failed: ${error instanceof Error ? error.message : String(error)}. Call get_current_canvas before retrying.`;
