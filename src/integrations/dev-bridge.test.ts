@@ -45,8 +45,15 @@ function createBridgeHarness(options: DrawMcpBridgeOptions = {}, config: { mode?
   if (!middleware) throw new Error("Plugin did not register middleware.");
 
   const request = (method: string, path: string, body?: unknown, remoteAddress = "127.0.0.1", headers: Record<string, string> = {}, paired = true) => {
+    let requestBody = body;
+    if (path === "/__draw/api/commands" && body && typeof body === "object") {
+      const command = body as { operation?: string; input?: Record<string, unknown> };
+      if (["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "undo_operation", "redo_operation", "set_canvas_settings"].includes(command.operation ?? "") && command.input && typeof command.input.idempotencyKey !== "string") {
+        requestBody = { ...command, input: { ...command.input, idempotencyKey: `bridge-test-${events.length}-${Date.now()}` } };
+      }
+    }
     return new Promise<CapturedResponse>((resolve, reject) => {
-      const req = Object.assign(Readable.from(body === undefined ? [] : [JSON.stringify(body)]), {
+      const req = Object.assign(Readable.from(requestBody === undefined ? [] : [JSON.stringify(requestBody)]), {
         method,
         url: path,
         headers: { host: "127.0.0.1:5173", "content-type": "application/json", ...(paired ? { "x-draw-client-identity": "test-mcp-client", authorization: `Bearer ${mcpCapability}` } : {}), ...headers },

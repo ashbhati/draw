@@ -14,10 +14,12 @@ const defaultBaseUrl = "http://127.0.0.1:5173";
 const requestTimeoutMs = 25_000;
 const pairingTimeoutMs = 125_000;
 const colorSchema = z.string().regex(/^#[\da-f]{6}$/i, "Use a six-digit hex color such as #f3c94c.");
+const idempotencyKeySchema = z.string().min(1).max(200).describe("Stable key for this intent: reuse it for retries, use a new key for a new intent, and do not change its payload on retry.");
 
 const createDiagramSchema = z.object({
   documentId: z.string().min(1).max(200),
   expectedDocumentRevision: z.number().int().nonnegative(),
+  idempotencyKey: idempotencyKeySchema,
   title: z.string().max(200).optional(),
   nodes: z.array(z.object({
     id: z.string().min(1).max(100),
@@ -69,13 +71,14 @@ const createPrimitiveSchema = z.discriminatedUnion("type", [
   z.object({ ...primitiveStrokeSchema, type: z.literal("freedraw"), points: z.array(pointSchema).min(2).max(2000) }).strict(),
 ]);
 const createElementsSchema = z.object({
-  documentId: z.string().min(1).max(200), expectedDocumentRevision: z.number().int().nonnegative(),
+  documentId: z.string().min(1).max(200), expectedDocumentRevision: z.number().int().nonnegative(), idempotencyKey: idempotencyKeySchema,
   elements: z.array(createPrimitiveSchema).min(1).max(100),
 }).strict();
 
 const updateElementsSchema = z.object({
   documentId: z.string().min(1).max(200),
   expectedDocumentRevision: z.number().int().nonnegative(),
+  idempotencyKey: idempotencyKeySchema,
   updates: z.array(z.object({
     id: z.string().min(1).max(100),
     patch: z.object({
@@ -90,10 +93,10 @@ const updateElementsSchema = z.object({
   })).min(1).max(100),
 });
 
-const revisionContext = { documentId: z.string().min(1).max(200), expectedDocumentRevision: z.number().int().nonnegative() };
+const revisionContext = { documentId: z.string().min(1).max(200), expectedDocumentRevision: z.number().int().nonnegative(), idempotencyKey: idempotencyKeySchema };
 const idsSchema = z.object({ ...revisionContext, ids: z.array(z.string().min(1).max(200)).min(1).max(100) }).strict();
 const commandTool = (server: McpServer, name: string, description: string, inputSchema: any) => {
-  server.registerTool(name, { description, inputSchema }, async (input: Record<string, unknown>) => {
+  server.registerTool(name, { description: `${description} For retries of the same intent, reuse the same idempotencyKey; use a new key for a new intent. Reusing a key with a different payload conflicts.`, inputSchema }, async (input: Record<string, unknown>) => {
     const command = parseMcpToolInput(name, input);
     const result = await bridgeRequest("/__draw/api/commands", { method: "POST", body: JSON.stringify(command) });
     return textResult(result.warning ? { ...result.result, warning: result.warning } : result.result ?? result);
@@ -195,7 +198,7 @@ function createServer() {
   server.registerTool(
     "create_diagram",
     {
-      description: "Create editable diagram nodes and arrows on the open Draw canvas. Coordinates are canvas units; every node and edge is added as native Draw/Excalidraw scene elements, not an image.",
+      description: "Create editable diagram nodes and arrows on the open Draw canvas. Coordinates are canvas units; every node and edge is added as native Draw/Excalidraw scene elements, not an image. Reuse the same idempotencyKey when retrying this request and use a new one for a new intent.",
       inputSchema: createDiagramSchema,
     },
     async (input) => {
@@ -211,7 +214,7 @@ function createServer() {
   server.registerTool(
     "create_elements",
     {
-      description: "Create editable native Draw shapes, text, lines, arrows, and freehand strokes on the open canvas. Use canvas coordinates; path points are offsets from x/y. Freedraw supports optional per-point pressure. Arrows may bind both endpoints to shapes created in the call; bound arrows derive their path from the shapes and ignore supplied x/y/points. Returns input IDs mapped to Draw element IDs and relationships.",
+      description: "Create editable native Draw shapes, text, lines, arrows, and freehand strokes on the open canvas. Use canvas coordinates; path points are offsets from x/y. Freedraw supports optional per-point pressure. Arrows may bind both endpoints to shapes created in the call; bound arrows derive their path from the shapes and ignore supplied x/y/points. Returns input IDs mapped to Draw element IDs and relationships. Reuse the same idempotencyKey when retrying this request and use a new one for a new intent.",
       inputSchema: createElementsSchema,
     },
     async (input) => {
@@ -227,7 +230,7 @@ function createServer() {
   server.registerTool(
     "update_elements",
     {
-      description: "Move, resize, recolor, or change text on editable elements in the open Draw canvas. Use get_current_canvas to find element IDs.",
+      description: "Move, resize, recolor, or change text on editable elements in the open Draw canvas. Use get_current_canvas to find element IDs. Reuse the same idempotencyKey when retrying this request and use a new one for a new intent.",
       inputSchema: updateElementsSchema,
     },
     async (input) => {
@@ -254,14 +257,15 @@ function createServer() {
     alignment: z.enum(["left", "right", "top", "bottom", "center_x", "center_y"]).optional(),
     axis: z.enum(["horizontal", "vertical"]).optional(),
   });
-  const historySchema = { documentId: z.string().min(1).max(200), operationId: z.string().min(1).max(200), expectedDocumentRevision: z.number().int().nonnegative() };
+  const historySchema = { documentId: z.string().min(1).max(200), operationId: z.string().min(1).max(200), expectedDocumentRevision: z.number().int().nonnegative(), idempotencyKey: idempotencyKeySchema };
   commandTool(server, "undo_operation", "Undo the latest MCP operation only if no later scene edit has invalidated it. Provide the operationId returned by a successful mutation.", historySchema);
   commandTool(server, "redo_operation", "Redo the operation just undone, provided no newer scene edit has occurred.", historySchema);
   commandTool(server, "set_canvas_settings", "Set the active document title and/or its Blackboard/Whiteboard background.", {
     ...revisionContext, title: z.string().min(1).max(200).optional(), background: z.enum(["blackboard", "white"]).optional(),
   });
-  commandTool(server, "set_viewport", "Set canvas pan/zoom or fit the current document contents into view. This changes the view revision, not element coordinates.", {
+  commandTool(server, "set_viewport", "Set canvas pan/zoom or fit the current document contents into view. This changes the view revision, not element coordinates. Reuse the same idempotencyKey only when retrying this exact request; use a new key for a new viewport intent.", {
     documentId: z.string().min(1).max(200), expectedViewRevision: z.number().int().nonnegative(),
+    idempotencyKey: idempotencyKeySchema,
     action: z.enum(["fit_content", "set"]), x: z.number().finite().optional(), y: z.number().finite().optional(), zoom: z.number().finite().min(0.1).max(10).optional(),
   });
 

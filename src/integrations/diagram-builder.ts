@@ -3,7 +3,7 @@ import type { CreateDiagramInput } from "./mcp-contract";
 export type DiagramBackground = "blackboard" | "white";
 
 export function buildDiagramSkeletons(
-  input: CreateDiagramInput,
+  input: Omit<CreateDiagramInput, "idempotencyKey">,
   background: DiagramBackground,
   createId: () => string,
 ) {

@@ -63,7 +63,11 @@ async function startStdioMcp(baseURL: string, documentDir: string, pairingSecret
   child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
   return {
     request,
-    call: async (name: string, args: Record<string, unknown>) => request("tools/call", { name, arguments: args }),
+    call: async (name: string, args: Record<string, unknown>) => {
+      const durableMutation = ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "undo_operation", "redo_operation", "set_canvas_settings", "set_viewport"].includes(name);
+      const argumentsWithKey = durableMutation && typeof args.idempotencyKey !== "string" ? { ...args, idempotencyKey: `e2e-${crypto.randomUUID()}` } : args;
+      return request("tools/call", { name, arguments: argumentsWithKey });
+    },
     credentialPath,
     close: async () => {
       child.stdin.end();
@@ -145,7 +149,7 @@ async function waitForBridge(page: Page) {
 
 async function readLocalDocument(page: Page) {
   return page.evaluate(() => new Promise((resolve, reject) => {
-    const request = indexedDB.open("draw-local", 1);
+    const request = indexedDB.open("draw-local");
     request.onerror = () => reject(request.error);
     request.onsuccess = () => {
       const db = request.result;
@@ -521,7 +525,7 @@ test("Meta+Shift+E cannot open Excalidraw's image exporter", async ({ page }) =>
 test("Blackboard texture is seam-safe across large live/PNG/JPEG canvases and shows through MCP nodes", async ({ page }) => {
   const createResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
-    input: { nodes: [
+    input: { idempotencyKey: "e2e-direct-526", nodes: [
       { id: "dark-fill", label: "Readable node", x: 200, y: 180, width: 160, height: 72 },
       { id: "wide-export-anchor", label: "Wide export", x: 2400, y: 180, width: 160, height: 72 },
     ], edges: [] },
@@ -586,7 +590,7 @@ test("Blackboard texture is seam-safe across large live/PNG/JPEG canvases and sh
 test("natural Blackboard texture stays subdued behind a compact three-node flow in PNG and JPEG", async ({ page }) => {
   const createdResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
-    input: {
+    input: { idempotencyKey: "e2e-direct-591",
       nodes: [
         { id: "analyze", label: "Analyze", x: 80, y: 140, width: 170, height: 76, color: "#2f86c9" },
         { id: "measure", label: "Measure", x: 360, y: 140, width: 170, height: 76, color: "#e64b45" },
@@ -662,7 +666,7 @@ test("the Draw wordmark and Open .draw action do not overlap on narrow screens",
 test("MCP create and update stay editable through save, reload, open, and image export", async ({ page }) => {
   const createdResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
-    input: {
+    input: { idempotencyKey: "e2e-direct-667",
       title: "Spec → Validation",
       nodes: [
         { id: "spec", label: "Specification\nWhat & Why", x: 40, y: 100, width: 190, height: 82, shape: "rectangle" },
@@ -695,7 +699,7 @@ test("MCP create and update stay editable through save, reload, open, and image 
   const longText = "A considerably longer label that should wrap inside the node";
   const updateResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "update_elements",
-    input: { updates: [{ id: editedElementId, patch: { text: longText, x: 96, y: 132 } }] },
+    input: { idempotencyKey: "e2e-direct-700", updates: [{ id: editedElementId, patch: { text: longText, x: 96, y: 132 } }] },
   } });
   expect(updateResponse.ok(), await updateResponse.text()).toBeTruthy();
   const document = await currentBridgeDocument(page);
@@ -748,7 +752,7 @@ test("MCP diagram titles reserve at least their live Excalifont text width", asy
   const title = "Specification → Implementation → Validation";
   const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
-    input: {
+    input: { idempotencyKey: "e2e-direct-753",
       title,
       nodes: [
         { id: "spec", label: "Specification\nWhat & Why", x: 280, y: 150, width: 190, height: 82 },
@@ -775,7 +779,7 @@ test("MCP diagram titles reserve at least their live Excalifont text width", asy
 test("Open .draw restores a downloaded file that remains editable through a second save and reopen", async ({ page }) => {
   const createResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
-    input: { nodes: [{ id: "roundtrip", label: "Downloaded editable diagram", x: 140, y: 120 }], edges: [] },
+    input: { idempotencyKey: "e2e-direct-780", nodes: [{ id: "roundtrip", label: "Downloaded editable diagram", x: 140, y: 120 }], edges: [] },
   } });
   expect(createResponse.ok(), await createResponse.text()).toBeTruthy();
   const created = await createResponse.json();
@@ -861,7 +865,7 @@ test("Open .draw restores a downloaded file that remains editable through a seco
   const editedText = "Edited after opening the downloaded file";
   const updateResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "update_elements",
-    input: { updates: [{ id: created.result.nodes.roundtrip, patch: { text: editedText } }] },
+    input: { idempotencyKey: "e2e-direct-866", updates: [{ id: created.result.nodes.roundtrip, patch: { text: editedText } }] },
   } });
   expect(updateResponse.ok(), await updateResponse.text()).toBeTruthy();
   await expect.poll(async () => {
@@ -889,7 +893,7 @@ test("Open .draw restores a downloaded file that remains editable through a seco
 test("malformed .draw files leave the current canvas and local autosave untouched", async ({ page }) => {
   const create = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
-    input: { nodes: [{ id: "keep", label: "Keep this work", x: 100, y: 100 }], edges: [] },
+    input: { idempotencyKey: "e2e-direct-894", nodes: [{ id: "keep", label: "Keep this work", x: 100, y: 100 }], edges: [] },
   } });
   expect(create.ok()).toBeTruthy();
   const before = await currentBridgeDocument(page);
@@ -973,7 +977,7 @@ test("loads fonts and exports the hand-drawn scene without network access", asyn
   await expect(page.getByRole("button", { name: "Blackboard", exact: true })).toBeEnabled();
   const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
-    input: { nodes: [{ id: "offline", label: "Offline hand-drawn text 中文 日本語 한국어", x: 100, y: 100, color: "#f2d27a" }], edges: [] },
+    input: { idempotencyKey: "e2e-direct-978", nodes: [{ id: "offline", label: "Offline hand-drawn text 中文 日本語 한국어", x: 100, y: 100, color: "#f2d27a" }], edges: [] },
   } });
   expect(response.ok()).toBeTruthy();
   await expect.poll(() => localFontRequests.length).toBeGreaterThan(0);
@@ -998,7 +1002,7 @@ test("background changes recolor Draw defaults, preserve custom colors, and undo
   await page.getByRole("button", { name: "Blackboard", exact: true }).click();
   const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
-    input: {
+    input: { idempotencyKey: "e2e-direct-1003",
       title: "Preset test",
       nodes: [
         { id: "default", label: "Default color", x: 100, y: 100 },
@@ -1037,7 +1041,7 @@ test("background changes recolor Draw defaults, preserve custom colors, and undo
 
   const whiteNodeResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
-    input: { nodes: [{ id: "white-default", label: "White default", x: 580, y: 100 }], edges: [] },
+    input: { idempotencyKey: "e2e-direct-1042", nodes: [{ id: "white-default", label: "White default", x: 580, y: 100 }], edges: [] },
   } });
   expect(whiteNodeResponse.ok()).toBeTruthy();
   const whiteNode = await whiteNodeResponse.json();
@@ -1063,7 +1067,7 @@ test("background changes recolor Draw defaults, preserve custom colors, and undo
 test("blackboard background survives reload and is present in PNG and JPEG exports", async ({ page }) => {
   const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
-    input: { nodes: [{ id: "pixel-check", label: "Background pixel check", x: 160, y: 100 }], edges: [] },
+    input: { idempotencyKey: "e2e-direct-1068", nodes: [{ id: "pixel-check", label: "Background pixel check", x: 160, y: 100 }], edges: [] },
   } });
   expect(response.ok()).toBeTruthy();
 
@@ -1107,7 +1111,7 @@ test("MCP creates rendered editable primitives with relationships that stay edit
   await page.getByRole("button", { name: "Whiteboard", exact: true }).click();
   const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_elements",
-    input: { elements: [
+    input: { idempotencyKey: "e2e-direct-1112", elements: [
       { id: "box", type: "rectangle", x: 100, y: 100, width: 140, height: 72, strokeColor: "#e64b45", label: "Source" },
       { id: "oval", type: "ellipse", x: 400, y: 100, width: 120, height: 72, strokeColor: "#54ae66", label: "Target" },
       { id: "decision", type: "diamond", x: 600, y: 100, width: 120, height: 72, fillStyle: "hachure", strokeColor: "#2f86c9" },
@@ -1212,7 +1216,7 @@ test("MCP creates rendered editable primitives with relationships that stay edit
 test("one infinite canvas pans and zooms across multiple independent diagrams", async ({ page }) => {
   const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
-    input: { nodes: [
+    input: { idempotencyKey: "e2e-direct-1217", nodes: [
       { id: "near", label: "First diagram", x: 100, y: 120 },
       { id: "far", label: "Second diagram", x: 1800, y: 120 },
     ], edges: [] },
@@ -1275,7 +1279,7 @@ test("rapid Chrome pan events debounce viewport revision and preserve scene revi
 test("a reloaded .draw node remains selectable and manually editable", async ({ page }) => {
   const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
-    input: { nodes: [{ id: "editable", label: "Before reload", x: 100, y: 100, width: 180, height: 72 }], edges: [] },
+    input: { idempotencyKey: "e2e-direct-1280", nodes: [{ id: "editable", label: "Before reload", x: 100, y: 100, width: 180, height: 72 }], edges: [] },
   } });
   expect(response.ok()).toBeTruthy();
   const created = await response.json();
@@ -1302,7 +1306,7 @@ test("a reloaded .draw node remains selectable and manually editable", async ({ 
 test("long MCP labels fit inside ellipse and diamond outlines and reroute connected arrows", async ({ page }) => {
   const create = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
-    input: {
+    input: { idempotencyKey: "e2e-direct-1307",
       nodes: [
         { id: "oval", label: "Oval", x: 80, y: 100, width: 180, height: 72, shape: "ellipse" },
         { id: "diamond", label: "Diamond", x: 80, y: 320, width: 180, height: 72, shape: "diamond" },
@@ -1317,7 +1321,7 @@ test("long MCP labels fit inside ellipse and diamond outlines and reroute connec
   const longText = "A considerably longer label that should wrap to several lines inside this shape";
   const update = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "update_elements",
-    input: { updates: [
+    input: { idempotencyKey: "e2e-direct-1322", updates: [
       { id: created.result.nodes.oval, patch: { text: longText } },
       { id: created.result.nodes.diamond, patch: { text: longText } },
     ] },
@@ -1350,7 +1354,7 @@ test("long MCP labels fit inside ellipse and diamond outlines and reroute connec
 test("routes a feedback edge around the middle node and keeps its label clear after node growth", async ({ page }) => {
   const create = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
-    input: {
+    input: { idempotencyKey: "e2e-direct-1355",
       title: "Specification → Validation",
       nodes: [
         { id: "spec", label: "Specification\nWhat & Why", x: 40, y: 120, width: 190, height: 82 },
@@ -1398,7 +1402,7 @@ test("routes a feedback edge around the middle node and keeps its label clear af
   await assertBackEdgeClear();
   const longUpdate = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "update_elements",
-    input: { updates: [{ id: created.result.nodes.implementation, patch: { text: "Implementation\nHow we build and validate the intended outcome" } }] },
+    input: { idempotencyKey: "e2e-direct-1403", updates: [{ id: created.result.nodes.implementation, patch: { text: "Implementation\nHow we build and validate the intended outcome" } }] },
   } });
   expect(longUpdate.ok(), await longUpdate.text()).toBeTruthy();
   await assertBackEdgeClear();
@@ -1532,9 +1536,10 @@ test("embedded image assets survive autosave and editable Draw save/reopen", asy
 });
 
 test("PNG and JPEG exports keep the complete editable scene even when an object is selected", async ({ page }) => {
+  test.setTimeout(60_000);
   const createdResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
-    input: {
+    input: { idempotencyKey: "e2e-direct-1539",
       title: "Export fixture: complete scene",
       nodes: [
         { id: "first", label: "First node", x: 80, y: 100, width: 190, height: 90 },
@@ -1790,6 +1795,7 @@ test("revoking an MCP client cancels its pending command without overwriting a l
     command = {
       operation: "create_diagram",
       input: {
+        idempotencyKey: "revoke-pending-command",
         documentId: initial.document.id,
         expectedDocumentRevision: initial.document.documentRevision,
         nodes: [{ id: "cancel-node", label: "MCP edit", x: 180, y: 160, width: 220, height: 90 }],
@@ -1851,10 +1857,12 @@ test("revocation rolls back in place and retains the selected human scene and un
   let mcp: Awaited<ReturnType<typeof startStdioMcp>> | null = null;
   let resumeAck!: () => void;
   let ackIntercepted!: () => void;
+  let ackContinued!: () => void;
   let ackStatus: number | null = null;
   let editorSecret = "";
   const ackGate = new Promise<void>((resolve) => { resumeAck = resolve; });
   const ackSeen = new Promise<void>((resolve) => { ackIntercepted = resolve; });
+  const ackDone = new Promise<void>((resolve) => { ackContinued = resolve; });
   try {
     await page.goto("/");
     await connectEditorToMcp(page);
@@ -1904,12 +1912,13 @@ test("revocation rolls back in place and retains the selected human scene and un
       await ackGate;
       const response = await route.fetch();
       ackStatus = response.status();
-      await route.fulfill({ response });
+      try { await route.fulfill({ response }); } finally { ackContinued(); }
     });
     await page.evaluate(({ headers, documentId, documentRevision, updateTargetId }) => {
       (window as any).__pendingMcpResponse = fetch("/__draw/api/commands", {
         method: "POST", headers: { "content-type": "application/json", ...headers },
         body: JSON.stringify({ operation: "update_elements", input: {
+          idempotencyKey: "revoke-update-command",
           documentId,
           expectedDocumentRevision: documentRevision,
           updates: [{ id: updateTargetId, patch: { text: "Should roll back" } }],
@@ -1930,6 +1939,7 @@ test("revocation rolls back in place and retains the selected human scene and un
     expect(revokeResponse.status()).toBe(200);
     resumeAck();
     await expect.poll(() => ackStatus).toBe(410);
+    await ackDone;
     await expect.poll(async () => (await currentBridgeDocument(page)).document.elements.some((element: any) => element.originalText === "Should roll back")).toBe(false);
     const canceledResponse = await page.evaluate(async () => await (window as any).__pendingMcpResponse);
     expect(canceledResponse.status).toBe(401);
@@ -1948,6 +1958,183 @@ test("revocation rolls back in place and retains the selected human scene and un
     resumeAck();
     await page.unroute("**/__draw/api/commands/*/ack").catch(() => undefined);
     await mcp?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("MCP mutation replay and actor-safe undo/redo survive editor and stdio-client reloads", async ({ page, baseURL }) => {
+  // This flow includes several editor and stdio restarts; allow for a loaded
+  // Chrome worker while keeping each individual MCP request timeout bounded.
+  test.setTimeout(60_000);
+  if (!baseURL) throw new Error("Playwright baseURL is required for the MCP integration test.");
+  const directory = await mkdtemp(join(tmpdir(), "draw-mcp-durable-e2e-"));
+  let mcp = await startStdioMcp(baseURL, directory);
+  try {
+    await waitForBridge(page);
+    const initial = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const request = {
+      documentId: initial.documentId,
+      expectedDocumentRevision: initial.documentRevision,
+      idempotencyKey: "same-request-across-restart",
+      nodes: [{ id: "durable-node", label: "Created exactly once", x: 180, y: 150, width: 240, height: 100 }],
+      edges: [],
+    };
+    const first = await mcp.call("create_diagram", request);
+    expect(first.error).toBeUndefined();
+    const originalResult = JSON.parse(first.result.content[0].text);
+    await mcp.close();
+    await page.reload();
+    await waitForBridge(page);
+    mcp = await startStdioMcp(baseURL, directory);
+
+    const retry = await mcp.call("create_diagram", request);
+    expect(retry.error).toBeUndefined();
+    const replayedResult = JSON.parse(retry.result.content[0].text);
+    expect(replayedResult.operationId).toBe(originalResult.operationId);
+    expect(replayedResult.nodes).toEqual(originalResult.nodes);
+    const payloadConflict = await mcp.call("create_diagram", { ...request, nodes: [{ id: "durable-node", label: "Different payload", x: 180, y: 150 }] });
+    expect(payloadConflict.result?.isError).toBe(true);
+    expect(payloadConflict.result?.content?.[0]?.text).toMatch(/IDEMPOTENCY_KEY_REUSE/i);
+    let snapshot = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    expect(snapshot.documentRevision, JSON.stringify({ originalResult, snapshot })).toBe(originalResult.documentRevision);
+    expect(snapshot.elements.filter((element: any) => element.id === originalResult.nodes["durable-node"])).toHaveLength(1);
+
+    const viewportRequest = {
+      documentId: snapshot.documentId,
+      expectedViewRevision: snapshot.viewRevision,
+      idempotencyKey: "viewport-replay-after-reload",
+      action: "set",
+      x: -240,
+      y: -80,
+      zoom: 1.4,
+    };
+    const viewportFirst = await mcp.call("set_viewport", viewportRequest);
+    expect(viewportFirst.error).toBeUndefined();
+    const viewportResult = JSON.parse(viewportFirst.result.content[0].text);
+    await mcp.close();
+    await page.reload();
+    await waitForBridge(page);
+    mcp = await startStdioMcp(baseURL, directory);
+    const viewportRetry = await mcp.call("set_viewport", viewportRequest);
+    expect(viewportRetry.error).toBeUndefined();
+    expect(JSON.parse(viewportRetry.result.content[0].text)).toEqual(viewportResult);
+
+    const undo = await mcp.call("undo_operation", {
+      documentId: snapshot.documentId,
+      operationId: originalResult.operationId,
+      expectedDocumentRevision: snapshot.documentRevision,
+      idempotencyKey: "durable-undo-after-reload",
+    });
+    expect(undo.error).toBeUndefined();
+    expect(undo.result?.isError, JSON.stringify(undo)).not.toBe(true);
+    snapshot = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    expect(snapshot.elements.filter((element: any) => element.id === originalResult.nodes["durable-node"] && element.isDeleted !== true), JSON.stringify(undo)).toHaveLength(0);
+    await mcp.close();
+    await page.reload();
+    await waitForBridge(page);
+    mcp = await startStdioMcp(baseURL, directory);
+    snapshot = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    expect(snapshot.elements.filter((element: any) => element.id === originalResult.nodes["durable-node"] && element.isDeleted !== true)).toHaveLength(0);
+
+    const redo = await mcp.call("redo_operation", {
+      documentId: snapshot.documentId,
+      operationId: originalResult.operationId,
+      expectedDocumentRevision: snapshot.documentRevision,
+      idempotencyKey: "durable-redo-after-reload",
+    });
+    expect(redo.error).toBeUndefined();
+    expect(redo.result?.isError).not.toBe(true);
+    snapshot = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    expect(snapshot.elements.filter((element: any) => element.id === originalResult.nodes["durable-node"] && element.isDeleted !== true)).toHaveLength(1);
+    const redoneResult = JSON.parse(redo.result.content[0].text);
+
+    await page.locator('.excalidraw label[title^="Rectangle"]').click();
+    const canvas = page.locator(".excalidraw canvas").last();
+    const bounds = await canvas.boundingBox();
+    if (!bounds) throw new Error("Could not locate the canvas for the later human edit.");
+    await page.mouse.move(bounds.x + bounds.width / 2 + 40, bounds.y + bounds.height / 2 + 100);
+    await page.mouse.down();
+    await page.mouse.move(bounds.x + bounds.width / 2 + 170, bounds.y + bounds.height / 2 + 190);
+    await page.mouse.up();
+    await expect.poll(async () => (await freshBridgeDocument(page)).document.elements.filter((element: any) => element.type === "rectangle" && element.isDeleted !== true).length).toBe(2);
+    await mcp.close();
+    await page.reload();
+    await waitForBridge(page);
+    mcp = await startStdioMcp(baseURL, directory);
+    snapshot = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const rejectedUndo = await mcp.call("undo_operation", {
+      documentId: snapshot.documentId,
+      operationId: redoneResult.operationId,
+      expectedDocumentRevision: snapshot.documentRevision,
+      idempotencyKey: "undo-after-later-human-edit",
+    });
+    expect(rejectedUndo.result?.isError).toBe(true);
+    const afterRejectedUndo = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    expect(afterRejectedUndo.elements.filter((element: any) => element.type === "rectangle" && element.isDeleted !== true)).toHaveLength(2);
+  } finally {
+    await mcp.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("damaged MCP history leaves the drawing editable and the next committed mutation cleans corruption", async ({ page, baseURL }) => {
+  if (!baseURL) throw new Error("Playwright baseURL is required for the MCP integration test.");
+  const directory = await mkdtemp(join(tmpdir(), "draw-mcp-corrupt-ledger-"));
+  const mcp = await startStdioMcp(baseURL, directory);
+  try {
+    await waitForBridge(page);
+    const initial = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    await page.evaluate(async ({ documentId }) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open("draw-local");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const transaction = db.transaction(["mcpUndo", "mcpRedo", "mcpOperations", "mcpMeta"], "readwrite");
+      transaction.objectStore("mcpUndo").put({ broken: true }, documentId);
+      transaction.objectStore("mcpRedo").put({ broken: true }, documentId);
+      transaction.objectStore("mcpOperations").put({ broken: true }, JSON.stringify([documentId, "damaged-client", "damaged-key"]));
+      transaction.objectStore("mcpMeta").put(31, "commit-count");
+      await new Promise<void>((resolve, reject) => {
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(transaction.error);
+      });
+      db.close();
+    }, { documentId: initial.documentId });
+    await page.reload();
+    await waitForBridge(page);
+    await expect(page.getByText(/drawing loaded, but stored MCP undo history is damaged/i)).toBeVisible();
+
+    const current = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const created = await mcp.call("create_diagram", {
+      documentId: current.documentId,
+      expectedDocumentRevision: current.documentRevision,
+      idempotencyKey: "recover-after-corrupt-history",
+      nodes: [{ id: "recovery-node", label: "Still editable", x: 100, y: 100 }],
+      edges: [],
+    });
+    expect(created.error).toBeUndefined();
+    expect(created.result?.isError).not.toBe(true);
+    expect(JSON.parse(created.result.content[0].text).nodes["recovery-node"]).toBeTruthy();
+    const state = await page.evaluate(async (documentId) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open("draw-local");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const transaction = db.transaction(["mcpUndo", "mcpRedo", "mcpOperations"], "readonly");
+      const undo = await new Promise((resolve, reject) => { const request = transaction.objectStore("mcpUndo").get(documentId); request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
+      const redo = await new Promise((resolve, reject) => { const request = transaction.objectStore("mcpRedo").get(documentId); request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
+      const broken = await new Promise((resolve, reject) => { const request = transaction.objectStore("mcpOperations").get(JSON.stringify([documentId, "damaged-client", "damaged-key"])); request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
+      db.close();
+      return { undo, redo, broken };
+    }, current.documentId);
+    expect(state.undo).toBeTruthy();
+    expect(state.redo).toBeUndefined();
+    expect(state.broken).toBeUndefined();
+  } finally {
+    await mcp.close();
     await rm(directory, { recursive: true, force: true });
   }
 });

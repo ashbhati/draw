@@ -3,7 +3,7 @@ import type { CreateElementsInput, DrawPrimitiveInput } from "./mcp-contract";
 export type PrimitiveBackground = "blackboard" | "white";
 
 export function buildPrimitiveSkeletons(
-  input: CreateElementsInput,
+  input: Omit<CreateElementsInput, "idempotencyKey">,
   background: PrimitiveBackground,
   createId: () => string,
 ) {

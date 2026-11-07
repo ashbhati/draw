@@ -1,6 +1,6 @@
 import type { DrawDocument } from "../document/document";
 
-type Persist = (document: DrawDocument) => Promise<void>;
+type Persist = (document: DrawDocument) => Promise<void | { saved: boolean }>;
 
 /** Keep applied MCP edits successful while exposing any durability warning. */
 export async function persistAppliedDocument(
@@ -10,7 +10,8 @@ export async function persistAppliedDocument(
 ): Promise<string | undefined> {
   const failures: string[] = [];
   try {
-    await saveLocally(document);
+    const outcome = await saveLocally(document);
+    if (outcome && !outcome.saved) failures.push("local autosave kept a newer document snapshot");
   } catch (error) {
     failures.push(`local autosave failed: ${error instanceof Error ? error.message : String(error)}`);
   }

@@ -679,8 +679,6 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
             }
 
             const commandInput = command.input as Record<string, unknown>;
-            const expectedDocumentRevision = commandInput.expectedDocumentRevision;
-            const expectedViewRevision = commandInput.expectedViewRevision;
             if (typeof commandInput.documentId === "string" && command.operation !== "open_document" && commandInput.documentId !== document.document.id) {
               sendJson(response, 409, { error: "Document ID does not match the active Draw canvas." });
               return;
@@ -689,15 +687,6 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               sendJson(response, 409, { error: "Open context document ID does not match the active Draw canvas." });
               return;
             }
-            if (typeof expectedDocumentRevision === "number" && expectedDocumentRevision !== (document.document.documentRevision ?? 0)) {
-              sendJson(response, 409, { error: `Document revision conflict. Expected ${expectedDocumentRevision}; current revision is ${document.document.documentRevision ?? 0}. Read the current canvas before retrying.` });
-              return;
-            }
-            if (typeof expectedViewRevision === "number" && expectedViewRevision !== (document.document.viewRevision ?? 0)) {
-              sendJson(response, 409, { error: `View revision conflict. Expected ${expectedViewRevision}; current revision is ${document.document.viewRevision ?? 0}. Read the current canvas before retrying.` });
-              return;
-            }
-
             commandSequence += 1;
             const id = `draw-command-${Date.now().toString(36)}-${commandSequence.toString(36)}`;
             const clientId = activeClientId;
