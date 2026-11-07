@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createServer } from "node:net";
+import { isAbsolute, relative } from "node:path";
+import { tmpdir } from "node:os";
 import { createE2EServerConfig, isBundledFontURL, isSameOriginURL, resolveAndStoreE2EBaseURL, resolveE2EBaseURL } from "./config";
 
 describe("Playwright E2E server configuration", () => {
@@ -39,12 +41,19 @@ describe("Playwright E2E server configuration", () => {
     const previous = process.env.DRAW_E2E_REUSE_SERVER;
     try {
       delete process.env.DRAW_E2E_REUSE_SERVER;
-      expect(createE2EServerConfig("http://127.0.0.1:5197")).toEqual({
-        command: "npm run dev -- --host 127.0.0.1 --port 5197 --strictPort",
+      const config = createE2EServerConfig("http://127.0.0.1:5197");
+      expect(config).toEqual({
+        command: "npm run dev -- --mode e2e --host 127.0.0.1 --port 5197 --strictPort",
+        env: expect.objectContaining({ DRAW_E2E_EDITOR_CODE: expect.stringMatching(/^[A-F\d]{12}$/) }),
         url: "http://127.0.0.1:5197/__draw/api/health",
         reuseExistingServer: false,
         timeout: 30_000,
       });
+      const statePath = config.env.DRAW_E2E_AUTH_STATE_PATH;
+      expect(isAbsolute(statePath)).toBe(true);
+      const relativeToTemp = relative(tmpdir(), statePath);
+      expect(relativeToTemp).not.toBe("");
+      expect(relativeToTemp.startsWith("..")).toBe(false);
       process.env.DRAW_E2E_REUSE_SERVER = "1";
       expect(createE2EServerConfig("http://127.0.0.1:5197").reuseExistingServer).toBe(true);
     } finally {

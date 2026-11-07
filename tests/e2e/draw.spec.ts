@@ -100,16 +100,32 @@ async function countPixelsNear(page: Page, image: Buffer, target: [number, numbe
   }, { bytes: Array.from(image), color: target, limit: tolerance, mime: mimeType });
 }
 
+async function connectEditorToMcp(page: Page, requestFreshCode = false) {
+  await page.getByRole("button", { name: "Connect MCP" }).click();
+  if (requestFreshCode) {
+    await page.getByRole("button", { name: "Request fresh code" }).click();
+    await expect(page.getByText(/fresh code was printed in the trusted terminal/i)).toBeVisible();
+  }
+  const codeResponse = await page.request.get("/__draw/api/e2e/active-launch-code", {
+    headers: { Origin: new URL(page.url()).origin },
+  });
+  expect(codeResponse.ok(), "the isolated E2E server should provide its current launch code to Playwright").toBeTruthy();
+  const { code } = await codeResponse.json();
+  await page.getByLabel("Launch code").fill(code);
+  await page.getByRole("button", { name: "Connect", exact: true }).click();
+  await expect(page.getByRole("button", { name: "MCP connected", exact: true })).toBeVisible();
+  expect(new URL(page.url()).search).toBe("");
+  expect(new URL(page.url()).hash).toBe("");
+}
+
 async function waitForBridge(page: Page) {
-  const registrationRequest = page.waitForRequest((request) => request.url().endsWith("/__draw/api/client") && request.method() === "PUT");
-  const documentRequest = page.waitForRequest((request) => request.url().endsWith(documentApi) && request.method() === "PUT");
   await page.goto("/");
   await page.locator(".topbar").waitFor();
-  const registered = await registrationRequest;
-  const synced = await documentRequest;
-  expect(synced.postDataJSON().clientId).toBe(registered.postDataJSON().clientId);
-  const health = await (await page.request.get("/__draw/api/health")).json();
-  expect(health.clientReady && health.documentReady).toBe(true);
+  await connectEditorToMcp(page);
+  await expect.poll(async () => {
+    const health = await (await page.request.get("/__draw/api/health")).json();
+    return health.clientReady && health.documentReady;
+  }).toBe(true);
 }
 
 async function readLocalDocument(page: Page) {
@@ -699,9 +715,10 @@ test("MCP create and update stay editable through save, reload, open, and image 
   await page.locator(".excalidraw canvas").first().waitFor();
   await expect(page.getByRole("button", { name: "Whiteboard", exact: true })).toHaveAttribute("aria-pressed", "true");
   expect((await readLocalDocument(page)).document.elements.some((element: any) => element.originalText === longText)).toBeTruthy();
+  await connectEditorToMcp(page, true);
 
   page.once("dialog", (dialog) => dialog.accept());
-  await page.locator('input[type="file"]').setInputFiles({
+  await page.locator('input[type="file"][accept^=".draw"]').setInputFiles({
     name: "roundtrip.draw",
     mimeType: "application/vnd.draw+json",
     buffer: drawBuffer,
@@ -867,7 +884,7 @@ test("malformed .draw files leave the current canvas and local autosave untouche
   }));
 
   page.once("dialog", (dialog) => dialog.accept());
-  await page.locator('input[type="file"]').setInputFiles({ name: "broken.draw", mimeType: "application/json", buffer: malformed });
+  await page.locator('input[type="file"][accept^=".draw"]').setInputFiles({ name: "broken.draw", mimeType: "application/json", buffer: malformed });
   await expect(page.getByRole("status").filter({ hasText: /background|elements/i })).toBeVisible();
   const after = await currentBridgeDocument(page);
   expect(after.document.id).toBe(before.document.id);
@@ -1051,6 +1068,8 @@ test("blackboard background survives reload and is present in PNG and JPEG expor
   await page.reload();
   await page.locator(".excalidraw canvas").first().waitFor();
   await expect(page.getByRole("button", { name: "Blackboard", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByRole("button", { name: "Connect MCP", exact: true })).toBeEnabled();
+  await connectEditorToMcp(page, true);
 });
 
 test("fresh MCP canvas reads flush a just-drawn freehand edit", async ({ page }) => {
@@ -1138,7 +1157,7 @@ test("MCP creates rendered editable primitives with relationships that stay edit
     expect(saved.document.elements.some((element: any) => element.id === id && element.isDeleted !== true)).toBe(true);
   }
   page.once("dialog", (dialog) => dialog.accept());
-  await page.locator('input[type="file"]').setInputFiles({ name: "mcp-primitives.draw", mimeType: "application/vnd.draw+json", buffer: drawBuffer });
+  await page.locator('input[type="file"][accept^=".draw"]').setInputFiles({ name: "mcp-primitives.draw", mimeType: "application/vnd.draw+json", buffer: drawBuffer });
   await expect.poll(async () => {
     const reopened = await freshBridgeDocument(page);
     return Object.values(created.result.elementIds).every((id: any) => reopened.document.elements.some((element: any) => element.id === id && element.isDeleted !== true));
@@ -1373,12 +1392,28 @@ test("routes a feedback edge around the middle node and keeps its label clear af
 test("the supplied reference fixture keeps chalk, layout, and editable nodes after a .draw round trip", async ({ page }) => {
   const reference = await readFile("tests/fixtures/specification-implementation-validation.draw");
   page.on("dialog", (dialog) => dialog.accept());
-  await page.locator('input[type="file"]').setInputFiles({
+  const drawFileInput = page.locator('input[type="file"][accept^=".draw"]');
+  await drawFileInput.evaluate((input: HTMLInputElement) => { input.value = ""; });
+  await drawFileInput.setInputFiles({
     name: "specification-implementation-validation.draw",
     mimeType: "application/vnd.draw+json",
     buffer: reference,
   });
-  await expect.poll(async () => (await freshBridgeDocument(page)).document.elements.filter((element: any) => ["rectangle", "ellipse", "diamond"].includes(element.type)).length).toBe(3);
+  await expect.poll(async () => {
+    const local = await readLocalDocument(page);
+    return local.document.elements.filter((element: any) => ["rectangle", "ellipse", "diamond"].includes(element.type)).length;
+  }).toBe(3);
+  await expect.poll(async () => {
+    const health = await (await page.request.get("/__draw/api/health")).json();
+    const local = await readLocalDocument(page);
+    return health.clientReady && health.documentReady && typeof local.document.documentRevision === "number";
+  }).toBe(true);
+  await expect.poll(async () => {
+    const local = await readLocalDocument(page);
+    const live = await freshBridgeDocument(page);
+    return live.document.documentRevision === local.document.documentRevision &&
+      live.document.elements.filter((element: any) => ["rectangle", "ellipse", "diamond"].includes(element.type)).length === 3;
+  }).toBe(true);
   const initial = await freshBridgeDocument(page);
   expect(initial.document.canvas.background.preset).toBe("blackboard");
   const nodes = initial.document.elements.filter((element: any) => ["rectangle", "ellipse", "diamond"].includes(element.type));
@@ -1424,7 +1459,7 @@ test("the supplied reference fixture keeps chalk, layout, and editable nodes aft
   await page.getByRole("button", { name: /Save \.draw/ }).click();
   const savedFile = await readFile(await (await downloadWait).path());
   const saveJson = JSON.parse(savedFile.toString("utf8"));
-  await page.locator('input[type="file"]').setInputFiles({ name: "reference-roundtrip.draw", mimeType: "application/vnd.draw+json", buffer: savedFile });
+  await page.locator('input[type="file"][accept^=".draw"]').setInputFiles({ name: "reference-roundtrip.draw", mimeType: "application/vnd.draw+json", buffer: savedFile });
   const reopened = await freshBridgeDocument(page);
   expect(reopened.document.canvas.background.preset).toBe("blackboard");
   for (const node of nodes) {
@@ -1470,7 +1505,7 @@ test("embedded image assets survive autosave and editable Draw save/reopen", asy
   expect(Object.keys((await readLocalDocument(page)).document.assets)).not.toHaveLength(0);
 
   page.once("dialog", (dialog) => dialog.accept());
-  await page.locator('input[type="file"]').setInputFiles({
+  await page.locator('input[type="file"][accept^=".draw"]').setInputFiles({
     name: "image-roundtrip.draw",
     mimeType: "application/vnd.draw+json",
     buffer: Buffer.from(JSON.stringify(saved)),
@@ -1726,6 +1761,10 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
     const challenge = JSON.parse(confirmationResponse.result.content[0].text);
     expect(challenge.status).toBe("NEEDS_CONFIRMATION");
     await expect(page.getByRole("dialog", { name: "Open a Draw document?" })).toBeVisible();
+    const forgedApproval = await page.request.post(`/__draw/api/confirmations/${encodeURIComponent(challenge.confirmationToken)}/respond`, {
+      data: { clientId: "forged-local-mcp-client", approved: true },
+    });
+    expect(forgedApproval.status()).toBe(401);
     await page.getByRole("button", { name: "Keep current canvas" }).click();
     const denied = await mcp.call("open_document", { path: "stdio-roundtrip.draw", documentId: current.documentId, expectedDocumentRevision: current.documentRevision, confirmationToken: challenge.confirmationToken });
     expect(JSON.parse(denied.result.content[0].text).status).toBe("DENIED");

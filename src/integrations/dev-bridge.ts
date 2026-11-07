@@ -1,10 +1,14 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
+import { isAbsolute, relative, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import type { Plugin, ViteDevServer } from "vite";
 import type { DrawDocument } from "../document/document";
 import { parseDrawFile, validateDrawDocument } from "../document/document";
 import type { McpCommand } from "./mcp-contract";
 import { parseMcpToolInput } from "./mcp-contract";
+import { createEditorAuthManager, createFileEditorAuthStore, type EditorAuthOptions, type EditorAuthManager } from "./editor-auth";
 
 export type DrawDocumentBridgeValue = DrawDocument;
 
@@ -48,6 +52,8 @@ export type DrawMcpBridgeOptions = {
   flushTimeoutMs?: number;
   lateAckRetentionMs?: number;
   maxBodyBytes?: number;
+  /** Test seam for deterministic launch-code exchange. Production uses an interactive trusted terminal. */
+  editorAuthForTests?: Partial<EditorAuthOptions>;
 };
 
 const API_ROOT = "/__draw/api";
@@ -62,6 +68,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function isLoopbackAddress(address: string | undefined): boolean {
   if (!address) return false;
   return address === "::1" || address === "127.0.0.1" || address.startsWith("127.") || address.startsWith("::ffff:127.");
+}
+
+function isLoopbackHost(host: unknown): boolean {
+  return host === "127.0.0.1" || host === "localhost" || host === "::1";
+}
+
+function isWithinDirectory(directory: string, candidate: string): boolean {
+  const relativePath = relative(resolve(directory), resolve(candidate));
+  return relativePath !== "" && !relativePath.startsWith("..") && !isAbsolute(relativePath);
 }
 
 function isDrawDocument(value: unknown): value is DrawDocumentBridgeValue {
@@ -120,11 +135,64 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
   const confirmations = new Map<string, PendingConfirmation>();
   let document: DrawDocumentBridgeValue | null = null;
   let activeClientId: string | null = null;
+  let editorAuth: Promise<EditorAuthManager> | null = null;
   let commandSequence = 0;
 
   return {
     name: "draw-local-mcp-bridge",
     configureServer(server: ViteDevServer) {
+      const testAuth = options.editorAuthForTests;
+      const e2eCode = process.env.DRAW_E2E_EDITOR_CODE;
+      const e2eAuthStatePath = process.env.DRAW_E2E_AUTH_STATE_PATH;
+      const isE2ETestMode = server.config.mode === "e2e"
+        && !server.config.isProduction
+        && isLoopbackHost(server.config.server.host)
+        && typeof e2eCode === "string"
+        && /^[A-F\d]{12}$/i.test(e2eCode)
+        && typeof e2eAuthStatePath === "string"
+        && isWithinDirectory(tmpdir(), e2eAuthStatePath);
+      let e2eLaunchCodeSequence = 0n;
+      let activeE2ELaunchCode: string | null = null;
+      const generateE2ELaunchCode = () => {
+        const base = BigInt(`0x${e2eCode}`);
+        const code = (base + e2eLaunchCodeSequence).toString(16).toUpperCase().slice(-12).padStart(12, "0");
+        e2eLaunchCodeSequence += 1n;
+        activeE2ELaunchCode = code;
+        return code;
+      };
+      if (isE2ETestMode) {
+        server.config.logger.warn("Draw E2E-only editor auth provider is active on loopback. Its per-run test code and test endpoint are for isolated automation only; never use this mode with real drawings or outside an isolated test run.");
+      }
+      const displayLaunchCode = testAuth?.displayLaunchCode ?? (isE2ETestMode ? (() => true) : ((code: string) => {
+        // Never put authentication material in Vite's logger, browser traffic,
+        // command arguments, or tool output. Pairing requires a trusted TTY.
+        if (!process.stdout.isTTY) return false;
+        process.stdout.write(`\nDraw editor launch code (expires in 60 seconds): ${code}\nEnter it in Draw's Connect MCP dialog.\n\n`);
+        return true;
+      }));
+      editorAuth = createEditorAuthManager({
+        displayLaunchCode,
+        ...(isE2ETestMode ? { generateLaunchCode: generateE2ELaunchCode } : {}),
+        ...(testAuth?.now ? { now: testAuth.now } : {}),
+        ...(testAuth?.generateLaunchCode ? { generateLaunchCode: testAuth.generateLaunchCode } : {}),
+        ...(testAuth?.generateSecret ? { generateSecret: testAuth.generateSecret } : {}),
+        ...(testAuth?.store
+          ? { store: testAuth.store }
+          : { store: createFileEditorAuthStore(isE2ETestMode ? e2eAuthStatePath : undefined) }),
+      });
+      if (isE2ETestMode && e2eAuthStatePath) {
+        server.httpServer?.once("close", () => { void rm(e2eAuthStatePath, { force: true }); });
+      }
+      const getAuth = () => {
+        if (!editorAuth) throw new Error("Editor authentication is unavailable.");
+        return editorAuth;
+      };
+      const authorizedEditor = async (request: IncomingMessage): Promise<{ auth: EditorAuthManager; clientId: string } | null> => {
+        const auth = await getAuth();
+        const clientId = auth.getActiveClientId();
+        const token = request.headers["x-draw-editor-secret"];
+        return clientId && auth.authorize(clientId, token) ? { auth, clientId } : null;
+      };
       const respond = async (request: IncomingMessage, response: ServerResponse, next: (error?: unknown) => void) => {
         const path = requestPath(request);
         if (!path.startsWith(API_ROOT)) return next();
@@ -158,25 +226,92 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
         }
 
         try {
+          const authManager = await getAuth();
           if (request.method === "GET" && path === `${API_ROOT}/health`) {
             sendJson(response, 200, { ok: true, documentReady: document !== null, clientReady: activeClientId !== null });
             return;
           }
 
-          if (request.method === "PUT" && path === `${API_ROOT}/client`) {
-            const body = await readJsonBody(request, maxBodyBytes);
-            if (!isRecord(body) || typeof body.clientId !== "string" || body.clientId.length < 1 || body.clientId.length > 200) {
-              sendJson(response, 400, { error: "clientId must be a non-empty string of at most 200 characters." });
+          // This endpoint exists only for isolated, loopback Playwright runs.
+          // Production builds and normal Vite modes never expose test credentials.
+          if (isE2ETestMode && request.method === "GET" && path === `${API_ROOT}/e2e/active-launch-code`) {
+            if (origin !== `http://${host}` || !activeE2ELaunchCode) {
+              sendJson(response, 403, { error: "The isolated E2E launch code is unavailable." });
               return;
             }
-            activeClientId = body.clientId;
-            sendJson(response, 200, { ok: true, clientId: activeClientId });
+            sendJson(response, 200, { code: activeE2ELaunchCode });
+            return;
+          }
+
+          if (request.method === "POST" && path === `${API_ROOT}/editor/reissue-code`) {
+            if (origin !== `http://${host}`) {
+              sendJson(response, 403, { error: "A fresh editor code can be requested only from Draw." });
+              return;
+            }
+            const result = await authManager.requestFreshLaunchCode();
+            if (result !== "ISSUED") {
+              sendJson(response, result === "LOCKED" || result === "THROTTLED" ? 429 : 503, {
+                status: result,
+                error: result === "THROTTLED"
+                  ? "A code was requested recently. Wait before requesting another code."
+                  : "No code was issued. Start Draw from a trusted interactive terminal and check that terminal.",
+              });
+              return;
+            }
+            sendJson(response, 200, { status: "ISSUED" });
+            return;
+          }
+
+          if (request.method === "POST" && path === `${API_ROOT}/editor/bootstrap`) {
+            const body = await readJsonBody(request, maxBodyBytes);
+            const clientId = isRecord(body) && typeof body.clientId === "string" ? body.clientId : "";
+            const launchCode = isRecord(body) ? body.launchCode : undefined;
+            if (!clientId || clientId.length > 200) {
+              sendJson(response, 401, { status: "INVALID", error: "Could not authenticate this Draw editor session." });
+              return;
+            }
+            const result = await authManager.exchangeLaunchCode(launchCode, clientId);
+            if (result.status !== "AUTHENTICATED") {
+              const statusCode = result.status === "LOCKED" ? 429 : result.status === "UNAVAILABLE" ? 503 : result.status === "EXPIRED" ? 410 : 401;
+              const error = result.status === "EXPIRED"
+                ? "This code may have expired. Request a fresh code and check the trusted terminal."
+                : "Could not authenticate this Draw editor session. Check the trusted terminal and retry.";
+              sendJson(response, statusCode, { status: result.status, error });
+              return;
+            }
+            if (activeClientId) {
+              for (const [id, waiting] of pending) {
+                clearTimeout(waiting.timeout);
+                if (waiting.cleanupTimeout) clearTimeout(waiting.cleanupTimeout);
+                waiting.resolve({ id, clientId: waiting.clientId, error: "The active Draw editor session was replaced." });
+                pending.delete(id);
+              }
+              for (const [id, waiting] of pendingFlushes) {
+                clearTimeout(waiting.timeout);
+                waiting.reject(new Error("The active Draw editor session was replaced."));
+                pendingFlushes.delete(id);
+              }
+              confirmations.clear();
+              server.ws.send("draw:editor-lease-revoked", { clientId: activeClientId });
+            }
+            activeClientId = clientId;
+            sendJson(response, 200, { status: "AUTHENTICATED", clientId, editorSecret: result.editorSecret });
+            return;
+          }
+
+          if (request.method === "PUT" && path === `${API_ROOT}/client`) {
+            sendJson(response, 401, { error: "Editor registration requires the authenticated bootstrap flow." });
             return;
           }
 
           if (request.method === "PUT" && path === `${API_ROOT}/document`) {
+            const authenticated = await authorizedEditor(request);
+            if (!authenticated) {
+              sendJson(response, 401, { error: "Editor authentication is required to sync a Draw document." });
+              return;
+            }
             const body = await readJsonBody(request, maxBodyBytes);
-            if (!isRecord(body) || typeof body.clientId !== "string" || body.clientId !== activeClientId) {
+            if (!isRecord(body) || typeof body.clientId !== "string" || body.clientId !== authenticated.clientId) {
               sendJson(response, 409, { error: "Only the active Draw canvas may sync its document." });
               return;
             }
@@ -217,6 +352,11 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
 
           const confirmationRespondMatch = path.match(/^\/__draw\/api\/confirmations\/([^/]+)\/respond$/);
           if (request.method === "POST" && confirmationRespondMatch) {
+            const authenticated = await authorizedEditor(request);
+            if (!authenticated) {
+              sendJson(response, 401, { error: "Only the authenticated active Draw editor can relay a human confirmation." });
+              return;
+            }
             const body = await readJsonBody(request, maxBodyBytes);
             const token = decodeURIComponent(confirmationRespondMatch[1]);
             const confirmation = confirmations.get(token);
@@ -225,7 +365,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               sendJson(response, 410, { status: "EXPIRED" });
               return;
             }
-            if (!isRecord(body) || body.clientId !== confirmation.clientId || body.clientId !== activeClientId || typeof body.approved !== "boolean") {
+            if (!isRecord(body) || body.clientId !== confirmation.clientId || body.clientId !== authenticated.clientId || typeof body.approved !== "boolean") {
               sendJson(response, 409, { error: "Confirmation response came from a stale or invalid editor session." });
               return;
             }
@@ -295,6 +435,11 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
 
           const flushAckMatch = path.match(/^\/__draw\/api\/document\/flush\/([^/]+)$/);
           if (request.method === "POST" && flushAckMatch) {
+            const authenticated = await authorizedEditor(request);
+            if (!authenticated) {
+              sendJson(response, 401, { error: "Editor authentication is required for a document flush acknowledgement." });
+              return;
+            }
             const body = await readJsonBody(request, maxBodyBytes);
             if (!isRecord(body) || typeof body.clientId !== "string" || (body.error === undefined && !isDrawDocument(body.document)) || (body.error !== undefined && typeof body.error !== "string")) {
               sendJson(response, 400, { error: "Flush acknowledgement must include a clientId and a valid Draw document or error." });
@@ -306,7 +451,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               sendJson(response, 404, { error: "No pending Draw document flush matches this acknowledgement." });
               return;
             }
-            if (body.clientId !== waiting.clientId || body.clientId !== activeClientId) {
+            if (body.clientId !== waiting.clientId || body.clientId !== authenticated.clientId) {
               sendJson(response, 409, { error: "Flush acknowledgement came from a canvas that is no longer active." });
               return;
             }
@@ -411,6 +556,11 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
 
           const ackMatch = path.match(/^\/__draw\/api\/commands\/([^/]+)\/ack$/);
           if (request.method === "POST" && ackMatch) {
+            const authenticated = await authorizedEditor(request);
+            if (!authenticated) {
+              sendJson(response, 401, { error: "Editor authentication is required for an MCP command acknowledgement." });
+              return;
+            }
             const body = await readJsonBody(request, maxBodyBytes);
             if (!isRecord(body) || typeof body.clientId !== "string" || !body.clientId) {
               sendJson(response, 400, { error: "Ack must include clientId." });
@@ -422,7 +572,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               sendJson(response, 404, { error: "No pending Draw MCP command matches this acknowledgement." });
               return;
             }
-            if (body.clientId !== waiting.clientId || body.clientId !== activeClientId) {
+            if (body.clientId !== waiting.clientId || body.clientId !== authenticated.clientId) {
               sendJson(response, 409, { error: "Acknowledgement came from a canvas that is no longer active." });
               return;
             }
