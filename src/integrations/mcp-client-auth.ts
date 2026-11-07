@@ -39,12 +39,13 @@ export type McpPairingRequest = {
 };
 
 export type PairedMcpCredential = { clientIdentity: string; capability: string; expiresAt: number };
+export type McpPairingResolution = { credential: PairedMcpCredential; replacedClientIdentity?: string };
 
 export type McpClientAuthManager = {
   issuePairingCode: () => Promise<string | null>;
   beginPairing: (code: unknown, name: unknown, fingerprint: unknown) => Promise<McpPairingRequest>;
   cancelPairing: (requestId: string) => Promise<boolean>;
-  resolvePairing: (requestId: string, approved: boolean) => Promise<PairedMcpCredential | null>;
+  resolvePairing: (requestId: string, approved: boolean) => Promise<McpPairingResolution | null>;
   authenticate: (clientIdentity: unknown, capability: unknown) => boolean;
   list: () => Array<Omit<PairedMcpClient, "secretHash">>;
   revoke: (clientIdentity: string) => Promise<boolean>;
@@ -228,11 +229,12 @@ export async function createMcpClientAuthManager(options: McpClientAuthOptions =
           throw new Error("Could not create a unique MCP client credential.");
         }
         const expiresAt = now() + CREDENTIAL_TTL_MS;
+        const replacedClient = state.clients.find((client) => client.fingerprint === request.fingerprint && client.revokedAt === null && client.expiresAt > now());
         state = {
           ...state,
           failedAttempts: 0,
           lockedUntil: 0,
-          clients: [...state.clients.map((client) => client.fingerprint === request.fingerprint && client.revokedAt === null ? { ...client, revokedAt: now() } : client), {
+          clients: [...state.clients.map((client) => client.fingerprint === request.fingerprint && client.revokedAt === null && client.expiresAt > now() ? { ...client, revokedAt: now() } : client), {
             clientIdentity,
             name: request.name,
             fingerprint: request.fingerprint,
@@ -243,7 +245,10 @@ export async function createMcpClientAuthManager(options: McpClientAuthOptions =
           }],
         };
         await store.save(state);
-        return { clientIdentity, capability, expiresAt };
+        return {
+          credential: { clientIdentity, capability, expiresAt },
+          ...(replacedClient ? { replacedClientIdentity: replacedClient.clientIdentity } : {}),
+        };
       });
     },
     authenticate(clientIdentity, capability) {

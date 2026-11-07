@@ -1,8 +1,8 @@
 import { chmod, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
-import { getLocalMcpIdentity, readLocalMcpCredential, writeLocalMcpCredential } from "./mcp-client-credentials";
+import { describe, expect, it, vi } from "vitest";
+import { getLocalMcpIdentity, localMcpCredentialPath, readLocalMcpCredential, validatePosixCredentialOwnership, writeLocalMcpCredential } from "./mcp-client-credentials";
 
 describe("local MCP host credentials", () => {
   it("creates a stable local identity and atomically stores the capability with restrictive permissions", async () => {
@@ -78,6 +78,27 @@ describe("local MCP host credentials", () => {
       });
       expect(credential?.clientIdentity).toBe("original");
     } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects relative configured paths and unsafe POSIX owners or directories", async () => {
+    vi.stubEnv("DRAW_MCP_CLIENT_CREDENTIAL_PATH", "relative/credential.json");
+    expect(() => localMcpCredentialPath()).toThrow(/absolute path/i);
+    vi.unstubAllEnvs();
+    expect(() => validatePosixCredentialOwnership(10, 10, 0o700, 11)).toThrow(/owned by the current user/i);
+    expect(() => validatePosixCredentialOwnership(10, 10, 0o702, 10)).toThrow(/group- or world-writable/i);
+  });
+
+  it("rejects a group- or world-writable credential parent directory", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "draw-mcp-host-dir-mode-"));
+    const path = join(directory, "client.json");
+    try {
+      await writeLocalMcpCredential({ installationId: "host", clientIdentity: "id", capability: "f".repeat(64) }, path);
+      await chmod(directory, 0o777);
+      await expect(readLocalMcpCredential(path)).rejects.toThrow(/group- or world-writable/i);
+    } finally {
+      await chmod(directory, 0o700);
       await rm(directory, { recursive: true, force: true });
     }
   });

@@ -139,6 +139,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
   const lateAckRetentionMs = options.lateAckRetentionMs ?? DEFAULT_LATE_ACK_RETENTION_MS;
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const pending = new Map<string, PendingCommand>();
+  const revokedCommands = new Map<string, { clientIdentity: string; expiresAt: number }>();
   const pendingFlushes = new Map<string, PendingFlush>();
   const confirmations = new Map<string, PendingConfirmation>();
   const pendingMcpPairings = new Map<string, { clientId: string; resolve: (value: { clientIdentity: string; capability: string; expiresAt: number } | null) => void; timer: ReturnType<typeof setTimeout> }>();
@@ -240,6 +241,9 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
           clearTimeout(waiting.timeout);
           if (waiting.cleanupTimeout) clearTimeout(waiting.cleanupTimeout);
           pending.delete(id);
+          for (const [revokedId, tombstone] of revokedCommands) if (tombstone.expiresAt <= Date.now()) revokedCommands.delete(revokedId);
+          revokedCommands.set(id, { clientIdentity, expiresAt: Date.now() + lateAckRetentionMs });
+          while (revokedCommands.size > 1_000) revokedCommands.delete(revokedCommands.keys().next().value!);
           server.ws.send("draw:mcp-command-revoked", { id, clientId: waiting.clientId, clientIdentity });
           waiting.resolve({ id, clientId: waiting.clientId, clientIdentity, revoked: true, error: "This MCP client was revoked while its request was in flight." });
         }
@@ -448,9 +452,13 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
             }
             clearTimeout(pendingPairing.timer);
             pendingMcpPairings.delete(requestId);
-            const credential = await (await getMcpAuth()).resolvePairing(requestId, body.approved);
-            pendingPairing.resolve(credential);
-            sendJson(response, 200, { status: credential ? "APPROVED" : "DENIED" });
+            const resolution = await (await getMcpAuth()).resolvePairing(requestId, body.approved);
+            if (resolution?.replacedClientIdentity) {
+              cancelMcpClientWork(resolution.replacedClientIdentity);
+              server.ws.send("draw:mcp-client-revoked", { clientIdentity: resolution.replacedClientIdentity });
+            }
+            pendingPairing.resolve(resolution?.credential ?? null);
+            sendJson(response, 200, { status: resolution ? "APPROVED" : "DENIED" });
             return;
           }
 
@@ -763,6 +771,13 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
             const id = decodeURIComponent(ackMatch[1]);
             const waiting = pending.get(id);
             if (!waiting) {
+              const revoked = revokedCommands.get(id);
+              if (revoked && revoked.expiresAt > Date.now() && revoked.clientIdentity === body.clientIdentity) {
+                revokedCommands.delete(id);
+                sendJson(response, 410, { revoked: true, error: "This command was canceled because its MCP client was revoked." });
+                return;
+              }
+              revokedCommands.delete(id);
               sendJson(response, 404, { error: "No pending Draw MCP command matches this acknowledgement." });
               return;
             }

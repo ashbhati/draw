@@ -1816,6 +1816,7 @@ test("revoking an MCP client cancels its pending command without overwriting a l
     await page.keyboard.press("Control+Enter");
     await expect.poll(async () => (await currentBridgeDocument(page)).document.elements.some((element: any) => element.originalText === "Human edit after MCP")).toBe(true);
 
+    await page.waitForTimeout(5_000);
     await page.getByRole("button", { name: "MCP clients" }).click();
     const row = page.locator(".mcp-client-row").filter({ hasText: credential.clientIdentity });
     await row.getByRole("button", { name: "Revoke" }).click();
@@ -1842,6 +1843,113 @@ test("revoking an MCP client cancels its pending command without overwriting a l
   const saved = JSON.parse(await readFile(await (await savedFile).path(), "utf8"));
   expect(saved.document.elements).toEqual(expect.arrayContaining([expect.objectContaining({ originalText: "Human edit after MCP" })]));
   expect(saved.document.elements.filter((element: any) => element.originalText === "Human edit after MCP")).toHaveLength(1);
+});
+
+test("revocation rolls back in place and retains the selected human scene and undo history", async ({ page, baseURL }) => {
+  if (!baseURL) throw new Error("Playwright baseURL is required for the rollback-history test.");
+  const directory = await mkdtemp(join(tmpdir(), "draw-mcp-rollback-history-e2e-"));
+  let mcp: Awaited<ReturnType<typeof startStdioMcp>> | null = null;
+  let resumeAck!: () => void;
+  let ackIntercepted!: () => void;
+  let ackStatus: number | null = null;
+  let editorSecret = "";
+  const ackGate = new Promise<void>((resolve) => { resumeAck = resolve; });
+  const ackSeen = new Promise<void>((resolve) => { ackIntercepted = resolve; });
+  try {
+    await page.goto("/");
+    await connectEditorToMcp(page);
+    page.on("request", (request) => {
+      if (request.url().endsWith("/__draw/api/mcp/clients")) editorSecret = request.headers()["x-draw-editor-secret"] ?? editorSecret;
+    });
+    await page.waitForTimeout(5_000);
+    await page.getByRole("button", { name: "MCP clients" }).click();
+    const pairingSecret = await page.locator(".mcp-pairing-secret code").innerText();
+    mcp = await startStdioMcp(baseURL, directory, pairingSecret);
+    const pairing = mcp.call("pair_mcp_client", {});
+    await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
+    await page.getByRole("button", { name: "Approve client" }).click();
+    expect((await pairing).result.isError).not.toBe(true);
+    const credential = JSON.parse(await readFile(mcp.credentialPath, "utf8"));
+    await page.getByRole("button", { name: "Close" }).click();
+
+    const beforeFixture = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const fixtureResponse = await mcp.call("create_diagram", {
+      documentId: beforeFixture.documentId, expectedDocumentRevision: beforeFixture.documentRevision,
+      nodes: [{ id: "update-target", label: "Existing MCP node", x: 650, y: 180, width: 220, height: 90 }], edges: [],
+    });
+    expect(fixtureResponse.error).toBeUndefined();
+    const fixture = JSON.parse(fixtureResponse.result.content[0].text);
+    const updateTargetId = fixture.nodes["update-target"];
+
+    await page.locator('.excalidraw label[title^="Rectangle"]').click();
+    const canvas = page.locator(".excalidraw canvas").last();
+    const bounds = await canvas.boundingBox();
+    if (!bounds) throw new Error("Could not locate the canvas.");
+    const startX = bounds.x + bounds.width / 2 - 70;
+    const startY = bounds.y + bounds.height / 2 - 30;
+    await page.mouse.move(startX, startY);
+    await page.mouse.down();
+    await page.mouse.move(startX + 140, startY + 100);
+    await page.mouse.up();
+    await expect.poll(async () => (await currentBridgeDocument(page)).document.elements.some((element: any) => element.type === "rectangle")).toBe(true);
+    const initial = await currentBridgeDocument(page);
+    const humanRectangle = initial.document.elements.find((element: any) => element.type === "rectangle");
+    await page.locator('.excalidraw label[title^="Selection"]').click();
+    await page.mouse.click(bounds.x + humanRectangle.x + humanRectangle.width / 2, bounds.y + humanRectangle.y + humanRectangle.height / 2);
+    await expect.poll(async () => (await currentBridgeDocument(page)).document.appState.selectedElementIds?.[humanRectangle.id]).toBe(true);
+    const beforeUpdate = await currentBridgeDocument(page);
+
+    await page.route("**/__draw/api/commands/*/ack", async (route) => {
+      ackIntercepted();
+      await ackGate;
+      const response = await route.fetch();
+      ackStatus = response.status();
+      await route.fulfill({ response });
+    });
+    await page.evaluate(({ headers, documentId, documentRevision, updateTargetId }) => {
+      (window as any).__pendingMcpResponse = fetch("/__draw/api/commands", {
+        method: "POST", headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify({ operation: "update_elements", input: {
+          documentId,
+          expectedDocumentRevision: documentRevision,
+          updates: [{ id: updateTargetId, patch: { text: "Should roll back" } }],
+        } }),
+      }).then(async (response) => ({ status: response.status, body: await response.json() }));
+    }, {
+      headers: { "x-draw-client-identity": credential.clientIdentity, authorization: `Bearer ${credential.capability}` },
+      documentId: beforeUpdate.document.id,
+      documentRevision: beforeUpdate.document.documentRevision,
+      updateTargetId,
+    });
+    await ackSeen;
+    expect((await currentBridgeDocument(page)).document.elements.some((element: any) => element.originalText === "Should roll back")).toBe(true);
+
+    const revokeResponse = await page.request.delete(`/__draw/api/mcp/clients/${credential.clientIdentity}`, {
+      headers: { "content-type": "application/json", origin: new URL(page.url()).origin, "x-draw-editor-secret": editorSecret }, data: {},
+    });
+    expect(revokeResponse.status()).toBe(200);
+    resumeAck();
+    await expect.poll(() => ackStatus).toBe(410);
+    await expect.poll(async () => (await currentBridgeDocument(page)).document.elements.some((element: any) => element.originalText === "Should roll back")).toBe(false);
+    const canceledResponse = await page.evaluate(async () => await (window as any).__pendingMcpResponse);
+    expect(canceledResponse.status).toBe(401);
+    expect(ackStatus).toBe(410);
+    await expect.poll(async () => (await currentBridgeDocument(page)).document.appState.selectedElementIds?.[humanRectangle.id]).toBe(true);
+    const undoButton = page.getByRole("button", { name: "Undo" });
+    await expect(undoButton).toBeEnabled();
+    let humanRectangleStillPresent = true;
+    for (let attempt = 0; attempt < 6 && humanRectangleStillPresent && await undoButton.isEnabled(); attempt += 1) {
+      await undoButton.click();
+      await page.waitForTimeout(80);
+      humanRectangleStillPresent = (await currentBridgeDocument(page)).document.elements.some((element: any) => element.id === humanRectangle.id && element.isDeleted !== true);
+    }
+    await expect.poll(async () => (await currentBridgeDocument(page)).document.elements.some((element: any) => element.id === humanRectangle.id && element.isDeleted !== true)).toBe(false);
+  } finally {
+    resumeAck();
+    await page.unroute("**/__draw/api/commands/*/ack").catch(() => undefined);
+    await mcp?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject paths safely", async ({ page, baseURL }) => {

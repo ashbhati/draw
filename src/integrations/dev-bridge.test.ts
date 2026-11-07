@@ -178,7 +178,8 @@ describe("Draw MCP Vite bridge", () => {
     expect((await flushA).status).toBe(401);
     expect((await bridge.editorRequest("editor-tab", "POST", `/__draw/api/commands/${eventA.id}/ack`, {
       id: eventA.id, clientId: "editor-tab", clientIdentity: "client-A", document,
-    })).status).toBe(404);
+    })).status).toBe(410);
+    expect((await bridge.mcpRequest("client-B", capabilityB, "GET", "/__draw/api/document")).body).toEqual(document);
     expect((await bridge.editorRequest("editor-tab", "POST", `/__draw/api/document/flush/${flushEventA.id}`, {
       id: flushEventA.id, clientId: "editor-tab", clientIdentity: "client-A", document,
     })).status).toBe(404);
@@ -192,6 +193,47 @@ describe("Draw MCP Vite bridge", () => {
     })).status).toBe(200);
     expect((await commandB).status).toBe(200);
     expect((await bridge.editorRequest("editor-tab", "PUT", "/__draw/api/document", { clientId: "editor-tab", document })).status).toBe(200);
+  });
+
+  it("cancels old MCP commands and confirmation when approval replaces the same fingerprint", async () => {
+    const bridge = createBridgeHarness({ commandTimeoutMs: 1_000 });
+    const document = createEmptyDocument("Replace paired host");
+    await bridge.registerClient("editor-tab");
+    await bridge.editorRequest("editor-tab", "PUT", "/__draw/api/document", { clientId: "editor-tab", document });
+    const oldCommand = bridge.request("POST", "/__draw/api/commands", {
+      operation: "create_diagram", input: { nodes: [{ id: "old", label: "Old", x: 0, y: 0 }], edges: [] },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const oldCommandEvent = bridge.events.find(({ event }) => event === "draw:mcp-command")?.data;
+    const confirmation = await bridge.request("POST", "/__draw/api/confirmations", {
+      action: "open_document", documentId: document.document.id, expectedDocumentRevision: 0,
+      filename: "incoming.draw", fingerprint: "c".repeat(64),
+    });
+    expect(confirmation.status).toBe(202);
+
+    const pairingSecret = await bridge.editorRequest("editor-tab", "POST", "/__draw/api/mcp/pairing-secret", {});
+    const replacementPairing = bridge.request("POST", "/__draw/api/mcp/pair", {
+      pairingSecret: pairingSecret.body.pairingSecret, clientName: "Replacement host", fingerprint: "a".repeat(64),
+    }, "127.0.0.1", {}, false);
+    await new Promise((resolve) => setImmediate(resolve));
+    const pairingEvent = bridge.events.filter(({ event }) => event === "draw:mcp-pairing-required").slice(-1)[0]?.data;
+    expect(pairingEvent).toMatchObject({ replacesName: "Test MCP" });
+    expect((await bridge.editorRequest("editor-tab", "POST", `/__draw/api/mcp/pairings/${pairingEvent.requestId}/respond`, {
+      clientId: "editor-tab", approved: true,
+    })).body.status).toBe("APPROVED");
+
+    const replacement = await replacementPairing;
+    expect(replacement.status).toBe(200);
+    expect((await oldCommand).status).toBe(401);
+    expect((await bridge.request("POST", `/__draw/api/confirmations/${confirmation.body.confirmationToken}/consume`, {
+      action: "open_document", documentId: document.document.id, expectedDocumentRevision: 0,
+      filename: "incoming.draw", fingerprint: "c".repeat(64),
+    })).status).toBe(401);
+    expect((await bridge.editorRequest("editor-tab", "POST", `/__draw/api/commands/${oldCommandEvent.id}/ack`, {
+      id: oldCommandEvent.id, clientId: "editor-tab", clientIdentity: "test-mcp-client", document,
+    })).status).toBe(410);
+    expect(bridge.events.some(({ event, data }) => event === "draw:confirmation-revoked" && data.token === confirmation.body.confirmationToken)).toBe(true);
+    expect(bridge.events.some(({ event, data }) => event === "draw:mcp-client-revoked" && data.clientIdentity === "test-mcp-client")).toBe(true);
   });
 
   it("binds dirty-open confirmations to their creator and removes them on revocation", async () => {

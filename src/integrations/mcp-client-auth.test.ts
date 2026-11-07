@@ -23,9 +23,9 @@ describe("paired MCP client authentication", () => {
     expect(manager.authenticate("client-stable-id", "a".repeat(64))).toBe(false);
     const paired = await manager.resolvePairing(request.requestId, true);
     if (!paired) throw new Error("Approved pairing did not issue a client credential.");
-    expect(paired).toMatchObject({ clientIdentity: "client-stable-id", capability: "a".repeat(64) });
-    expect(manager.authenticate(paired.clientIdentity, paired.capability)).toBe(true);
-    expect(manager.authenticate(paired.clientIdentity, "wrong")).toBe(false);
+    expect(paired.credential).toMatchObject({ clientIdentity: "client-stable-id", capability: "a".repeat(64) });
+    expect(manager.authenticate(paired.credential.clientIdentity, paired.credential.capability)).toBe(true);
+    expect(manager.authenticate(paired.credential.clientIdentity, "wrong")).toBe(false);
     expect(await manager.issuePairingCode()).toBeNull();
   });
 
@@ -68,11 +68,11 @@ describe("paired MCP client authentication", () => {
       const paired = await first.resolvePairing(request.requestId, true);
       if (!paired) throw new Error("Approved pairing did not issue a client credential.");
       const second = await createMcpClientAuthManager({ store: createFileMcpClientAuthStore(path) });
-      expect(second.authenticate(paired.clientIdentity, paired.capability)).toBe(true);
-      await second.revoke(paired.clientIdentity);
+      expect(second.authenticate(paired.credential.clientIdentity, paired.credential.capability)).toBe(true);
+      await second.revoke(paired.credential.clientIdentity);
       const third = await createMcpClientAuthManager({ store: createFileMcpClientAuthStore(path) });
-      expect(third.authenticate(paired.clientIdentity, paired.capability)).toBe(false);
-      expect(JSON.parse(await readFile(path, "utf8")).clients[0].secretHash).not.toBe(paired.capability);
+      expect(third.authenticate(paired.credential.clientIdentity, paired.credential.capability)).toBe(false);
+      expect(JSON.parse(await readFile(path, "utf8")).clients[0].secretHash).not.toBe(paired.credential.capability);
       expect((await stat(path)).mode & 0o777).toBe(0o600);
     } finally {
       await rm(directory, { recursive: true, force: true });
@@ -122,7 +122,7 @@ describe("paired MCP client authentication", () => {
     const code = await manager.issuePairingCode();
     const first = await manager.beginPairing(code, "host one", "1".repeat(64));
     await expect(manager.beginPairing(code, "host two", "2".repeat(64))).rejects.toThrow();
-    expect(await manager.resolvePairing(first.requestId, true)).toMatchObject({ clientIdentity: expect.any(String) });
+    expect(await manager.resolvePairing(first.requestId, true)).toMatchObject({ credential: { clientIdentity: expect.any(String) } });
   });
 
   it("always performs capability hash comparison for unknown, revoked, and expired identities", async () => {
@@ -158,9 +158,9 @@ describe("paired MCP client authentication", () => {
     const requestB = await manager.beginPairing(codeB, "Host B", "b".repeat(64));
     const pairedB = await manager.resolvePairing(requestB.requestId, true);
     if (!pairedB) throw new Error("Host B pairing was not approved.");
-    expect(await manager.revoke(pairedA.clientIdentity)).toBe(true);
-    expect(manager.authenticate(pairedA.clientIdentity, pairedA.capability)).toBe(false);
-    expect(manager.authenticate(pairedB.clientIdentity, pairedB.capability)).toBe(true);
+    expect(await manager.revoke(pairedA.credential.clientIdentity)).toBe(true);
+    expect(manager.authenticate(pairedA.credential.clientIdentity, pairedA.credential.capability)).toBe(false);
+    expect(manager.authenticate(pairedB.credential.clientIdentity, pairedB.credential.capability)).toBe(true);
 
     now += 5_000;
     const replacementCode = await manager.issuePairingCode();
@@ -168,7 +168,8 @@ describe("paired MCP client authentication", () => {
     expect(replacement.replacesName).toBe("Host B");
     const pairedReplacement = await manager.resolvePairing(replacement.requestId, true);
     if (!pairedReplacement) throw new Error("Replacement pairing was not approved.");
-    expect(manager.authenticate(pairedB.clientIdentity, pairedB.capability)).toBe(false);
+    expect(pairedReplacement.replacedClientIdentity).toBe(pairedB.credential.clientIdentity);
+    expect(manager.authenticate(pairedB.credential.clientIdentity, pairedB.credential.capability)).toBe(false);
   });
 
   it("throttles pairing-secret issue/reissue and reuses the same live secret", async () => {
