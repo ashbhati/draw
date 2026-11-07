@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { chmod, lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, mkdir, open, rename, writeFile, type FileHandle } from "node:fs/promises";
 
 export type LocalMcpCredential = {
   installationId: string;
@@ -14,13 +15,19 @@ export function localMcpCredentialPath(): string {
   return process.env.DRAW_MCP_CLIENT_CREDENTIAL_PATH ?? join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "draw", "mcp-client-credential.json");
 }
 
-export async function readLocalMcpCredential(filePath = localMcpCredentialPath()): Promise<LocalMcpCredential | null> {
+export async function readLocalMcpCredential(
+  filePath = localMcpCredentialPath(),
+  openFile: typeof open = open,
+): Promise<LocalMcpCredential | null> {
+  let handle: FileHandle | undefined;
   try {
-    const metadata = await lstat(filePath);
-    if (metadata.isSymbolicLink() || process.platform !== "win32" && (metadata.mode & 0o077) !== 0) {
+    const flags = constants.O_RDONLY | (process.platform !== "win32" ? constants.O_NOFOLLOW : 0);
+    handle = await openFile(filePath, flags);
+    const metadata = await handle.stat();
+    if (!metadata.isFile() || process.platform !== "win32" && (metadata.mode & 0o077) !== 0) {
       throw new Error("Draw MCP credential file permissions are too broad. Set mode 0600 or choose a private credential path.");
     }
-    const parsed: unknown = JSON.parse(await readFile(filePath, "utf8"));
+    const parsed: unknown = JSON.parse(await handle.readFile("utf8"));
     if (typeof parsed !== "object" || parsed === null || typeof (parsed as LocalMcpCredential).installationId !== "string") {
       throw new Error("Draw MCP credential file is invalid. Remove it and pair this MCP host again.");
     }
@@ -33,7 +40,12 @@ export async function readLocalMcpCredential(filePath = localMcpCredentialPath()
     return value;
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+    if (error instanceof Error && "code" in error && error.code === "ELOOP") {
+      throw new Error("Draw MCP credential file cannot be a symbolic link.");
+    }
     throw error;
+  } finally {
+    await handle?.close();
   }
 }
 

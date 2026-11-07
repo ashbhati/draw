@@ -35,13 +35,15 @@ export type McpPairingRequest = {
   name: string;
   fingerprint: string;
   expiresAt: number;
+  replacesName?: string;
 };
 
 export type PairedMcpCredential = { clientIdentity: string; capability: string; expiresAt: number };
 
 export type McpClientAuthManager = {
-  issuePairingCode: () => string | null;
+  issuePairingCode: () => Promise<string | null>;
   beginPairing: (code: unknown, name: unknown, fingerprint: unknown) => Promise<McpPairingRequest>;
+  cancelPairing: (requestId: string) => Promise<boolean>;
   resolvePairing: (requestId: string, approved: boolean) => Promise<PairedMcpCredential | null>;
   authenticate: (clientIdentity: unknown, capability: unknown) => boolean;
   list: () => Array<Omit<PairedMcpClient, "secretHash">>;
@@ -70,7 +72,7 @@ function normalizeState(value: unknown): McpClientAuthState {
   const clients = candidate.clients.map((client): PairedMcpClient => {
     if (typeof client !== "object" || client === null || typeof client.clientIdentity !== "string" ||
       typeof client.name !== "string" || typeof client.fingerprint !== "string" ||
-      typeof client.secretHash !== "string" || !Number.isFinite(client.createdAt) ||
+      typeof client.secretHash !== "string" || !/^[a-f\d]{64}$/i.test(client.secretHash) || !Number.isFinite(client.createdAt) ||
       !Number.isFinite(client.expiresAt) || (client.revokedAt !== null && !Number.isFinite(client.revokedAt))) {
       throw new Error("MCP client credential store is invalid.");
     }
@@ -144,28 +146,44 @@ export async function createMcpClientAuthManager(options: McpClientAuthOptions =
 
   return {
     issuePairingCode() {
-      const currentTime = now();
-      if (currentTime < state.lockedUntil || pending && pending.expiresAt > currentTime) return null;
-      if (lastPairingCodeIssuedAt !== null && currentTime - lastPairingCodeIssuedAt < PAIRING_CODE_REISSUE_MS) return null;
-      if (pairingCode && currentTime < pairingExpiresAt) {
+      return serialize(async () => {
+        const currentTime = now();
+        if (pending && pending.expiresAt <= currentTime) pending = null;
+        if (state.lockedUntil && currentTime >= state.lockedUntil) {
+          state = { ...state, failedAttempts: 0, lockedUntil: 0 };
+          await store.save(state);
+        }
+        if (currentTime < state.lockedUntil || pending && pending.expiresAt > currentTime) return null;
+        if (lastPairingCodeIssuedAt !== null && currentTime - lastPairingCodeIssuedAt < PAIRING_CODE_REISSUE_MS) return null;
+        if (pairingCode && currentTime < pairingExpiresAt) {
+          lastPairingCodeIssuedAt = currentTime;
+          return pairingCode;
+        }
+        const candidate = makeCode();
+        if (!/^[A-F\d]{64}$/i.test(candidate)) return null;
+        pairingCode = candidate.toUpperCase();
+        pairingExpiresAt = currentTime + pairingTtl;
         lastPairingCodeIssuedAt = currentTime;
         return pairingCode;
-      }
-      const candidate = makeCode();
-      if (!/^[A-F\d]{64}$/i.test(candidate)) return null;
-      pairingCode = candidate.toUpperCase();
-      pairingExpiresAt = currentTime + pairingTtl;
-      lastPairingCodeIssuedAt = currentTime;
-      return pairingCode;
+      });
     },
     beginPairing(code, name, fingerprint) {
       return serialize(async () => {
         const currentTime = now();
+        if (state.lockedUntil && currentTime >= state.lockedUntil) {
+          state = { ...state, failedAttempts: 0, lockedUntil: 0 };
+          await store.save(state);
+        }
+        if (pending && pending.expiresAt <= currentTime) pending = null;
+        if (currentTime < state.lockedUntil) throw genericPairingError();
+        // A concurrent retry while a host is awaiting human approval must not
+        // consume the pending request, invalidate another code, or add strikes.
+        if (pending) throw genericPairingError();
         const supplied = typeof code === "string" ? code.toUpperCase() : "";
         const matches = pairingCode !== null && supplied.length === pairingCode.length && /^[A-F\d]{64}$/i.test(supplied) && constantTimeHexEqual(sha256(supplied), sha256(pairingCode));
         const validShape = typeof name === "string" && name.trim().length > 0 && name.trim().length <= 100 &&
           typeof fingerprint === "string" && /^[a-f\d]{64}$/i.test(fingerprint);
-        if (currentTime < state.lockedUntil || !matches || currentTime >= pairingExpiresAt || !validShape || pending) {
+        if (!matches || currentTime >= pairingExpiresAt || !validShape) {
           if (!matches || !validShape || currentTime >= pairingExpiresAt) {
             state = { ...state, failedAttempts: state.failedAttempts + 1 };
             if (state.failedAttempts >= maxFailedAttempts) {
@@ -179,8 +197,20 @@ export async function createMcpClientAuthManager(options: McpClientAuthOptions =
         }
         pairingCode = null;
         pairingExpiresAt = 0;
-        pending = { requestId: makeRequestId(), name: name.trim(), fingerprint: fingerprint.toLowerCase(), expiresAt: currentTime + 2 * 60_000 };
+        const existing = state.clients.find((client) => client.fingerprint === fingerprint.toLowerCase() && client.revokedAt === null && client.expiresAt > currentTime);
+        pending = {
+          requestId: makeRequestId(), name: name.trim(), fingerprint: fingerprint.toLowerCase(),
+          expiresAt: currentTime + 2 * 60_000,
+          ...(existing ? { replacesName: existing.name } : {}),
+        };
         return { ...pending };
+      });
+    },
+    cancelPairing(requestId) {
+      return serialize(async () => {
+        if (!pending || pending.requestId !== requestId) return false;
+        pending = null;
+        return true;
       });
     },
     resolvePairing(requestId, approved) {
@@ -217,10 +247,13 @@ export async function createMcpClientAuthManager(options: McpClientAuthOptions =
       });
     },
     authenticate(clientIdentity, capability) {
-      if (typeof clientIdentity !== "string" || typeof capability !== "string") return false;
-      const client = state.clients.find((entry) => entry.clientIdentity === clientIdentity);
-      if (!client || client.revokedAt !== null || client.expiresAt <= now()) return false;
-      return constantTimeHexEqual(client.secretHash, sha256(capability));
+      const identity = typeof clientIdentity === "string" ? clientIdentity : "";
+      const supplied = typeof capability === "string" ? capability : "";
+      const client = state.clients.find((entry) => entry.clientIdentity === identity);
+      const isActive = Boolean(client && client.revokedAt === null && client.expiresAt > now());
+      const expectedHash = isActive ? client!.secretHash : "0".repeat(64);
+      const matches = constantTimeHexEqual(expectedHash, sha256(supplied));
+      return isActive && matches;
     },
     list() {
       return state.clients.map(({ secretHash: _secretHash, ...client }) => ({ ...client }));

@@ -12,7 +12,7 @@ import type { McpClientAuthState } from "./mcp-client-auth";
 type CapturedResponse = { status: number; body: any };
 type Middleware = (request: any, response: any, next: (error?: unknown) => void) => void;
 
-function createBridgeHarness(options: DrawMcpBridgeOptions = {}, config: { mode?: string; host?: string; isProduction?: boolean; useFileStore?: boolean } = {}) {
+function createBridgeHarness(options: DrawMcpBridgeOptions = {}, config: { mode?: string; host?: string; isProduction?: boolean; useFileStore?: boolean; extraMcpClients?: Array<{ identity: string; capability: string }> } = {}) {
   let middleware: Middleware | undefined;
   const events: Array<{ event: string; data: any }> = [];
   let launchCode = "";
@@ -22,7 +22,10 @@ function createBridgeHarness(options: DrawMcpBridgeOptions = {}, config: { mode?
   let mcpState: McpClientAuthState = {
     failedAttempts: 0,
     lockedUntil: 0,
-    clients: [{ clientIdentity: "test-mcp-client", name: "Test MCP", fingerprint: "a".repeat(64), secretHash: createHash("sha256").update(mcpCapability).digest("hex"), createdAt: Date.now(), expiresAt: Date.now() + 86_400_000, revokedAt: null }],
+    clients: [
+      { clientIdentity: "test-mcp-client", name: "Test MCP", fingerprint: "a".repeat(64), secretHash: createHash("sha256").update(mcpCapability).digest("hex"), createdAt: Date.now(), expiresAt: Date.now() + 86_400_000, revokedAt: null },
+      ...(config.extraMcpClients ?? []).map(({ identity, capability }, index) => ({ clientIdentity: identity, name: identity, fingerprint: `${index + 1}`.repeat(64), secretHash: createHash("sha256").update(capability).digest("hex"), createdAt: Date.now(), expiresAt: Date.now() + 86_400_000, revokedAt: null })),
+    ],
   };
   const injectedAuth = config.useFileStore ? {} : { editorAuthForTests: {
     displayLaunchCode: (code: string) => { launchCode = code; return true; },
@@ -82,7 +85,8 @@ function createBridgeHarness(options: DrawMcpBridgeOptions = {}, config: { mode?
     return request(method, path, body, "127.0.0.1", { origin: "http://127.0.0.1:5173", "x-draw-editor-secret": session.editorSecret });
   };
   const reissueCode = () => request("POST", "/__draw/api/editor/reissue-code", {}, "127.0.0.1", { origin: "http://127.0.0.1:5173" });
-  return { request, editorRequest, registerClient, reissueCode, events, getLaunchCode: () => launchCode, getSession: (clientId: string) => sessions.get(clientId) };
+  const mcpRequest = (identity: string, capability: string, method: string, path: string, body?: unknown) => request(method, path, body, "127.0.0.1", { "x-draw-client-identity": identity, authorization: `Bearer ${capability}` }, false);
+  return { request, editorRequest, registerClient, reissueCode, mcpRequest, events, getLaunchCode: () => launchCode, getSession: (clientId: string) => sessions.get(clientId) };
 }
 
 describe("Draw MCP Vite bridge", () => {
@@ -135,6 +139,83 @@ describe("Draw MCP Vite bridge", () => {
       "x-draw-client-identity": paired.body.clientIdentity, authorization: `Bearer ${paired.body.capability}`,
     })).status).toBe(401);
     expect((await bridge.editorRequest("pairing-tab", "PUT", "/__draw/api/document", { clientId: "pairing-tab", document: createEmptyDocument("Editor remains connected") })).status).toBe(200);
+  });
+
+  it("does not consume a pairing code when no editor is connected", async () => {
+    const bridge = createBridgeHarness();
+    const unavailable = await bridge.request("POST", "/__draw/api/mcp/pair", {
+      pairingSecret: "a".repeat(64), clientName: "MCP host", fingerprint: "9".repeat(64),
+    }, "127.0.0.1", {}, false);
+    expect(unavailable.status).toBe(409);
+    expect((await bridge.registerClient("connected-tab")).response.status).toBe(200);
+    const code = await bridge.editorRequest("connected-tab", "POST", "/__draw/api/mcp/pairing-secret", {});
+    expect(code.status).toBe(200);
+    expect(code.body.pairingSecret).toMatch(/^[a-f\d]{64}$/i);
+  });
+
+  it("binds pending commands and flushes to the authenticated MCP identity and cancels them on revocation", async () => {
+    const capabilityA = "a".repeat(64);
+    const capabilityB = "b".repeat(64);
+    const bridge = createBridgeHarness({ commandTimeoutMs: 1_000, flushTimeoutMs: 1_000 }, {
+      extraMcpClients: [{ identity: "client-A", capability: capabilityA }, { identity: "client-B", capability: capabilityB }],
+    });
+    const document = createEmptyDocument("Identity-bound work");
+    await bridge.registerClient("editor-tab");
+    await bridge.editorRequest("editor-tab", "PUT", "/__draw/api/document", { clientId: "editor-tab", document });
+
+    const commandA = bridge.mcpRequest("client-A", capabilityA, "POST", "/__draw/api/commands", { operation: "create_diagram", input: { nodes: [{ id: "a", label: "A", x: 0, y: 0 }], edges: [] } });
+    await new Promise((resolve) => setImmediate(resolve));
+    const eventA = bridge.events.find(({ event }) => event === "draw:mcp-command")?.data;
+    expect(eventA).toMatchObject({ clientIdentity: "client-A" });
+
+    const flushA = bridge.mcpRequest("client-A", capabilityA, "GET", "/__draw/api/document?flush=1");
+    await new Promise((resolve) => setImmediate(resolve));
+    const flushEventA = bridge.events.find(({ event }) => event === "draw:flush-document")?.data;
+    expect(flushEventA).toMatchObject({ clientIdentity: "client-A" });
+
+    expect((await bridge.editorRequest("editor-tab", "DELETE", "/__draw/api/mcp/clients/client-A")).body.revoked).toBe(true);
+    expect((await commandA).status).toBe(401);
+    expect((await flushA).status).toBe(401);
+    expect((await bridge.editorRequest("editor-tab", "POST", `/__draw/api/commands/${eventA.id}/ack`, {
+      id: eventA.id, clientId: "editor-tab", clientIdentity: "client-A", document,
+    })).status).toBe(404);
+    expect((await bridge.editorRequest("editor-tab", "POST", `/__draw/api/document/flush/${flushEventA.id}`, {
+      id: flushEventA.id, clientId: "editor-tab", clientIdentity: "client-A", document,
+    })).status).toBe(404);
+
+    const commandB = bridge.mcpRequest("client-B", capabilityB, "POST", "/__draw/api/commands", { operation: "create_diagram", input: { nodes: [{ id: "b", label: "B", x: 0, y: 0 }], edges: [] } });
+    await new Promise((resolve) => setImmediate(resolve));
+    const eventB = bridge.events.filter(({ event }) => event === "draw:mcp-command").at(-1)?.data;
+    expect(eventB).toMatchObject({ clientIdentity: "client-B" });
+    expect((await bridge.editorRequest("editor-tab", "POST", `/__draw/api/commands/${eventB.id}/ack`, {
+      id: eventB.id, clientId: "editor-tab", clientIdentity: "client-B", document, result: { ok: true },
+    })).status).toBe(200);
+    expect((await commandB).status).toBe(200);
+    expect((await bridge.editorRequest("editor-tab", "PUT", "/__draw/api/document", { clientId: "editor-tab", document })).status).toBe(200);
+  });
+
+  it("binds dirty-open confirmations to their creator and removes them on revocation", async () => {
+    const capabilityA = "a".repeat(64);
+    const capabilityB = "b".repeat(64);
+    const bridge = createBridgeHarness({}, {
+      extraMcpClients: [{ identity: "client-A", capability: capabilityA }, { identity: "client-B", capability: capabilityB }],
+    });
+    const document = createEmptyDocument("Active confirmation canvas");
+    await bridge.registerClient("editor-tab");
+    await bridge.editorRequest("editor-tab", "PUT", "/__draw/api/document", { clientId: "editor-tab", document });
+    const challenge = await bridge.mcpRequest("client-A", capabilityA, "POST", "/__draw/api/confirmations", {
+      action: "open_document", documentId: document.document.id, expectedDocumentRevision: 0,
+      filename: "incoming.draw", fingerprint: "c".repeat(64),
+    });
+    expect(challenge.status).toBe(202);
+    expect(bridge.events.find(({ event }) => event === "draw:confirmation-required")?.data).toMatchObject({ clientIdentity: "client-A" });
+    const consumeBody = { action: "open_document", documentId: document.document.id, expectedDocumentRevision: 0, filename: "incoming.draw", fingerprint: "c".repeat(64) };
+    expect((await bridge.mcpRequest("client-B", capabilityB, "POST", `/__draw/api/confirmations/${challenge.body.confirmationToken}/consume`, consumeBody)).status).toBe(404);
+    expect((await bridge.mcpRequest("client-A", capabilityA, "POST", `/__draw/api/confirmations/${challenge.body.confirmationToken}/consume`, consumeBody)).body.status).toBe("PENDING");
+    expect((await bridge.editorRequest("editor-tab", "DELETE", "/__draw/api/mcp/clients/client-A")).body.revoked).toBe(true);
+    expect((await bridge.mcpRequest("client-A", capabilityA, "POST", `/__draw/api/confirmations/${challenge.body.confirmationToken}/consume`, consumeBody)).status).toBe(401);
+    expect(bridge.events.some(({ event, data }) => event === "draw:confirmation-revoked" && data.token === challenge.body.confirmationToken)).toBe(true);
+    expect((await bridge.mcpRequest("client-B", capabilityB, "GET", "/__draw/api/document")).status).toBe(200);
   });
 
   it("only accepts loopback requests", async () => {
@@ -233,6 +314,7 @@ describe("Draw MCP Vite bridge", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     const message = bridge.events.find(({ event }) => event === "draw:mcp-command")?.data;
     expect(message).toMatchObject({ clientId: "tab-1", operation: "create_diagram" });
+    expect(message.clientIdentity).toBe("test-mcp-client");
     expect(message.id).toBeTruthy();
 
     const updated = structuredClone(document);
@@ -242,6 +324,7 @@ describe("Draw MCP Vite bridge", () => {
     const ack = await bridge.editorRequest("tab-1", "POST", `/__draw/api/commands/${message.id}/ack`, {
       id: message.id,
       clientId: "tab-1",
+      clientIdentity: message.clientIdentity,
       result: { addedElementIds: ["one"] },
     });
     expect(ack.status).toBe(200);
@@ -284,7 +367,7 @@ describe("Draw MCP Vite bridge", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     const command = bridge.events.find(({ event }) => event === "draw:mcp-command")?.data;
     expect(command?.clientId).toBe("tab-1");
-    const ackBody = { id: command.id, clientId: "tab-1", document: active, result: { background: "white" } };
+    const ackBody = { id: command.id, clientId: "tab-1", clientIdentity: command.clientIdentity, document: active, result: { background: "white" } };
     const spoofedAck = await bridge.request("POST", `/__draw/api/commands/${command.id}/ack`, ackBody);
     expect(spoofedAck.status).toBe(401);
     const wrongSecretAck = await bridge.request("POST", `/__draw/api/commands/${command.id}/ack`, ackBody, "127.0.0.1", { "x-draw-editor-secret": "c".repeat(64) });
@@ -300,7 +383,7 @@ describe("Draw MCP Vite bridge", () => {
     const flushPromise = bridge.request("GET", "/__draw/api/document?flush=1");
     await new Promise((resolve) => setTimeout(resolve, 0));
     const flush = bridge.events.find(({ event }) => event === "draw:flush-document")?.data;
-    const flushBody = { id: flush.id, clientId: "tab-1", document: active };
+    const flushBody = { id: flush.id, clientId: "tab-1", clientIdentity: flush.clientIdentity, document: active };
     expect((await bridge.request("POST", `/__draw/api/document/flush/${flush.id}`, flushBody)).status).toBe(401);
     expect((await bridge.request("POST", `/__draw/api/document/flush/${flush.id}`, flushBody, "127.0.0.1", { "x-draw-editor-secret": "d".repeat(64) })).status).toBe(401);
     expect((await bridge.editorRequest("tab-1", "POST", `/__draw/api/document/flush/${flush.id}`, flushBody)).status).toBe(200);
@@ -334,7 +417,7 @@ describe("Draw MCP Vite bridge", () => {
     expect(bridge.events.some(({ event, data }) => event === "draw:editor-lease-revoked" && data.clientId === "live-tab")).toBe(false);
     expect((await bridge.editorRequest("live-tab", "PUT", "/__draw/api/document", { clientId: "live-tab", document })).status).toBe(200);
     expect((await bridge.editorRequest("live-tab", "POST", `/__draw/api/commands/${command.id}/ack`, {
-      id: command.id, clientId: "live-tab", document, result: { survived: true },
+      id: command.id, clientId: "live-tab", clientIdentity: command.clientIdentity, document, result: { survived: true },
     })).status).toBe(200);
     expect((await pendingCommand).body.result).toEqual({ survived: true });
 
@@ -474,11 +557,12 @@ describe("Draw MCP Vite bridge", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     const message = bridge.events.find(({ event }) => event === "draw:flush-document")?.data;
     expect(message).toMatchObject({ clientId: "tab-1" });
+    expect(message.clientIdentity).toBe("test-mcp-client");
 
     const edited = structuredClone(original);
     edited.document.elements.push({ id: "immediate-edit", type: "rectangle" });
     const ack = await bridge.editorRequest("tab-1", "POST", `/__draw/api/document/flush/${message.id}`, {
-      clientId: "tab-1", document: edited,
+      clientId: "tab-1", clientIdentity: message.clientIdentity, document: edited,
     });
     expect(ack.status).toBe(200);
     const read = await readPromise;
@@ -505,6 +589,7 @@ describe("Draw MCP Vite bridge", () => {
     lateDocument.document.elements.push({ id: "late-shape", type: "rectangle" });
     const ack = await bridge.editorRequest("tab-1", "POST", `/__draw/api/commands/${message.id}/ack`, {
       clientId: "tab-1",
+      clientIdentity: message.clientIdentity,
       document: lateDocument,
       result: { addedElementIds: ["late-shape"] },
     });

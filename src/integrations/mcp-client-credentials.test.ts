@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -39,6 +39,44 @@ describe("local MCP host credentials", () => {
       await writeFile(path, JSON.stringify({ installationId: "host", clientIdentity: "id", capability: "b".repeat(64) }));
       await chmod(path, 0o644);
       await expect(readLocalMcpCredential(path)).rejects.toThrow(/permissions are too broad/i);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects symlink credentials and permission changes made after pairing", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "draw-mcp-host-race-"));
+    const path = join(directory, "client.json");
+    const target = join(directory, "target.json");
+    try {
+      await writeLocalMcpCredential({ installationId: "host", clientIdentity: "id", capability: "c".repeat(64) }, target);
+      await symlink(target, path);
+      await expect(readLocalMcpCredential(path)).rejects.toThrow(/permissions|symlink|symbolic/i);
+      await rm(path);
+      await writeLocalMcpCredential({ installationId: "host", clientIdentity: "id", capability: "c".repeat(64) }, path);
+      await chmod(path, 0o644);
+      await expect(readLocalMcpCredential(path)).rejects.toThrow(/permissions are too broad/i);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reads the originally opened file if its path is replaced during validation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "draw-mcp-host-open-race-"));
+    const path = join(directory, "client.json");
+    const replacement = join(directory, "replacement.json");
+    try {
+      const original = { installationId: "host", clientIdentity: "original", capability: "d".repeat(64) };
+      const attacker = { installationId: "host", clientIdentity: "attacker", capability: "e".repeat(64) };
+      await writeLocalMcpCredential(original, path);
+      await writeLocalMcpCredential(attacker, replacement);
+      const credential = await readLocalMcpCredential(path, async (filePath, flags) => {
+        const handle = await import("node:fs/promises").then(({ open }) => open(filePath, flags));
+        await rm(filePath);
+        await symlink(replacement, filePath);
+        return handle;
+      });
+      expect(credential?.clientIdentity).toBe("original");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

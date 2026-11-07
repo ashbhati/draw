@@ -17,7 +17,7 @@ describe("paired MCP client authentication", () => {
       generateIdentity: () => "client-stable-id",
       generateCapability: () => "a".repeat(64),
     });
-    const code = manager.issuePairingCode();
+    const code = await manager.issuePairingCode();
     const request = await manager.beginPairing(code, "Claude Code", "b".repeat(64));
 
     expect(manager.authenticate("client-stable-id", "a".repeat(64))).toBe(false);
@@ -26,7 +26,7 @@ describe("paired MCP client authentication", () => {
     expect(paired).toMatchObject({ clientIdentity: "client-stable-id", capability: "a".repeat(64) });
     expect(manager.authenticate(paired.clientIdentity, paired.capability)).toBe(true);
     expect(manager.authenticate(paired.clientIdentity, "wrong")).toBe(false);
-    expect(manager.issuePairingCode()).toBeNull();
+    expect(await manager.issuePairingCode()).toBeNull();
   });
 
   it("rejects missing, invalid, expired, reused, and revoked capabilities without disclosing identity existence", async () => {
@@ -39,7 +39,7 @@ describe("paired MCP client authentication", () => {
       generateIdentity: () => "client-1",
       generateCapability: () => "b".repeat(64),
     });
-    const code = manager.issuePairingCode();
+    const code = await manager.issuePairingCode();
     const request = await manager.beginPairing(code, "MCP host", "c".repeat(64));
     await manager.resolvePairing(request.requestId, true);
     expect(manager.authenticate("client-1", undefined)).toBe(false);
@@ -47,7 +47,7 @@ describe("paired MCP client authentication", () => {
     expect(manager.authenticate("client-1", "wrong")).toBe(false);
     await expect(manager.beginPairing(code, "MCP host", "c".repeat(64))).rejects.toThrow();
     now += 5_000;
-    const expiringCode = manager.issuePairingCode();
+    const expiringCode = await manager.issuePairingCode();
     now += 1_001;
     await expect(manager.beginPairing(expiringCode, "MCP host", "c".repeat(64))).rejects.toThrow();
     await manager.revoke("client-1");
@@ -64,7 +64,7 @@ describe("paired MCP client authentication", () => {
         generateIdentity: () => "durable-client",
         generateCapability: () => "d".repeat(64),
       });
-      const request = await first.beginPairing(first.issuePairingCode(), "Draw MCP", "e".repeat(64));
+      const request = await first.beginPairing(await first.issuePairingCode(), "Draw MCP", "e".repeat(64));
       const paired = await first.resolvePairing(request.requestId, true);
       if (!paired) throw new Error("Approved pairing did not issue a client credential.");
       const second = await createMcpClientAuthManager({ store: createFileMcpClientAuthStore(path) });
@@ -82,12 +82,93 @@ describe("paired MCP client authentication", () => {
   it("rate limits failed pairing-code attempts", async () => {
     const store = memoryStore();
     const manager = await createMcpClientAuthManager({ store, maxFailedAttempts: 2, generatePairingCode: () => "A".repeat(64) });
-    manager.issuePairingCode();
+    await manager.issuePairingCode();
     await expect(manager.beginPairing("wrong-code", "host", "f".repeat(64))).rejects.toThrow();
     await expect(manager.beginPairing("wrong-code", "host", "f".repeat(64))).rejects.toThrow(/pairing is unavailable/i);
-    expect(manager.issuePairingCode()).toBeNull();
+    expect(await manager.issuePairingCode()).toBeNull();
     const afterRestart = await createMcpClientAuthManager({ store, maxFailedAttempts: 2, generatePairingCode: () => "B".repeat(64) });
-    expect(afterRestart.issuePairingCode()).toBeNull();
+    expect(await afterRestart.issuePairingCode()).toBeNull();
+  });
+
+  it("does not extend a lockout and resets the failed counter after expiry", async () => {
+    let now = 1_000;
+    const store = memoryStore();
+    const manager = await createMcpClientAuthManager({
+      now: () => now,
+      store,
+      maxFailedAttempts: 2,
+      generatePairingCode: () => "A".repeat(64),
+    });
+    await manager.issuePairingCode();
+    await expect(manager.beginPairing("wrong", "host", "f".repeat(64))).rejects.toThrow();
+    await expect(manager.beginPairing("wrong", "host", "f".repeat(64))).rejects.toThrow();
+    const initialLockout = (await store.load()).lockedUntil;
+    now += 10 * 60_000;
+    await expect(manager.beginPairing("wrong", "host", "f".repeat(64))).rejects.toThrow();
+    expect((await store.load()).lockedUntil).toBe(initialLockout);
+    now = initialLockout;
+    await manager.issuePairingCode();
+    expect(await store.load()).toMatchObject({ failedAttempts: 0, lockedUntil: 0 });
+    await expect(manager.beginPairing("wrong", "host", "f".repeat(64))).rejects.toThrow();
+    expect(await store.load()).toMatchObject({ failedAttempts: 1, lockedUntil: 0 });
+  });
+
+  it("does not let a rejected pairing request disturb an existing pending request", async () => {
+    const manager = await createMcpClientAuthManager({
+      store: memoryStore(),
+      generatePairingCode: () => "A".repeat(64),
+      generateRequestId: () => "request-one",
+    });
+    const code = await manager.issuePairingCode();
+    const first = await manager.beginPairing(code, "host one", "1".repeat(64));
+    await expect(manager.beginPairing(code, "host two", "2".repeat(64))).rejects.toThrow();
+    expect(await manager.resolvePairing(first.requestId, true)).toMatchObject({ clientIdentity: expect.any(String) });
+  });
+
+  it("always performs capability hash comparison for unknown, revoked, and expired identities", async () => {
+    const manager = await createMcpClientAuthManager({
+      store: memoryStore(),
+      generatePairingCode: () => "A".repeat(64),
+      generateIdentity: () => "client-known",
+      generateCapability: () => "c".repeat(64),
+    });
+    const request = await manager.beginPairing(await manager.issuePairingCode(), "host", "3".repeat(64));
+    await manager.resolvePairing(request.requestId, true);
+    expect(manager.authenticate("client-unknown", "c".repeat(64))).toBe(false);
+    expect(manager.authenticate("client-known", "wrong")).toBe(false);
+  });
+
+  it("reports fingerprint replacements and keeps different hosts independently revocable", async () => {
+    let now = 50_000;
+    let identity = 0;
+    let capability = 0;
+    const manager = await createMcpClientAuthManager({
+      now: () => now,
+      store: memoryStore(),
+      generatePairingCode: () => "A".repeat(64),
+      generateIdentity: () => `client-${++identity}`,
+      generateCapability: () => (++capability).toString(16).padStart(64, "0"),
+    });
+    const codeA = await manager.issuePairingCode();
+    const requestA = await manager.beginPairing(codeA, "Host A", "a".repeat(64));
+    const pairedA = await manager.resolvePairing(requestA.requestId, true);
+    if (!pairedA) throw new Error("Host A pairing was not approved.");
+    now += 5_000;
+    const codeB = await manager.issuePairingCode();
+    const requestB = await manager.beginPairing(codeB, "Host B", "b".repeat(64));
+    const pairedB = await manager.resolvePairing(requestB.requestId, true);
+    if (!pairedB) throw new Error("Host B pairing was not approved.");
+    expect(await manager.revoke(pairedA.clientIdentity)).toBe(true);
+    expect(manager.authenticate(pairedA.clientIdentity, pairedA.capability)).toBe(false);
+    expect(manager.authenticate(pairedB.clientIdentity, pairedB.capability)).toBe(true);
+
+    now += 5_000;
+    const replacementCode = await manager.issuePairingCode();
+    const replacement = await manager.beginPairing(replacementCode, "Replacement A", "b".repeat(64));
+    expect(replacement.replacesName).toBe("Host B");
+    const pairedReplacement = await manager.resolvePairing(replacement.requestId, true);
+    if (!pairedReplacement) throw new Error("Replacement pairing was not approved.");
+    expect(manager.authenticate(pairedB.clientIdentity, pairedB.capability)).toBe(false);
   });
 
   it("throttles pairing-secret issue/reissue and reuses the same live secret", async () => {
@@ -98,11 +179,11 @@ describe("paired MCP client authentication", () => {
       generatePairingCode: () => (++sequence).toString(16).padStart(64, "0"),
       store: memoryStore(),
     });
-    const first = manager.issuePairingCode();
+    const first = await manager.issuePairingCode();
     expect(first).toBeTruthy();
-    expect(manager.issuePairingCode()).toBeNull();
+    expect(await manager.issuePairingCode()).toBeNull();
     now += 5_000;
-    expect(manager.issuePairingCode()).toBe(first);
+    expect(await manager.issuePairingCode()).toBe(first);
     expect(sequence).toBe(1);
   });
 });

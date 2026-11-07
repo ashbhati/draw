@@ -8,6 +8,7 @@ import { loadDrawFileSnapshot, writeNewArtifact } from "./mcp-file-access";
 import { assertInlineArtifactSize } from "./mcp-result-limits";
 import { shouldRequireOpenConfirmation } from "../document/open-safety";
 import { serializeDrawFile } from "../document/document";
+import { readConfiguredPairingSecret } from "./mcp-pairing-config";
 
 const defaultBaseUrl = "http://127.0.0.1:5173";
 const requestTimeoutMs = 25_000;
@@ -167,10 +168,7 @@ function createServer() {
     description: "Pair this MCP host with Draw. First copy Draw's one-time MCP pairing secret into protected host configuration as DRAW_MCP_PAIRING_SECRET. The tool submits that secret, a stable host fingerprint, and a configured client name; Draw asks the human owner to approve. The capability is saved locally with restrictive permissions and is never returned to the model.",
     inputSchema: z.object({}).strict(),
   }, async () => {
-    const pairingSecret = process.env.DRAW_MCP_PAIRING_SECRET;
-    if (!pairingSecret || !/^[a-f\d]{64}$/i.test(pairingSecret)) {
-      throw new Error("Set DRAW_MCP_PAIRING_SECRET in the MCP host's protected secret configuration using the secret displayed in Draw's MCP clients dialog.");
-    }
+    const pairingSecret = readConfiguredPairingSecret();
     const local = await getLocalMcpIdentity();
     const fingerprint = createHash("sha256").update(local.installationId).digest("hex");
     const clientName = process.env.DRAW_MCP_CLIENT_NAME?.trim() || "Draw MCP client";

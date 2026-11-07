@@ -1673,6 +1673,9 @@ test("selection-only export reports an empty selection when the image format cha
 test("a human pairs an MCP host, the secret stays out of tool output, and revocation blocks it", async ({ page, baseURL }) => {
   if (!baseURL) throw new Error("Playwright baseURL is required for the MCP pairing test.");
   const directory = await mkdtemp(join(tmpdir(), "draw-mcp-pairing-e2e-"));
+  const secondDirectory = await mkdtemp(join(tmpdir(), "draw-mcp-pairing-second-e2e-"));
+  let replacementMcp: Awaited<ReturnType<typeof startStdioMcp>> | null = null;
+  let secondMcp: Awaited<ReturnType<typeof startStdioMcp>> | null = null;
   await page.goto("/");
   await connectEditorToMcp(page);
   await expect(page.getByRole("button", { name: "MCP clients" })).toBeVisible();
@@ -1700,16 +1703,145 @@ test("a human pairs an MCP host, the secret stays out of tool output, and revoca
 
     const clientRow = page.locator(".mcp-client-row").filter({ hasText: publicResult.clientIdentity });
     await expect(clientRow).toBeVisible();
-    const revocationResponse = page.waitForResponse((response) => response.url().includes(`/__draw/api/mcp/clients/${publicResult.clientIdentity}`) && response.request().method() === "DELETE");
-    await clientRow.getByRole("button", { name: "Revoke" }).click();
-    expect((await revocationResponse).status()).toBe(200);
+    await page.getByRole("button", { name: "Close" }).click();
+    // Pairing-secret requests are intentionally rate-limited to one per five seconds.
+    await page.waitForTimeout(5_000);
+    await page.getByRole("button", { name: "MCP clients" }).click();
+    const replacementSecret = await page.locator(".mcp-pairing-secret code").innerText();
+    const sameHostMcp = await startStdioMcp(baseURL, directory, replacementSecret);
+    replacementMcp = sameHostMcp;
+    const replacementPairing = sameHostMcp.call("pair_mcp_client", {});
+    await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
+    await expect(page.getByRole("alert")).toContainText("will revoke the existing paired client");
+    await page.getByRole("button", { name: "Approve client" }).click();
+    const replacementPaired = await replacementPairing;
+    expect(replacementPaired.result.isError).not.toBe(true);
+    const replacementPublicResult = JSON.parse(replacementPaired.result.content[0].text);
+    expect(replacementPublicResult.clientIdentity).not.toBe(publicResult.clientIdentity);
     await expect(clientRow).toContainText("revoked");
+
+    await page.getByRole("button", { name: "Close" }).click();
+    await page.waitForTimeout(5_000);
+    await page.getByRole("button", { name: "MCP clients" }).click();
+    const secondPairingSecret = await page.locator(".mcp-pairing-secret code").innerText();
+    const mcp2 = await startStdioMcp(baseURL, secondDirectory, secondPairingSecret);
+    secondMcp = mcp2;
+    const secondPairing = mcp2.call("pair_mcp_client", {});
+    await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
+    const secondFingerprint = await page.locator("section[aria-labelledby='draw-mcp-pairing-title'] code").innerText();
+    expect(secondFingerprint).toMatch(/^[a-f\d]{64}$/i);
+    await page.getByRole("button", { name: "Approve client" }).click();
+    const secondPaired = await secondPairing;
+    expect(secondPaired.result.isError).not.toBe(true);
+    const secondPublicResult = JSON.parse(secondPaired.result.content[0].text);
+    expect(secondPublicResult.clientIdentity).not.toBe(publicResult.clientIdentity);
+    expect((await mcp2.call("get_current_canvas", {})).result.isError).not.toBe(true);
+
+    const replacementRow = page.locator(".mcp-client-row").filter({ hasText: replacementPublicResult.clientIdentity });
+    const revocationResponse = page.waitForResponse((response) => response.url().includes(`/__draw/api/mcp/clients/${replacementPublicResult.clientIdentity}`) && response.request().method() === "DELETE");
+    await replacementRow.getByRole("button", { name: "Revoke" }).click();
+    expect((await revocationResponse).status()).toBe(200);
+    await expect(replacementRow).toContainText("revoked");
     const afterRevocation = await mcp.call("get_current_canvas", {});
     expect(Boolean(afterRevocation.error || afterRevocation.result?.isError)).toBe(true);
+    expect((await mcp2.call("get_current_canvas", {})).result.isError).not.toBe(true);
   } finally {
+    await secondMcp?.close();
+    await replacementMcp?.close();
     await mcp.close();
+    await rm(secondDirectory, { recursive: true, force: true });
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("revoking an MCP client cancels its pending command without overwriting a later human edit", async ({ page, baseURL }) => {
+  if (!baseURL) throw new Error("Playwright baseURL is required for the in-flight revocation test.");
+  const directory = await mkdtemp(join(tmpdir(), "draw-mcp-revocation-e2e-"));
+  let mcp: Awaited<ReturnType<typeof startStdioMcp>> | null = null;
+  let resumeAck!: () => void;
+  let ackIntercepted!: () => void;
+  let ackContinued!: () => void;
+  let didIntercept = false;
+  let credential: any;
+  let command: any;
+  const ackGate = new Promise<void>((resolve) => { resumeAck = resolve; });
+  const ackSeen = new Promise<void>((resolve) => { ackIntercepted = resolve; });
+  const ackDone = new Promise<void>((resolve) => { ackContinued = resolve; });
+  try {
+    await page.goto("/");
+    await connectEditorToMcp(page);
+    await page.waitForTimeout(5_000);
+    await page.getByRole("button", { name: "MCP clients" }).click();
+    const pairingSecret = await page.locator(".mcp-pairing-secret code").innerText();
+    mcp = await startStdioMcp(baseURL, directory, pairingSecret);
+    const pairing = mcp.call("pair_mcp_client", {});
+    await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
+    await page.getByRole("button", { name: "Approve client" }).click();
+    expect((await pairing).result.isError).not.toBe(true);
+    credential = JSON.parse(await readFile(mcp.credentialPath, "utf8"));
+    await page.getByRole("button", { name: "Close" }).click();
+    const initial = await currentBridgeDocument(page);
+    await page.route("**/__draw/api/commands/*/ack", async (route) => {
+      didIntercept = true;
+      ackIntercepted();
+      await ackGate;
+      try { await route.continue(); } finally { ackContinued(); }
+    });
+    command = {
+      operation: "create_diagram",
+      input: {
+        documentId: initial.document.id,
+        expectedDocumentRevision: initial.document.documentRevision,
+        nodes: [{ id: "cancel-node", label: "MCP edit", x: 180, y: 160, width: 220, height: 90 }],
+        edges: [],
+      },
+    };
+    await page.evaluate(({ body, headers }) => {
+      (window as any).__pendingMcpResponse = fetch("/__draw/api/commands", {
+        method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body),
+      }).then(async (response) => ({ status: response.status, body: await response.json() }));
+    }, { body: command, headers: { "x-draw-client-identity": credential.clientIdentity, authorization: `Bearer ${credential.capability}` } });
+    await ackSeen;
+    const afterMcp = await currentBridgeDocument(page);
+    expect(afterMcp.document.elements.some((element: any) => element.text === "MCP edit" || element.originalText === "MCP edit")).toBe(true);
+    const node = afterMcp.document.elements.find((element: any) => element.id === afterMcp.document.elements.find((candidate: any) => candidate.text === "MCP edit" || candidate.originalText === "MCP edit")?.containerId) as any;
+    const canvas = page.locator(".excalidraw canvas").last();
+    const bounds = await canvas.boundingBox();
+    if (!bounds || !node) throw new Error("Could not locate the pending MCP node.");
+    await page.mouse.click(bounds.x + node.x + node.width / 2, bounds.y + node.y + node.height / 2);
+    await page.keyboard.press("Enter");
+    const editor = page.locator(".excalidraw textarea").last();
+    await expect(editor).toBeVisible();
+    await editor.fill("Human edit after MCP");
+    await page.keyboard.press("Control+Enter");
+    await expect.poll(async () => (await currentBridgeDocument(page)).document.elements.some((element: any) => element.originalText === "Human edit after MCP")).toBe(true);
+
+    await page.getByRole("button", { name: "MCP clients" }).click();
+    const row = page.locator(".mcp-client-row").filter({ hasText: credential.clientIdentity });
+    await row.getByRole("button", { name: "Revoke" }).click();
+    await expect(row).toContainText("revoked");
+  } finally {
+    resumeAck();
+    if (didIntercept) {
+      await ackDone;
+      await page.unroute("**/__draw/api/commands/*/ack");
+    }
+    await mcp?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+  const response = await page.evaluate(async () => await (window as any).__pendingMcpResponse);
+  expect(response.status).toBe(401);
+  const retry = await page.request.post("/__draw/api/commands", {
+    headers: { "x-draw-client-identity": credential.clientIdentity, authorization: `Bearer ${credential.capability}` },
+    data: command,
+  });
+  expect(retry.status()).toBe(401);
+  await page.getByRole("button", { name: "Close" }).click();
+  const savedFile = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Save .draw" }).click();
+  const saved = JSON.parse(await readFile(await (await savedFile).path(), "utf8"));
+  expect(saved.document.elements).toEqual(expect.arrayContaining([expect.objectContaining({ originalText: "Human edit after MCP" })]));
+  expect(saved.document.elements.filter((element: any) => element.originalText === "Human edit after MCP")).toHaveLength(1);
 });
 
 test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject paths safely", async ({ page, baseURL }) => {
