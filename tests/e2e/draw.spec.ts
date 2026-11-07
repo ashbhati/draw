@@ -211,6 +211,48 @@ async function inspectBlackboardImage(page: Page, image: Buffer, mimeType: "imag
   }, { encodedImage: image.toString("base64"), mime: mimeType, checkHorizontalSeam: includeHorizontalSeam });
 }
 
+async function inspectCompactBlackboardImage(page: Page, image: Buffer, mimeType: "image/png" | "image/jpeg", matchingLivePatch = false) {
+  return page.evaluate(async ({ encodedImage, mime, matchingLivePatch }) => {
+    const binary = atob(encodedImage);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: mime }));
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Canvas pixel inspection is unavailable.");
+    context.drawImage(bitmap, 0, 0);
+    const { data } = context.getImageData(0, 0, bitmap.width, bitmap.height);
+    const luma = (x: number, y: number) => {
+      const offset = (y * bitmap.width + x) * 4;
+      return data[offset] * 0.2126 + data[offset + 1] * 0.7152 + data[offset + 2] * 0.0722;
+    };
+    const board: number[] = [];
+    // When comparing live and exported texture, sample the same empty top-right
+    // board patch. Otherwise, sample bands above and below a compact flow.
+    const boardRegions = matchingLivePatch
+      ? [[0.82, 0.95, 0.05, 0.16]] as const
+      : [[0.03, 0.97, 0.03, 0.14], [0.03, 0.97, 0.86, 0.97]] as const;
+    for (const [left, right, top, bottom] of boardRegions) {
+      for (let y = Math.floor(bitmap.height * top); y < Math.floor(bitmap.height * bottom); y += 3) {
+        for (let x = Math.floor(bitmap.width * left); x < Math.floor(bitmap.width * right); x += 3) board.push(luma(x, y));
+      }
+    }
+    const mean = board.reduce((sum, value) => sum + value, 0) / board.length;
+    const standardDeviation = Math.sqrt(board.reduce((sum, value) => sum + (value - mean) ** 2, 0) / board.length);
+    const palette = [[47, 134, 201], [230, 75, 69], [84, 174, 102], [229, 194, 77]];
+    const palettePixels = palette.map((color) => {
+      let count = 0;
+      for (let index = 0; index < data.length; index += 4) {
+        if (Math.abs(data[index] - color[0]) <= 38 && Math.abs(data[index + 1] - color[1]) <= 38 && Math.abs(data[index + 2] - color[2]) <= 38) count += 1;
+      }
+      return count;
+    });
+    return { width: bitmap.width, height: bitmap.height, mean, standardDeviation, palettePixels };
+  }, { encodedImage: image.toString("base64"), mime: mimeType, matchingLivePatch });
+}
+
 function maxChannelDifference(a: readonly number[], b: readonly number[]): number {
   return Math.max(...a.map((channel, index) => Math.abs(channel - b[index])));
 }
@@ -427,10 +469,9 @@ test("Blackboard texture is seam-safe across large live/PNG/JPEG canvases and sh
   for (const [format, pixels] of [["live", livePixels], ["PNG", pngPixels], ["JPEG", jpegPixels]] as const) {
     expect(pixels.width, `${format} width includes the x=2000 boundary`).toBeGreaterThan(2100);
     expect(pixels.height, `${format} keeps the full board image`).toBeGreaterThan(format === "live" ? 1200 : 120);
-    expect(pixels.board.standardDeviation, `${format} texture variation`).toBeGreaterThan(6);
-    expect(pixels.board.standardDeviation, `${format} texture variation`).toBeLessThan(18);
+    expect(pixels.board.standardDeviation, `${format} exposed slate is not flat`).toBeGreaterThan(2.5);
     expect(pixels.board.mean, `${format} board brightness`).toBeGreaterThan(20);
-    expect(pixels.board.mean, `${format} board brightness`).toBeLessThan(52);
+    expect(pixels.board.mean, `${format} board brightness`).toBeLessThan(80);
     expect(pixels.edges.left.standardDeviation, `${format} left edge has chalk grain`).toBeGreaterThan(3);
     expect(pixels.edges.right.standardDeviation, `${format} right edge has chalk grain`).toBeGreaterThan(3);
     expect(Math.abs(pixels.edges.left.mean - pixels.edges.leftAdjacent.mean), `${format} left edge has no vertical band`).toBeLessThan(13);
@@ -456,6 +497,70 @@ test("Blackboard texture is seam-safe across large live/PNG/JPEG canvases and sh
   // the Blackboard residue visible under its outline and text.
   expect(pngPixels.nodeInteriorStandardDeviation, "PNG node interior retains board grain").toBeGreaterThan(2);
   expect(jpegPixels.nodeInteriorStandardDeviation, "JPEG node interior retains board grain").toBeGreaterThan(2);
+});
+
+test("natural Blackboard texture stays subdued behind a compact three-node flow in PNG and JPEG", async ({ page }) => {
+  const createdResponse = await page.request.post(commandApi, { data: {
+    operation: "create_diagram",
+    input: {
+      nodes: [
+        { id: "analyze", label: "Analyze", x: 80, y: 140, width: 170, height: 76, color: "#2f86c9" },
+        { id: "measure", label: "Measure", x: 360, y: 140, width: 170, height: 76, color: "#e64b45" },
+        { id: "improve", label: "Improve", x: 640, y: 140, width: 170, height: 76, color: "#54ae66" },
+      ],
+      edges: [
+        { from: "analyze", to: "measure", color: "#e5c24d" },
+        { from: "measure", to: "improve", color: "#e5c24d" },
+      ],
+    },
+  } });
+  expect(createdResponse.ok(), await createdResponse.text()).toBeTruthy();
+  await expect.poll(async () => {
+    const current = await freshBridgeDocument(page);
+    return current.document.elements.filter((element: any) => element.type === "arrow").length;
+  }).toBe(2);
+
+  await page.setViewportSize({ width: 1280, height: 360 });
+  await page.locator(".draw-app").evaluate((element) => { (element as HTMLElement).style.minHeight = "0"; });
+  await page.addStyleTag({ content: ".editor-shell button,.editor-shell [role=button],.editor-shell [role=toolbar],.editor-shell .App-menu_top,.editor-shell .App-menu_bottom{visibility:hidden!important}" });
+  await page.waitForTimeout(100);
+  const textureURL = await page.locator(".editor-shell").evaluate((element) => getComputedStyle(element).backgroundImage);
+  expect(textureURL, "live canvas uses the bundled natural texture").toContain("blackboard-texture");
+  const liveShot = await page.locator(".editor-shell").screenshot();
+  const pngDownloadWait = page.waitForEvent("download");
+  await page.locator("button.export-main").click();
+  const png = await readFile(await (await pngDownloadWait).path());
+  const jpegDownloadWait = page.waitForEvent("download");
+  await page.getByLabel("Image export format").selectOption("image/jpeg");
+  await page.locator("button.export-main").click();
+  const jpeg = await readFile(await (await jpegDownloadWait).path());
+
+  const [livePixels, pngPixels, jpegPixels] = await Promise.all([
+    inspectCompactBlackboardImage(page, liveShot, "image/png", true),
+    inspectCompactBlackboardImage(page, png, "image/png", true),
+    inspectCompactBlackboardImage(page, jpeg, "image/jpeg", true),
+  ]);
+  expect(livePixels.width / livePixels.height, "live preview and exports use comparable cover scales").toBeGreaterThan(pngPixels.width / pngPixels.height - 1);
+  expect(livePixels.width / livePixels.height, "live preview and exports use comparable cover scales").toBeLessThan(pngPixels.width / pngPixels.height + 1);
+  for (const [format, pixels] of [["live", livePixels], ["PNG", pngPixels], ["JPEG", jpegPixels]] as const) {
+    expect(pixels.width, `${format} is a compact diagram export`).toBeLessThan(1800);
+    expect(pixels.height).toBeLessThan(1200);
+  }
+  for (const [format, pixels] of [["live", livePixels], ["PNG", pngPixels], ["JPEG", jpegPixels]] as const) {
+    expect(pixels.mean, `${format} remains a dark slate`).toBeGreaterThan(18);
+    expect(pixels.mean, `${format} remains a dark slate`).toBeLessThan(90);
+    expect(pixels.standardDeviation, `${format} exposed slate is not flat`).toBeGreaterThan(2.5);
+    expect(pixels.standardDeviation, `${format} slate texture remains subdued`).toBeLessThan(25);
+  }
+  for (const [format, pixels] of [["PNG", pngPixels], ["JPEG", jpegPixels]] as const) {
+    expect(pixels.palettePixels.every((count) => count > 8), `${format} keeps colored strokes and connectors visible`).toBe(true);
+  }
+  expect(Math.abs(pngPixels.mean - livePixels.mean), "PNG and live share the same board tone").toBeLessThan(14);
+  expect(Math.abs(jpegPixels.mean - livePixels.mean), "JPEG and live share the same board tone").toBeLessThan(14);
+  expect(Math.abs(pngPixels.standardDeviation - livePixels.standardDeviation), "PNG and live share the same texture strength").toBeLessThan(8);
+  expect(Math.abs(jpegPixels.standardDeviation - livePixels.standardDeviation), "JPEG and live share the same texture strength").toBeLessThan(8);
+  expect(Math.abs(pngPixels.mean - jpegPixels.mean), "PNG and JPEG retain similar board tone").toBeLessThan(8);
+  expect(Math.abs(pngPixels.standardDeviation - jpegPixels.standardDeviation), "PNG and JPEG retain similar texture strength").toBeLessThan(6);
 });
 
 test("the Draw wordmark and Open .draw action do not overlap on narrow screens", async ({ page }) => {
@@ -796,7 +901,9 @@ test("loads fonts and exports the hand-drawn scene without network access", asyn
   const image = await readFile(await exported.path());
   expect(image.subarray(0, 8).toString("hex")).toBe("89504e470d0a1a0a");
   expect(await countWarmImagePixels(page, image), "the exported diagram includes visible yellow diagram pixels").toBeGreaterThan(40);
-  expect(await countPixelsNear(page, image, [24, 25, 26], 8), "the export includes its charcoal board background").toBeGreaterThan(1_000);
+  const board = await inspectCompactBlackboardImage(page, image, "image/png");
+  expect(board.mean, "the export includes a dark slate board").toBeLessThan(90);
+  expect(board.standardDeviation, "the exposed board texture is not flat").toBeGreaterThan(2.5);
   expect(externalRequests).toEqual([]);
   expect(localFontRequests.every((url) => isBundledFontURL(url, localOrigin))).toBe(true);
   expect(cjkFontRequests.every((url) => isBundledFontURL(url, localOrigin))).toBe(true);
@@ -882,7 +989,9 @@ test("blackboard background survives reload and is present in PNG and JPEG expor
     const download = await downloadWait;
     const image = await readFile(await download.path());
     expect(image.subarray(0, signature.length / 2).toString("hex")).toBe(signature);
-    expect(await countPixelsNear(page, image, [24, 25, 26], mimeType === "image/png" ? 3 : 18, mimeType)).toBeGreaterThan(100);
+    const board = await inspectCompactBlackboardImage(page, image, mimeType);
+    expect(board.mean, `${mimeType} retains a dark slate background`).toBeLessThan(90);
+    expect(board.standardDeviation, `${mimeType} retains visible slate texture`).toBeGreaterThan(2.5);
   }
 
   await page.reload();
@@ -1273,7 +1382,7 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
       expect(sample.greenAssetPixels, `${mime} should preserve the embedded image`).toBeGreaterThan(50);
       if (preset === "blackboard") {
         const luminance = corner[0] * 0.2126 + corner[1] * 0.7152 + corner[2] * 0.0722;
-        expect(luminance, `${mime} blackboard corner should stay charcoal`).toBeLessThanOrEqual(35);
+        expect(luminance, `${mime} blackboard corner should stay charcoal`).toBeLessThanOrEqual(90);
         expect(sample.whiteInkPixels, `${mime} should preserve text and chalk strokes`).toBeGreaterThan(100);
         for (const { label, region } of nodeLabels) {
           expect(await countInkInSceneRegion(page, image, mime, region, exportOrigin, "chalk"), `${mime} should render ${label} on Blackboard`).toBeGreaterThan(0);

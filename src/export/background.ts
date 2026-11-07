@@ -1,4 +1,4 @@
-import blackboardTexture from "../ui/blackboard-texture.svg?raw";
+import blackboardTextureUrl from "../ui/blackboard-texture.jpg?url";
 
 export type DrawExportMimeType = "image/png" | "image/jpeg";
 
@@ -15,7 +15,7 @@ export function selectExportElements<T extends { id: string; isDeleted?: boolean
   return live.filter((element) => selectedIds.has(element.id) || (element.containerId != null && selectedIds.has(element.containerId)));
 }
 
-const BLACKBOARD_TEXTURE_SIZE = { width: 1280, height: 800 } as const;
+const BLACKBOARD_TEXTURE_SIZE = { width: 1536, height: 1024 } as const;
 
 type SvgViewport = { x: number; y: number; width: number; height: number };
 
@@ -39,7 +39,7 @@ function blackboardBackgroundLayer(viewport: SvgViewport): string {
   const imageHeight = BLACKBOARD_TEXTURE_SIZE.height * scale;
   const imageX = viewport.x + (viewport.width - imageWidth) / 2;
   const imageY = viewport.y + (viewport.height - imageHeight) / 2;
-  return `<rect data-draw-background="blackboard" x="${viewport.x}" y="${viewport.y}" width="${viewport.width}" height="${viewport.height}" fill="#18191a" /><defs><clipPath id="draw-blackboard-texture-clip" clipPathUnits="userSpaceOnUse"><rect x="${viewport.x}" y="${viewport.y}" width="${viewport.width}" height="${viewport.height}" /></clipPath></defs><image data-draw-background-texture="blackboard" x="${imageX}" y="${imageY}" width="${imageWidth}" height="${imageHeight}" preserveAspectRatio="none" clip-path="url(#draw-blackboard-texture-clip)" href="data:image/svg+xml,${encodeURIComponent(blackboardTexture)}" />`;
+  return `<rect data-draw-background="blackboard" x="${viewport.x}" y="${viewport.y}" width="${viewport.width}" height="${viewport.height}" fill="#18191a" /><defs><clipPath id="draw-blackboard-texture-clip" clipPathUnits="userSpaceOnUse"><rect x="${viewport.x}" y="${viewport.y}" width="${viewport.width}" height="${viewport.height}" /></clipPath></defs><image data-draw-background-texture="blackboard" x="${imageX}" y="${imageY}" width="${imageWidth}" height="${imageHeight}" preserveAspectRatio="none" clip-path="url(#draw-blackboard-texture-clip)" href="${blackboardTextureUrl}" />`;
 }
 
 export function hasSelectedExportElements<T extends { id: string; isDeleted?: boolean }>(
@@ -56,6 +56,21 @@ function backgroundLayer(preset: "blackboard" | "white", viewport: SvgViewport):
     return `<rect data-draw-background="white" x="${viewport.x}" y="${viewport.y}" width="${viewport.width}" height="${viewport.height}" fill="#ffffff" />`;
   }
   return blackboardBackgroundLayer(viewport);
+}
+
+async function inlineBlackboardTexture(svg: string): Promise<string> {
+  const textureHref = `href="${blackboardTextureUrl}"`;
+  if (!svg.includes(textureHref)) return svg;
+  const response = await fetch(blackboardTextureUrl);
+  if (!response.ok) throw new Error("Could not load the Blackboard texture for export.");
+  const textureBlob = await response.blob();
+  const textureDataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => typeof reader.result === "string" ? resolve(reader.result) : reject(new Error("Could not encode the Blackboard texture."));
+    reader.onerror = () => reject(reader.error ?? new Error("Could not encode the Blackboard texture."));
+    reader.readAsDataURL(textureBlob);
+  });
+  return svg.replaceAll(textureHref, `href="${textureDataUrl}"`);
 }
 
 /** Insert a persistent canvas background before any exported scene elements. */
@@ -89,7 +104,8 @@ export async function renderExportBlob(
     throw new Error("PNG/JPEG export requires a browser canvas.");
   }
 
-  const svgBlob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
+  const standaloneSvg = await inlineBlackboardTexture(svg);
+  const svgBlob = new Blob([standaloneSvg], { type: "image/svg+xml;charset=utf-8" });
   const url = URL.createObjectURL(svgBlob);
   try {
     const image = new Image();
