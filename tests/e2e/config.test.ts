@@ -40,7 +40,8 @@ describe("Playwright E2E server configuration", () => {
     try {
       delete process.env.DRAW_E2E_REUSE_SERVER;
       expect(createE2EServerConfig("http://127.0.0.1:5197")).toEqual({
-        command: "npm run dev -- --host 127.0.0.1 --port 5197 --strictPort",
+        command: "npm run dev -- --mode e2e --host 127.0.0.1 --port 5197 --strictPort",
+        env: { DRAW_E2E_EDITOR_CODE: "D4A7C091B52E" },
         url: "http://127.0.0.1:5197/__draw/api/health",
         reuseExistingServer: false,
         timeout: 30_000,

@@ -125,6 +125,10 @@ export default function App() {
   const [status, setStatus] = useState<Status>("loading");
   const [message, setMessage] = useState("");
   const [confirmation, setConfirmation] = useState<BridgeConfirmation | null>(null);
+  const [editorConnected, setEditorConnected] = useState(false);
+  const [connectOpen, setConnectOpen] = useState(false);
+  const [launchCodeInput, setLaunchCodeInput] = useState("");
+  const [connectError, setConnectError] = useState("");
   const [autosaveBlocked, setAutosaveBlocked] = useState(false);
   const autosaveBlockedRef = useRef(autosaveBlocked);
   autosaveBlockedRef.current = autosaveBlocked;
@@ -134,7 +138,8 @@ export default function App() {
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
   const docRef = useRef<DrawDocument | null>(null);
   const clientId = useRef(randomId());
-  const bridgeSync = useMemo(() => createBridgeSynchronizer(clientId.current), []);
+  const editorSecret = useRef<string | null>(null);
+  const bridgeSync = useMemo(() => createBridgeSynchronizer(clientId.current, () => editorSecret.current), []);
   const writerOwned = useRef(false);
   const titleInput = useRef<HTMLInputElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -164,6 +169,18 @@ export default function App() {
       window.removeEventListener("pointerdown", invalidateMcpHistoryOnHumanAction, true);
       window.removeEventListener("keydown", invalidateMcpHistoryOnHumanAction, true);
     };
+  }, []);
+
+  useEffect(() => {
+    const revokeEditorLease = (detail: { clientId?: string }) => {
+      if (detail?.clientId !== clientId.current) return;
+      editorSecret.current = null;
+      setEditorConnected(false);
+      setConfirmation(null);
+      setConnectError("This editor session was replaced. Reconnect using the launch code in the trusted terminal.");
+    };
+    import.meta.hot?.on("draw:editor-lease-revoked", revokeEditorLease);
+    return () => import.meta.hot?.off("draw:editor-lease-revoked", revokeEditorLease);
   }, []);
 
   useEffect(() => () => {
@@ -200,8 +217,17 @@ export default function App() {
 
   const syncBridgeDocument = useCallback(async (value: DrawDocument) => {
     if (!import.meta.env.DEV) return;
+    if (!editorSecret.current) return;
     if (!writerOwned.current) throw new Error("This tab does not own the active Draw canvas.");
-    await bridgeSync(value);
+    try {
+      await bridgeSync(value);
+    } catch (error) {
+      if (error instanceof Error && /authentication expired|401/i.test(error.message)) {
+        editorSecret.current = null;
+        setEditorConnected(false);
+      }
+      throw error;
+    }
   }, [bridgeSync]);
 
   const bridgeAutosave = useMemo(() => createDebouncedSaver<DrawDocument>(syncBridgeDocument, 350, (error) => {
@@ -321,9 +347,9 @@ export default function App() {
   }, [autosave, autosaveBlocked, bridgeAutosave, setDocument]);
 
   useEffect(() => {
-    if (!doc || !canWrite || !import.meta.env.DEV) return;
+    if (!doc || !canWrite || !editorConnected || !import.meta.env.DEV) return;
     bridgeAutosave.schedule(doc);
-  }, [bridgeAutosave, canWrite, doc?.document.id, doc ? editorKey : -1]);
+  }, [bridgeAutosave, canWrite, editorConnected, doc?.document.id, doc ? editorKey : -1]);
 
   useEffect(() => {
     const flushPending = () => {
@@ -369,6 +395,33 @@ export default function App() {
       setMessage(`The file opened, but local autosave failed: ${error instanceof Error ? error.message : String(error)}. Use Save .draw to preserve it.`);
     }
   }, [autosave, bridgeAutosave, setDocument, syncBridgeDocument]);
+
+  const connectEditorToMcp = useCallback(async () => {
+    if (!import.meta.env.DEV || !canWrite) return;
+    setConnectError("");
+    try {
+      const response = await fetch("/__draw/api/editor/bootstrap", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ clientId: clientId.current, launchCode: launchCodeInput.trim().toUpperCase() }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || typeof result.editorSecret !== "string") {
+        throw new Error(typeof result.error === "string" ? result.error : "Could not authenticate this Draw editor session.");
+      }
+      editorSecret.current = result.editorSecret;
+      setEditorConnected(true);
+      setConnectOpen(false);
+      setLaunchCodeInput("");
+      const current = docRef.current;
+      if (current) await bridgeSync(current);
+    } catch (error) {
+      editorSecret.current = null;
+      setEditorConnected(false);
+      setConnectError(error instanceof Error ? error.message : "Could not authenticate this Draw editor session.");
+    }
+  }, [bridgeSync, canWrite, launchCodeInput]);
 
   const openFile = async (file?: File) => {
     if (!file) return;
@@ -463,7 +516,7 @@ export default function App() {
   const handleMcpCommand = useCallback(async (event: BridgeCommand) => {
     const api = apiRef.current;
     const current = docRef.current;
-    if (!api || !current || event.clientId !== clientId.current) return;
+    if (!api || !current || !editorSecret.current || event.clientId !== clientId.current) return;
     let applied: { document: DrawDocument; result: Record<string, unknown> } | null = null;
     try {
       if (!writerOwned.current) throw new Error("This Draw tab is read-only because another tab owns the autosave lock.");
@@ -489,7 +542,7 @@ export default function App() {
         api.updateScene({ appState: { selectedElementIds: selected }, captureUpdate: CaptureUpdateAction.NEVER });
         result = { selectedElementIds: event.input.ids };
         await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
-          method: "POST", headers: { "content-type": "application/json" },
+          method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current },
           body: JSON.stringify({ id: event.id, clientId: clientId.current, document: current, result }),
         });
         return;
@@ -688,7 +741,7 @@ export default function App() {
         setMessage(warning);
       } else setStatus("saved");
       const acknowledgement = await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
-        method: "POST", headers: { "content-type": "application/json" },
+        method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
         body: JSON.stringify({ id: event.id, clientId: clientId.current, document: nextDocument, result, ...(warning ? { warning } : {}) }),
       });
       if (!acknowledgement.ok) throw new Error(`Draw MCP bridge rejected the command acknowledgement (HTTP ${acknowledgement.status}).`);
@@ -698,13 +751,13 @@ export default function App() {
         setStatus("error");
         setMessage(warning);
         await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
-          method: "POST", headers: { "content-type": "application/json" },
+          method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
           body: JSON.stringify({ id: event.id, clientId: clientId.current, document: applied.document, result: applied.result, warning }),
         }).catch(() => undefined);
         return;
       }
       await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
-        method: "POST", headers: { "content-type": "application/json" },
+        method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
         body: JSON.stringify({ id: event.id, clientId: clientId.current, error: error instanceof Error ? error.message : String(error) }),
       }).catch(() => undefined);
     }
@@ -713,7 +766,7 @@ export default function App() {
   const handleBridgeFlush = useCallback(async (event: BridgeFlush) => {
     const api = apiRef.current;
     const current = docRef.current;
-    if (!api || !current || event.clientId !== clientId.current || !writerOwned.current) return;
+    if (!api || !current || !editorSecret.current || event.clientId !== clientId.current || !writerOwned.current) return;
     try {
       const state = api.getAppState() as any;
       const elements = api.getSceneElementsIncludingDeleted() as any[];
@@ -749,19 +802,19 @@ export default function App() {
         await Promise.all([autosave.flush(), bridgeAutosave.flush()]);
       } else await syncBridgeDocument(next);
       await fetch(`/__draw/api/document/flush/${encodeURIComponent(event.id)}`, {
-        method: "POST", headers: { "content-type": "application/json" },
+        method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
         body: JSON.stringify({ id: event.id, clientId: clientId.current, document: next }),
       });
     } catch (error) {
       await fetch(`/__draw/api/document/flush/${encodeURIComponent(event.id)}`, {
-        method: "POST", headers: { "content-type": "application/json" },
+        method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
         body: JSON.stringify({ id: event.id, clientId: clientId.current, error: error instanceof Error ? error.message : String(error) }),
       }).catch(() => undefined);
     }
   }, [autosave, autosaveBlocked, bridgeAutosave, setDocument, syncBridgeDocument]);
 
   const handleBridgeConfirmation = useCallback((event: BridgeConfirmation) => {
-    if (event.clientId !== clientId.current || !writerOwned.current) return;
+    if (event.clientId !== clientId.current || !writerOwned.current || !editorSecret.current) return;
     setConfirmation(event);
   }, []);
 
@@ -770,7 +823,7 @@ export default function App() {
     if (!pending) return;
     try {
       const response = await fetch(`/__draw/api/confirmations/${encodeURIComponent(pending.token)}/respond`, {
-        method: "POST", headers: { "content-type": "application/json" },
+        method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
         body: JSON.stringify({ clientId: clientId.current, approved }),
       });
       if (!response.ok) throw new Error("This confirmation request expired or the active Draw tab changed.");
@@ -822,6 +875,7 @@ export default function App() {
       }} /></span></div>
       <div className="toolbar-actions">
         <span className={`save-indicator ${status}`}><i />{statusText}</span>
+        {import.meta.env.DEV && <button className="button button-quiet" disabled={!canWrite} onClick={() => { setConnectError(""); setConnectOpen(true); }} title="Pair this editor with the local MCP bridge">{editorConnected ? "MCP connected" : "Connect MCP"}</button>}
         <button className="button button-quiet" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open an editable Draw document" : "Close the other Draw tab to open files here"}>Open .draw</button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
         <button className="button button-primary" onClick={saveFile} title="Save the complete editable Draw file"><span className="button-icon">↓</span>Save .draw</button>
@@ -842,6 +896,19 @@ export default function App() {
         <div className="draw-confirmation-actions">
           <button className="button button-quiet" onClick={() => void respondToConfirmation(false)}>Keep current canvas</button>
           <button className="button button-primary" onClick={() => void respondToConfirmation(true)}>Approve opening</button>
+        </div>
+      </section>
+    </div>}
+    {connectOpen && <div className="draw-confirmation-backdrop" role="presentation">
+      <section className="draw-confirmation" role="dialog" aria-modal="true" aria-labelledby="draw-connect-title">
+        <h2 id="draw-connect-title">Connect to MCP</h2>
+        <p>Enter the one-time launch code printed in the trusted terminal running Draw. The code expires after one minute.</p>
+        <label htmlFor="draw-launch-code">Launch code</label>
+        <input id="draw-launch-code" autoComplete="off" spellCheck={false} value={launchCodeInput} onChange={(event) => setLaunchCodeInput(event.target.value.toUpperCase())} onKeyDown={(event) => { if (event.key === "Enter") void connectEditorToMcp(); }} />
+        {connectError && <p role="alert">{connectError}</p>}
+        <div className="draw-confirmation-actions">
+          <button className="button button-quiet" onClick={() => setConnectOpen(false)}>Cancel</button>
+          <button className="button button-primary" disabled={launchCodeInput.trim().length < 12} onClick={() => void connectEditorToMcp()}>Connect</button>
         </div>
       </section>
     </div>}
