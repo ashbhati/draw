@@ -16,7 +16,7 @@ describe("MCP native primitive construction", () => {
       expect.objectContaining({ id: "scene-1", type: "text", text: "Intent", fontSize: 28, strokeColor: "#f6f2e9" }),
       expect.objectContaining({ id: "scene-2", type: "line", points: [[0, 0], [80, 30]], strokeColor: "#f6f2e9" }),
       expect.objectContaining({ id: "scene-3", type: "arrow", endArrowhead: "triangle", points: [[0, 0], [80, 30]] }),
-      expect.objectContaining({ id: "scene-4", type: "freedraw", points: [[0, 0], [12, 6, 0.6], [24, 0]] }),
+      expect.objectContaining({ id: "scene-4", type: "freedraw", points: [[0, 0, 0.5], [12, 6, 0.6], [24, 0, 0.5]], width: 24, height: 6 }),
     ]);
   });
 
@@ -31,6 +31,29 @@ describe("MCP native primitive construction", () => {
     });
     expect(built.skeletons[1]).toMatchObject({
       type: "ellipse", width: 120, height: 70, strokeColor: "#e64b45", backgroundColor: "#202020", fillStyle: "hachure", strokeStyle: "dashed",
+    });
+  });
+
+  it("normalizes line and arrow bounds, binds labeled arrows, and supplies drawable pressure geometry", () => {
+    const built = buildPrimitiveSkeletons({ elements: [
+      { id: "source", type: "rectangle", x: 100, y: 80, width: 120, height: 60, label: "Source" },
+      { id: "target", type: "ellipse", x: 400, y: 80, width: 120, height: 60 },
+      { id: "edge", type: "arrow", x: 160, y: 110, points: [[0, 0], [300, 0]], start: "source", end: "target", label: "feeds" },
+      { id: "line", type: "line", x: 50, y: 300, points: [[10, 20], [60, 70]] },
+      { id: "chalk", type: "freedraw", x: 200, y: 300, points: [[-10, 5], [0, 12], [10, 25, 0.7]] },
+    ] }, "blackboard", (() => { let sequence = 0; return () => `scene-${++sequence}`; })());
+
+    expect(built.elementIds).toEqual({ source: "scene-1", target: "scene-2", edge: "scene-3", line: "scene-4", chalk: "scene-5" });
+    expect(built.skeletons[0]).toMatchObject({
+      id: "scene-1", type: "rectangle", label: { text: "Source", strokeColor: "#f6f2e9" },
+    });
+    expect(built.skeletons[2]).toMatchObject({
+      id: "scene-3", type: "arrow", x: 160, y: 110, start: { id: "scene-1" }, end: { id: "scene-2" },
+      label: { text: "feeds", strokeColor: "#f6f2e9" }, points: [[0, 0], [300, 0]], width: 300, height: 1,
+    });
+    expect(built.skeletons[3]).toMatchObject({ type: "line", x: 60, y: 320, points: [[0, 0], [50, 50]], width: 50, height: 50 });
+    expect(built.skeletons[4]).toMatchObject({
+      type: "freedraw", x: 190, y: 305, points: [[0, 0, 0.5], [10, 7, 0.5], [20, 20, 0.7]], width: 20, height: 20,
     });
   });
 });

@@ -160,6 +160,39 @@ describe("MCP tool input contract", () => {
     });
   });
 
+  it("accepts wrapped text, shape labels, arrow labels, and endpoint bindings", () => {
+    const command = parseMcpToolInput("create_elements", { elements: [
+      { id: "source", type: "rectangle", x: 0, y: 0, label: "Source" },
+      { id: "target", type: "ellipse", x: 260, y: 0 },
+      { id: "note", type: "text", x: 0, y: 120, text: "A long note", maxWidth: 320 },
+      { id: "connection", type: "arrow", x: 180, y: 36, points: [[0, 0], [80, 0]], start: "source", end: "target", label: "feeds" },
+    ] });
+    expect(command).toMatchObject({
+      operation: "create_elements",
+      input: { elements: [
+        { id: "source", type: "rectangle", label: "Source" },
+        { id: "target", type: "ellipse" },
+        { id: "note", type: "text", maxWidth: 320 },
+        { id: "connection", type: "arrow", start: "source", end: "target", label: "feeds" },
+      ] },
+    });
+  });
+
+  it("rejects pressure values on lines and arrows and rejects zero-length paths", () => {
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "line", type: "line", x: 0, y: 0, points: [[0, 0, 0.5], [10, 10, 0.5]] },
+    ] })).toThrow(/pressure is only supported for freedraw/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "arrow", type: "arrow", x: 0, y: 0, points: [[0, 0], [10, 10, 0.5]] },
+    ] })).toThrow(/pressure is only supported for freedraw/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "line", type: "line", x: 0, y: 0, points: [[5, 5], [5, 5]] },
+    ] })).toThrow(/zero-length/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "arrow", type: "arrow", x: 0, y: 0, points: [[5, 5], [5, 5]] },
+    ] })).toThrow(/zero-length/i);
+  });
+
   it("rejects malformed primitive geometry and duplicate input IDs", () => {
     expect(() => parseMcpToolInput("create_elements", { elements: [] })).toThrow(/at least one element/i);
     expect(() => parseMcpToolInput("create_elements", { elements: [
@@ -178,5 +211,8 @@ describe("MCP tool input contract", () => {
     expect(() => parseMcpToolInput("create_elements", { elements: [
       { id: "bad", type: "rectangle", x: 0, y: 0, strokeColor: "transparent" },
     ] })).toThrow(/six-digit hex/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "bad", type: "arrow", x: 0, y: 0, points: [[0, 0], [10, 0]], start: "missing", end: "also-missing" },
+    ] })).toThrow(/reference valid shapes/i);
   });
 });

@@ -35,6 +35,10 @@ export type DrawPrimitiveInput = {
   height?: number;
   text?: string;
   fontSize?: number;
+  maxWidth?: number;
+  label?: string;
+  start?: string;
+  end?: string;
   points?: PrimitivePoint[];
   strokeColor?: string;
   backgroundColor?: string;
@@ -129,13 +133,16 @@ function optionalBackgroundColor(value: unknown, label: string): string | undefi
   return optionalColor(value, label);
 }
 
-function parsePrimitivePoints(value: unknown, label: string): PrimitivePoint[] {
+function parsePrimitivePoints(value: unknown, label: string, allowPressure: boolean): PrimitivePoint[] {
   if (!Array.isArray(value) || value.length < 2 || value.length > MAX_POINTS) {
     throw new McpValidationError(`${label} must contain between 2 and ${MAX_POINTS} points.`);
   }
-  return value.map((rawPoint, index) => {
+  const points = value.map((rawPoint, index): PrimitivePoint => {
     if (!Array.isArray(rawPoint) || (rawPoint.length !== 2 && rawPoint.length !== 3)) {
       throw new McpValidationError(`${label}[${index}] must contain x, y, and optional pressure values.`);
+    }
+    if (rawPoint.length === 3 && !allowPressure) {
+      throw new McpValidationError(`${label}[${index}] pressure is only supported for freedraw elements.`);
     }
     const x = requireFiniteCoordinate(rawPoint[0], `${label}[${index}].x`);
     const y = requireFiniteCoordinate(rawPoint[1], `${label}[${index}].y`);
@@ -147,6 +154,10 @@ function parsePrimitivePoints(value: unknown, label: string): PrimitivePoint[] {
     }
     return [x, y];
   });
+  if (new Set(points.map(([x, y]) => `${x},${y}`)).size < 2) {
+    throw new McpValidationError(`${label} must describe a non-zero-length path.`);
+  }
+  return points;
 }
 
 function parseCreateElements(value: unknown): CreateElementsInput {
@@ -166,14 +177,14 @@ function parseCreateElements(value: unknown): CreateElementsInput {
       throw new McpValidationError(`elements[${index}].type is unsupported. Use rectangle, ellipse, diamond, text, line, arrow, or freedraw.`);
     }
     const baseFields = ["id", "type", "x", "y", "strokeColor"];
-    const shapeFields = ["width", "height", "strokeWidth", "strokeStyle", "roughness", "backgroundColor", "fillStyle"];
+    const shapeFields = ["width", "height", "strokeWidth", "strokeStyle", "roughness", "backgroundColor", "fillStyle", "label"];
     const pathFields = ["points", "strokeWidth", "strokeStyle", "roughness"];
     const allowedFields = new Set([
       ...baseFields,
       ...(type === "rectangle" || type === "ellipse" || type === "diamond" ? shapeFields : []),
-      ...(type === "text" ? ["text", "fontSize"] : []),
+      ...(type === "text" ? ["text", "fontSize", "maxWidth"] : []),
       ...(type === "line" || type === "freedraw" ? pathFields : []),
-      ...(type === "arrow" ? [...pathFields, "endArrowhead"] : []),
+      ...(type === "arrow" ? [...pathFields, "endArrowhead", "start", "end", "label"] : []),
     ]);
     for (const field of Object.keys(element)) {
       if (!allowedFields.has(field)) throw new McpValidationError(`elements[${index}] has unsupported field "${field}" for ${type}.`);
@@ -223,11 +234,14 @@ function parseCreateElements(value: unknown): CreateElementsInput {
         }
         parsed.fontSize = element.fontSize;
       }
+      if (element.maxWidth !== undefined) parsed.maxWidth = optionalDimension(element.maxWidth, `elements[${index}].maxWidth`);
+    } else if (type === "rectangle" || type === "ellipse" || type === "diamond") {
+      if (element.label !== undefined) parsed.label = requireString(element.label, `elements[${index}].label`);
     } else if (type === "line" || type === "arrow" || type === "freedraw") {
       if (element.width !== undefined || element.height !== undefined || element.backgroundColor !== undefined || element.fillStyle !== undefined || element.text !== undefined || element.fontSize !== undefined) {
         throw new McpValidationError(`elements[${index}] has fields that are not valid for ${type}.`);
       }
-      parsed.points = parsePrimitivePoints(element.points, `elements[${index}].points`);
+      parsed.points = parsePrimitivePoints(element.points, `elements[${index}].points`, type === "freedraw");
       if (element.endArrowhead !== undefined) {
         if (type !== "arrow") throw new McpValidationError(`elements[${index}].endArrowhead is only valid for arrow elements.`);
         if (element.endArrowhead !== null && !["arrow", "bar", "dot", "triangle"].includes(element.endArrowhead as string)) {
@@ -235,11 +249,29 @@ function parseCreateElements(value: unknown): CreateElementsInput {
         }
         parsed.endArrowhead = element.endArrowhead as DrawPrimitiveInput["endArrowhead"];
       }
+      if (type === "arrow") {
+        if ((element.start === undefined) !== (element.end === undefined)) {
+          throw new McpValidationError(`elements[${index}] must supply both start and end when binding arrow endpoints.`);
+        }
+        if (element.start !== undefined) parsed.start = requireString(element.start, `elements[${index}].start`, 100);
+        if (element.end !== undefined) parsed.end = requireString(element.end, `elements[${index}].end`, 100);
+        if (element.label !== undefined) parsed.label = requireString(element.label, `elements[${index}].label`);
+      }
     } else if (element.text !== undefined || element.points !== undefined || element.fontSize !== undefined || element.endArrowhead !== undefined) {
       throw new McpValidationError(`elements[${index}] has fields that are not valid for ${type}.`);
     }
     return parsed;
   });
+  const typeById = new Map(elements.map(({ id, type }) => [id, type]));
+  for (const element of elements) {
+    if (element.type !== "arrow" || element.start === undefined || element.end === undefined) continue;
+    const startType = typeById.get(element.start);
+    const endType = typeById.get(element.end);
+    const isShape = (candidate: DrawPrimitiveType | undefined) => candidate === "rectangle" || candidate === "ellipse" || candidate === "diamond";
+    if (!isShape(startType) || !isShape(endType)) {
+      throw new McpValidationError(`Arrow "${element.id}" endpoints must reference valid shapes from this create_elements call.`);
+    }
+  }
   return { elements };
 }
 

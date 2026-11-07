@@ -28,6 +28,7 @@ const createDiagramSchema = z.object({
 });
 
 const pointSchema = z.array(z.number().finite()).min(2).max(3);
+const pathPointSchema = z.tuple([z.number().finite(), z.number().finite()]);
 const primitiveBaseSchema = {
   id: z.string().min(1).max(100),
   x: z.number().finite(),
@@ -46,12 +47,14 @@ const createPrimitiveSchema = z.discriminatedUnion("type", [
     width: z.number().finite().min(24).max(5000).optional(), height: z.number().finite().min(24).max(5000).optional(),
     backgroundColor: z.union([colorSchema, z.literal("transparent")]).optional(),
     fillStyle: z.enum(["solid", "hachure", "cross-hatch", "zigzag", "dots"]).optional(),
+    label: z.string().min(1).max(500).optional(),
   }).strict(),
-  z.object({ ...primitiveBaseSchema, type: z.literal("text"), text: z.string().min(1).max(500), fontSize: z.number().finite().min(8).max(128).optional() }).strict(),
-  z.object({ ...primitiveStrokeSchema, type: z.literal("line"), points: z.array(pointSchema).min(2).max(2000) }).strict(),
+  z.object({ ...primitiveBaseSchema, type: z.literal("text"), text: z.string().min(1).max(500), fontSize: z.number().finite().min(8).max(128).optional(), maxWidth: z.number().finite().min(24).max(5000).optional() }).strict(),
+  z.object({ ...primitiveStrokeSchema, type: z.literal("line"), points: z.array(pathPointSchema).min(2).max(2000) }).strict(),
   z.object({
-    ...primitiveStrokeSchema, type: z.literal("arrow"), points: z.array(pointSchema).min(2).max(2000),
+    ...primitiveStrokeSchema, type: z.literal("arrow"), points: z.array(pathPointSchema).min(2).max(2000),
     endArrowhead: z.enum(["arrow", "bar", "dot", "triangle"]).nullable().optional(),
+    start: z.string().min(1).max(100).optional(), end: z.string().min(1).max(100).optional(), label: z.string().min(1).max(500).optional(),
   }).strict(),
   z.object({ ...primitiveStrokeSchema, type: z.literal("freedraw"), points: z.array(pointSchema).min(2).max(2000) }).strict(),
 ]);

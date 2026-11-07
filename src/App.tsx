@@ -18,6 +18,7 @@ import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
 import { createDebouncedSaver } from "./ui/autosave";
 import { buildDiagramSkeletons } from "./integrations/diagram-builder";
 import { buildPrimitiveSkeletons } from "./integrations/primitive-builder";
+import { wrapTextToWidth } from "./integrations/scene-updates";
 import { persistAppliedDocument } from "./integrations/command-persistence";
 import { createBridgeSynchronizer } from "./integrations/bridge-sync";
 
@@ -71,6 +72,13 @@ async function materializeMcpElements(skeletons: Record<string, unknown>[]) {
     if (measured.label && typeof measured.label === "object") {
       measured.label = { ...(measured.label as Record<string, unknown>), fontFamily: FONT_FAMILY.Excalifont };
     }
+    if (measured.type === "text" && typeof measured.maxWidth === "number" && typeof measured.text === "string") {
+      const maxWidth = measured.maxWidth;
+      const originalText = measured.text;
+      measured.text = wrapTextToWidth(originalText, maxWidth, (line) => renderedTextWidth(line, typeof measured.fontSize === "number" ? measured.fontSize : 20));
+      measured.originalText = originalText;
+      delete measured.maxWidth;
+    }
     return measured;
   });
   const created = convertToExcalidrawElements(measuredSkeletons as any[], { regenerateIds: false }) as any[];
@@ -78,6 +86,8 @@ async function materializeMcpElements(skeletons: Record<string, unknown>[]) {
     if (element.type !== "text" || element.containerId || typeof element.text !== "string") continue;
     const size = typeof element.fontSize === "number" ? element.fontSize : 20;
     element.width = Math.max(element.width ?? 0, Math.ceil(renderedTextWidth(element.text, size)) + 2);
+    const source = skeletons.find((skeleton) => skeleton.id === element.id);
+    if (typeof source?.text === "string") element.originalText = source.text;
   }
   return created;
 }
@@ -410,11 +420,27 @@ export default function App() {
         };
       } else if (event.operation === "create_elements") {
         const built = buildPrimitiveSkeletons(event.input, current.document.canvas.background.preset, randomId);
-        const created = await materializeMcpElements(built.skeletons);
+        const created = routeBoundArrows(await materializeMcpElements(built.skeletons) as any[]);
+        const labelElementIds = Object.fromEntries(Object.entries(built.elementIds).flatMap(([inputId, elementId]) => {
+          const label = created.find((element: any) => element.type === "text" && element.containerId === elementId);
+          return label ? [[inputId, label.id]] : [];
+        }));
+        const relationships = Object.entries(built.elementIds).map(([inputId, elementId]) => {
+          const element = created.find((candidate: any) => candidate.id === elementId) as any;
+          return {
+            id: inputId,
+            elementId,
+            ...(labelElementIds[inputId] ? { labelElementId: labelElementIds[inputId] } : {}),
+            ...(element?.startBinding?.elementId ? { startElementId: element.startBinding.elementId } : {}),
+            ...(element?.endBinding?.elementId ? { endElementId: element.endBinding.elementId } : {}),
+          };
+        });
         elements = [...elements, ...created];
         result = {
           addedElementIds: created.map((element: any) => element.id),
           elementIds: built.elementIds,
+          labelElementIds,
+          elements: relationships,
         };
       } else {
         const update = applyElementUpdates(elements, event.input.updates, measureTextWithExcalidraw);
