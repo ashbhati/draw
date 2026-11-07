@@ -15,6 +15,8 @@ describe("MCP tool input contract", () => {
       document: {
         id: "doc-1",
         title: "Flow",
+        documentRevision: 0,
+        viewRevision: 0,
         canvas: { infinite: true, background: { preset: "blackboard", styleVersion: 1 }, viewport: { x: 0, y: 0, zoom: 1 } },
         elements,
         appState: {},
@@ -40,6 +42,7 @@ describe("MCP tool input contract", () => {
       formatVersion: 1 as const,
       document: {
         id: "doc-1", title: "Flow",
+        documentRevision: 0, viewRevision: 0,
         canvas: { infinite: true as const, background: { preset: "white" as const, styleVersion: 1 }, viewport: { x: 0, y: 0, zoom: 1 } },
         elements, appState: {}, assets: {},
       },
@@ -66,6 +69,7 @@ describe("MCP tool input contract", () => {
       format: "draw" as const, formatVersion: 1 as const,
       document: {
         id: "doc-1", title: "Empty",
+        documentRevision: 0, viewRevision: 0,
         canvas: { infinite: true as const, background: { preset: "white" as const, styleVersion: 1 }, viewport: { x: 0, y: 0, zoom: 1 } },
         elements: [], appState: {}, assets: {},
       },
@@ -139,6 +143,39 @@ describe("MCP tool input contract", () => {
         updates: [{ id: "el-1", patch: { color: "#fff" } }],
       }),
     ).toThrow(/unsupported update field/i);
+  });
+
+  it("validates scene editing inputs with explicit document revisions", () => {
+    expect(parseMcpToolInput("delete_elements", {
+      documentId: "doc-1", expectedDocumentRevision: 4, ids: ["a", "b"],
+    })).toEqual({ operation: "delete_elements", input: { documentId: "doc-1", expectedDocumentRevision: 4, ids: ["a", "b"] } });
+    expect(() => parseMcpToolInput("delete_elements", {
+      documentId: "doc-1", expectedDocumentRevision: 4, ids: ["a", "a"],
+    })).toThrow(/duplicates/i);
+    expect(() => parseMcpToolInput("arrange_elements", {
+      documentId: "doc-1", expectedDocumentRevision: 0, ids: ["a"], action: "align", alignment: "left",
+    })).toThrow(/at least two/i);
+  });
+
+  it("requires explicit document and view revisions for settings and viewport tools", () => {
+    expect(parseMcpToolInput("set_canvas_settings", {
+      documentId: "doc-1", expectedDocumentRevision: 2, background: "white", title: "Updated",
+    })).toMatchObject({ operation: "set_canvas_settings", input: { background: "white", title: "Updated" } });
+    expect(parseMcpToolInput("set_viewport", {
+      documentId: "doc-1", expectedViewRevision: 1, action: "set", x: -120, y: 30, zoom: 1.25,
+    })).toMatchObject({ operation: "set_viewport", input: { x: -120, y: 30, zoom: 1.25 } });
+    expect(() => parseMcpToolInput("set_viewport", {
+      documentId: "doc-1", expectedViewRevision: 1, action: "set", x: 0, y: 0, zoom: 20,
+    })).toThrow(/zoom/i);
+  });
+
+  it("rejects absolute paths, traversal and mismatched file extensions", () => {
+    const base = { documentId: "doc-1", expectedDocumentRevision: 0 };
+    expect(() => parseMcpToolInput("open_document", { ...base, path: "../secret.draw" })).toThrow(/plain filename/i);
+    expect(() => parseMcpToolInput("open_document", { ...base, path: "/tmp/private.draw" })).toThrow(/plain filename/i);
+    expect(() => parseMcpToolInput("save_document", { ...base, path: "export.png" })).toThrow(/\.draw/i);
+    expect(parseMcpToolInput("export_image", { ...base, format: "png", scope: "canvas", path: "flow.png" })).toMatchObject({ operation: "export_image" });
+    expect(() => parseMcpToolInput("export_image", { ...base, format: "png", scope: "canvas", path: "flow.jpg" })).toThrow(/\.png/i);
   });
 
   it("accepts native standalone text, line, arrow, and freehand elements", () => {

@@ -1,5 +1,11 @@
 # Draw MCP capability matrix
 
+## V2 issue #33 delivery status
+
+The #33 implementation branch adds native scene editing, selection/group/arrange/delete/duplicate, guarded undo/redo, title/background and viewport controls, paginated revision-aware reads, plus MCP open/save/export tools. Dirty `open_document` uses an expiring, one-use token: Draw displays the request, the human approves or denies it in the editor, and the MCP caller must retry with the token. The bridge binds approval to the active document/revision, filename, and SHA-256 of the source file; stale or expired requests do not open anything. File access is restricted to basename paths in `DRAW_MCP_DOCUMENT_DIR`.
+
+MCP saves create new files atomically and fail with `PATH_EXISTS` when a target already exists. Overwrite is intentionally unavailable because a portable conditional atomic replace is not provided by Node's standard filesystem API; rechecking and then renaming leaves a race with another local process. See [#39](https://github.com/ashbhati/draw/issues/39) for a safe overwrite design. Durable MCP actor identity and undo eligibility across reloads/restarts are tracked separately in [#38](https://github.com/ashbhati/draw/issues/38); this branch fails closed when it cannot prove an operation remains eligible.
+
 This document translates the V2 goal—agents should be able to do the meaningful work available to a person in Draw—into a reviewable capability and safety contract. The target is **semantic capability parity**, not a remote imitation of every mouse gesture: an agent requests an operation such as “create a labeled box”, while the editor remains responsible for rendering, hit testing, and canvas interaction.
 
 Status labels below are deliberate: **Available (V1)** describes implemented behavior; **Unsupported (V1)** means no current MCP operation exists; **Proposed (V2)** is a design target, not an implementation claim. Tool names and detailed schemas are proposals for issue #31 review.

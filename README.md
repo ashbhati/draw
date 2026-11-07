@@ -34,7 +34,10 @@ The local MCP server communicates with the active development canvas. Start the 
     "draw": {
       "command": "npm",
       "args": ["run", "mcp"],
-      "cwd": "/absolute/path/to/draw"
+      "cwd": "/absolute/path/to/draw",
+      "env": {
+        "DRAW_MCP_DOCUMENT_DIR": "/absolute/path/to/a/dedicated/draw-documents-folder"
+      }
     }
   }
 }
@@ -47,6 +50,13 @@ Available tools:
 - `create_elements`: add native editable rectangles, ellipses, diamonds, standalone text, lines, arrows, and freehand strokes. Provide a unique caller-side `id` for each element; the result maps those IDs to Draw element IDs and reports label and arrow endpoint relationships. Coordinates use canvas units. `line`, `arrow`, and `freedraw` points are offsets relative to the element's `x` and `y`; bounds are derived from their points. Lines and arrows accept two-number points. Freedraw accepts `[x,y]` points or optional pressure as `[x,y,pressure]`; Draw stores native `[x,y]` points with a separate `pressures` array and `simulatePressure` flag. If no point supplies pressure, pressure is simulated. If any point supplies pressure, omitted point pressures default to `0.5`. Zero-length paths are rejected.
 - Shapes accept a `label`; arrows accept a `label` and either both `start` and `end` IDs or neither. Bound endpoints must reference shapes created in the same call. When both bindings are supplied, Draw derives the initial arrow path from the bound shapes' centers and ignores the arrow's supplied `x`, `y`, and `points`; the editor attaches the ends to the shapes. Unbound arrows use the supplied path. Standalone text accepts `maxWidth` (default 600 canvas units) and wraps to fit. The primitive API supports only the fields listed in the `create_elements` tool schema; it does not expose arbitrary Excalidraw element properties, images, frames, or app state.
 - `update_elements`: move, resize, recolor, or change text on existing elements.
+- `delete_elements`, `duplicate_elements`, `group_elements`, `ungroup_elements`, and `arrange_elements`: edit selected element IDs with revision-guarded batches. `arrange_elements` supports layer order, alignment, and distribution.
+- `set_selection`: select or clear element IDs in the editor; selection is temporary and is not saved in `.draw`.
+- `undo_operation` and `redo_operation`: act on the latest eligible MCP operation by its returned `operationId`. Draw rejects an undo after any later human scene change; eligibility is intentionally not retained across page reloads or MCP restarts.
+- `set_canvas_settings` and `set_viewport`: set the document title/background or pan, zoom, and fit-to-content. Scene and view revisions are tracked separately.
+- `save_document`, `open_document`, and `export_image`: save editable `.draw` documents, reopen them, and return PNG/JPEG image artifacts. Direct file operations require `DRAW_MCP_DOCUMENT_DIR`; MCP paths are basenames within that folder. Existing output files fail with `PATH_EXISTS` and are never overwritten; save-as to a new filename. Safe overwrite is tracked in [issue #39](https://github.com/ashbhati/draw/issues/39). Replacing a populated canvas returns `NEEDS_CONFIRMATION` with a one-use token; approve or deny it in Draw, then retry `open_document` with the token.
+
+Every scene mutation should include `documentId` and the latest `expectedDocumentRevision` from `get_current_canvas`. Viewport commands use `expectedViewRevision`. This detects stale agent context before changing the active document.
 
 `create_diagram` returns `nodes`, mapping each caller-provided node ID to its Draw element ID; `nodeLabels` maps those node IDs to their bound text IDs. `edges` contains each created arrow's `elementId`, optional `labelElementId`, and input index. The result also includes `addedElementIds` and, when supplied, `titleElementId`. Use these returned IDs with `update_elements`.
 

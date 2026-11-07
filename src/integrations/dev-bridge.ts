@@ -1,7 +1,8 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import type { Plugin, ViteDevServer } from "vite";
 import type { DrawDocument } from "../document/document";
-import { validateDrawDocument } from "../document/document";
+import { parseDrawFile, validateDrawDocument } from "../document/document";
 import type { McpCommand } from "./mcp-contract";
 import { parseMcpToolInput } from "./mcp-contract";
 
@@ -29,6 +30,17 @@ type PendingFlush = {
   resolve: (document: DrawDocumentBridgeValue) => void;
   reject: (error: Error) => void;
   timeout: ReturnType<typeof setTimeout>;
+};
+
+type PendingConfirmation = {
+  token: string;
+  clientId: string;
+  documentId: string;
+  expectedDocumentRevision: number;
+  filename: string;
+  fingerprint: string;
+  expiresAt: number;
+  decision: "pending" | "approved" | "denied";
 };
 
 export type DrawMcpBridgeOptions = {
@@ -90,7 +102,12 @@ function requestPath(request: IncomingMessage): string {
 
 function asMcpCommand(body: unknown): McpCommand {
   if (!isRecord(body) || typeof body.operation !== "string") throw new Error("Command must include an operation.");
-  return parseMcpToolInput(body.operation, body.input);
+  const command = parseMcpToolInput(body.operation, body.input);
+  if (command.operation === "open_document") {
+    if (!isDrawDocument(body.document)) throw new Error("open_document must include a valid Draw document loaded from the configured folder.");
+    return { ...command, document: parseDrawFile(body.document) };
+  }
+  return command;
 }
 
 export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin {
@@ -100,6 +117,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const pending = new Map<string, PendingCommand>();
   const pendingFlushes = new Map<string, PendingFlush>();
+  const confirmations = new Map<string, PendingConfirmation>();
   let document: DrawDocumentBridgeValue | null = null;
   let activeClientId: string | null = null;
   let commandSequence = 0;
@@ -168,6 +186,79 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
             }
             document = body.document;
             sendJson(response, 200, { ok: true, documentId: document.document.id });
+            return;
+          }
+
+          if (request.method === "POST" && path === `${API_ROOT}/confirmations`) {
+            const body = await readJsonBody(request, maxBodyBytes);
+            if (!isRecord(body) || body.action !== "open_document" || typeof body.documentId !== "string" || typeof body.expectedDocumentRevision !== "number" || typeof body.filename !== "string" || typeof body.fingerprint !== "string" || !/^[a-f\d]{64}$/i.test(body.fingerprint)) {
+              sendJson(response, 400, { error: "Confirmation request is invalid." });
+              return;
+            }
+            if (!document || !activeClientId || body.documentId !== document.document.id || body.expectedDocumentRevision !== document.document.documentRevision) {
+              sendJson(response, 409, { error: "Confirmation context is stale. Read the active canvas again." });
+              return;
+            }
+            if (body.filename.length > 160 || body.filename.includes("/") || body.filename.includes("\\")) {
+              sendJson(response, 400, { error: "Confirmation filename must be a basename." });
+              return;
+            }
+            const token = randomUUID();
+            const expiresAt = Date.now() + 120_000;
+            confirmations.set(token, {
+              token, clientId: activeClientId, documentId: document.document.id,
+              expectedDocumentRevision: document.document.documentRevision, filename: body.filename,
+              fingerprint: body.fingerprint, expiresAt, decision: "pending",
+            });
+            server.ws.send("draw:confirmation-required", { token, clientId: activeClientId, action: "open_document", filename: body.filename, expiresAt });
+            sendJson(response, 202, { status: "NEEDS_CONFIRMATION", confirmationToken: token, expiresAt });
+            return;
+          }
+
+          const confirmationRespondMatch = path.match(/^\/__draw\/api\/confirmations\/([^/]+)\/respond$/);
+          if (request.method === "POST" && confirmationRespondMatch) {
+            const body = await readJsonBody(request, maxBodyBytes);
+            const token = decodeURIComponent(confirmationRespondMatch[1]);
+            const confirmation = confirmations.get(token);
+            if (!confirmation || confirmation.expiresAt <= Date.now()) {
+              confirmations.delete(token);
+              sendJson(response, 410, { status: "EXPIRED" });
+              return;
+            }
+            if (!isRecord(body) || body.clientId !== confirmation.clientId || body.clientId !== activeClientId || typeof body.approved !== "boolean") {
+              sendJson(response, 409, { error: "Confirmation response came from a stale or invalid editor session." });
+              return;
+            }
+            if (confirmation.decision !== "pending") {
+              sendJson(response, 409, { error: "Confirmation token has already been used." });
+              return;
+            }
+            confirmation.decision = body.approved ? "approved" : "denied";
+            sendJson(response, 200, { status: body.approved ? "APPROVED" : "DENIED" });
+            return;
+          }
+
+          const confirmationConsumeMatch = path.match(/^\/__draw\/api\/confirmations\/([^/]+)\/consume$/);
+          if (request.method === "POST" && confirmationConsumeMatch) {
+            const body = await readJsonBody(request, maxBodyBytes);
+            const token = decodeURIComponent(confirmationConsumeMatch[1]);
+            const confirmation = confirmations.get(token);
+            if (!confirmation || confirmation.expiresAt <= Date.now()) {
+              confirmations.delete(token);
+              sendJson(response, 200, { status: "EXPIRED" });
+              return;
+            }
+            if (!isRecord(body) || confirmation.clientId !== activeClientId || body.action !== "open_document" || body.documentId !== confirmation.documentId || body.expectedDocumentRevision !== confirmation.expectedDocumentRevision || body.filename !== confirmation.filename || body.fingerprint !== confirmation.fingerprint || !document || document.document.id !== confirmation.documentId || document.document.documentRevision !== confirmation.expectedDocumentRevision) {
+              confirmations.delete(token);
+              sendJson(response, 200, { status: "STALE" });
+              return;
+            }
+            if (confirmation.decision === "pending") {
+              sendJson(response, 200, { status: "PENDING" });
+              return;
+            }
+            confirmations.delete(token);
+            sendJson(response, 200, { status: confirmation.decision === "approved" ? "APPROVED" : "DENIED" });
             return;
           }
 
@@ -247,6 +338,26 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               return;
             }
 
+            const commandInput = command.input as Record<string, unknown>;
+            const expectedDocumentRevision = commandInput.expectedDocumentRevision;
+            const expectedViewRevision = commandInput.expectedViewRevision;
+            if (typeof commandInput.documentId === "string" && command.operation !== "open_document" && commandInput.documentId !== document.document.id) {
+              sendJson(response, 409, { error: "Document ID does not match the active Draw canvas." });
+              return;
+            }
+            if (typeof commandInput.documentId === "string" && command.operation === "open_document" && commandInput.documentId !== document.document.id) {
+              sendJson(response, 409, { error: "Open context document ID does not match the active Draw canvas." });
+              return;
+            }
+            if (typeof expectedDocumentRevision === "number" && expectedDocumentRevision !== (document.document.documentRevision ?? 0)) {
+              sendJson(response, 409, { error: `Document revision conflict. Expected ${expectedDocumentRevision}; current revision is ${document.document.documentRevision ?? 0}. Read the current canvas before retrying.` });
+              return;
+            }
+            if (typeof expectedViewRevision === "number" && expectedViewRevision !== (document.document.viewRevision ?? 0)) {
+              sendJson(response, 409, { error: `View revision conflict. Expected ${expectedViewRevision}; current revision is ${document.document.viewRevision ?? 0}. Read the current canvas before retrying.` });
+              return;
+            }
+
             commandSequence += 1;
             const id = `draw-command-${Date.now().toString(36)}-${commandSequence.toString(36)}`;
             const clientId = activeClientId;
@@ -287,6 +398,8 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               sendJson(response, 200, {
                 ok: true,
                 documentId: document.document.id,
+                  documentRevision: document.document.documentRevision ?? 0,
+                  viewRevision: document.document.viewRevision ?? 0,
                 result: ack.result ?? null,
                 ...(ack.warning ? { warning: ack.warning } : {}),
               });

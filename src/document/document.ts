@@ -40,6 +40,8 @@ export interface DrawDocument {
   document: {
     id: string;
     title: string;
+    documentRevision: number;
+    viewRevision: number;
     canvas: {
       infinite: true;
       background: DrawBackground;
@@ -61,6 +63,8 @@ export interface ExcalidrawSceneInput {
 export interface DrawDocumentMetadata {
   id?: string;
   title?: string;
+  documentRevision?: number;
+  viewRevision?: number;
   background?: DrawBackground;
   viewport?: DrawViewport;
 }
@@ -128,6 +132,8 @@ export function createEmptyDocument(title = "Untitled drawing"): DrawDocument {
     document: {
       id: makeId(),
       title,
+      documentRevision: 0,
+      viewRevision: 0,
       canvas: {
         infinite: true,
         background,
@@ -158,6 +164,12 @@ export function validateDrawDocument(value: unknown): asserts value is DrawDocum
   }
   if (typeof document.title !== "string") {
     throw new DrawDocumentError("Document title must be a string.");
+  }
+  if (!Number.isSafeInteger(document.documentRevision) || Number(document.documentRevision) < 0) {
+    throw new DrawDocumentError("Document documentRevision must be a non-negative safe integer.");
+  }
+  if (!Number.isSafeInteger(document.viewRevision) || Number(document.viewRevision) < 0) {
+    throw new DrawDocumentError("Document viewRevision must be a non-negative safe integer.");
   }
 
   const canvas = document.canvas;
@@ -305,6 +317,8 @@ export function fromExcalidrawScene(
     document: {
       id: metadata.id ?? makeId(),
       title: metadata.title ?? "Untitled drawing",
+      documentRevision: metadata.documentRevision ?? 0,
+      viewRevision: metadata.viewRevision ?? 0,
       canvas: {
         infinite: true,
         background: { ...background },
@@ -378,6 +392,8 @@ export function normalizeLegacyDraw(raw: unknown): DrawDocument {
     document: {
       id: typeof legacy.id === "string" && legacy.id ? legacy.id : makeId(),
       title: typeof legacy.title === "string" ? legacy.title : "Untitled drawing",
+      documentRevision: 0,
+      viewRevision: 0,
       canvas: {
         infinite: true,
         background,
@@ -441,6 +457,8 @@ function normalizeVersionOneDocument(raw: Record<string, unknown>): DrawDocument
     document: {
       id: source.id,
       title: source.title,
+      documentRevision: Number.isSafeInteger(source.documentRevision) && Number(source.documentRevision) >= 0 ? Number(source.documentRevision) : 0,
+      viewRevision: Number.isSafeInteger(source.viewRevision) && Number(source.viewRevision) >= 0 ? Number(source.viewRevision) : 0,
       canvas: {
         infinite: true,
         background,

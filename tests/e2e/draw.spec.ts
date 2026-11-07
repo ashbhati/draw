@@ -1,10 +1,63 @@
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 import { readFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawn } from "node:child_process";
 import { isBundledFontURL, isSameOriginURL } from "./config";
 
 const documentApi = "/__draw/api/document";
 const commandApi = "/__draw/api/commands";
+
+async function startStdioMcp(baseURL: string, documentDir: string) {
+  const child = spawn(process.execPath, ["--import", "tsx/esm", "src/integrations/mcp-server.ts"], {
+    cwd: process.cwd(),
+    env: { ...process.env, DRAW_MCP_BASE_URL: new URL(baseURL).origin, DRAW_MCP_DOCUMENT_DIR: documentDir },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let output = "";
+  let errorOutput = "";
+  const pending = new Map<number, { resolve: (message: any) => void; reject: (error: Error) => void }>();
+  child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+    output += chunk;
+    while (output.includes("\n")) {
+      const end = output.indexOf("\n");
+      const line = output.slice(0, end);
+      output = output.slice(end + 1);
+      if (!line) continue;
+      const message = JSON.parse(line);
+      if (typeof message.id === "number") {
+        const waiter = pending.get(message.id);
+        if (waiter) { pending.delete(message.id); waiter.resolve(message); }
+      }
+    }
+  });
+  child.stderr.setEncoding("utf8").on("data", (chunk: string) => { errorOutput += chunk; });
+  let sequence = 0;
+  const request = (method: string, params: unknown) => {
+    const id = ++sequence;
+    const response = new Promise<any>((resolve, reject) => {
+      const timeout = setTimeout(() => { pending.delete(id); reject(new Error(`MCP ${method} timed out. ${errorOutput}`)); }, 15_000);
+      pending.set(id, { resolve: (message) => { clearTimeout(timeout); resolve(message); }, reject });
+    });
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    return response;
+  };
+  const initialized = await request("initialize", {
+    protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "draw-e2e", version: "1.0" },
+  });
+  if (initialized.error) throw new Error(`MCP initialize failed: ${JSON.stringify(initialized.error)} ${errorOutput}`);
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+  return {
+    request,
+    call: async (name: string, args: Record<string, unknown>) => request("tools/call", { name, arguments: args }),
+    close: async () => {
+      child.stdin.end();
+      await new Promise<void>((resolve) => { child.once("exit", () => resolve()); setTimeout(() => { child.kill(); resolve(); }, 2_000); });
+    },
+  };
+}
 
 async function currentBridgeDocument(page: Page) {
   const response = await page.request.get(documentApi);
@@ -1533,4 +1586,85 @@ test("selection-only export reports an empty selection when the image format cha
   await page.getByLabel("Image export format").selectOption("image/jpeg");
   await expect(page.getByRole("status")).toContainText("Select one or more objects to export a selection");
   expect(await unexpectedDownload).toBe(false);
+});
+
+test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject paths safely", async ({ page, baseURL }) => {
+  if (!baseURL) throw new Error("Playwright baseURL is required for the MCP integration test.");
+  const directory = await mkdtemp(join(tmpdir(), "draw-mcp-e2e-"));
+  const mcp = await startStdioMcp(baseURL, directory);
+  try {
+    await page.locator(".excalidraw canvas").first().waitFor();
+    await expect.poll(async () => (await (await page.request.get("/__draw/api/health")).json())).toMatchObject({ clientReady: true, documentReady: true });
+    const initializedTools = await mcp.request("tools/list", {});
+    expect(initializedTools.result.tools.map((tool: any) => tool.name)).toEqual(expect.arrayContaining([
+      "create_diagram", "update_elements", "delete_elements", "duplicate_elements", "set_selection",
+      "group_elements", "ungroup_elements", "arrange_elements", "undo_operation", "redo_operation",
+      "set_canvas_settings", "set_viewport", "open_document", "save_document", "export_image",
+    ]));
+
+    const initial = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const createdResponse = await mcp.call("create_diagram", { documentId: initial.documentId, expectedDocumentRevision: initial.documentRevision, title: "MCP lifecycle", nodes: [
+      { id: "first", label: "First editable node", x: 160, y: 120 },
+      { id: "second", label: "Second editable node", x: 440, y: 120 },
+    ], edges: [{ from: "first", to: "second" }] });
+    expect(createdResponse.error).toBeUndefined();
+    const created = JSON.parse(createdResponse.result.content[0].text);
+    expect(created.nodes.first).toBeTruthy();
+    const snapshotResponse = await mcp.call("get_current_canvas", { offset: 0, limit: 250 });
+    const snapshot = JSON.parse(snapshotResponse.result.content[0].text);
+    expect(snapshot.documentId).toBeTruthy();
+    expect(snapshot.elements.some((element: any) => element.id === created.nodes.first)).toBe(true);
+
+    const beforeEdit = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const editResponse = await mcp.call("update_elements", { documentId: beforeEdit.documentId, expectedDocumentRevision: beforeEdit.documentRevision, updates: [{ id: created.nodes.first, patch: { x: 190, text: "Edited through MCP" } }] });
+    expect(editResponse.error).toBeUndefined();
+    const edited = JSON.parse(editResponse.result.content[0].text);
+    const undoResponse = await mcp.call("undo_operation", { documentId: snapshot.documentId, operationId: edited.operationId, expectedDocumentRevision: edited.documentRevision });
+    expect(undoResponse.error).toBeUndefined();
+    const undoneCanvas = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    expect(undoneCanvas.elements.find((element: any) => element.id === created.nodes.first).text).not.toBe("Edited through MCP");
+    const undone = JSON.parse(undoResponse.result.content[0].text);
+    const redoResponse = await mcp.call("redo_operation", { documentId: snapshot.documentId, operationId: edited.operationId, expectedDocumentRevision: undone.documentRevision });
+    expect(redoResponse.error).toBeUndefined();
+
+    // A later human history operation invalidates the MCP undo token. The MCP
+    // request must fail closed instead of consuming this subsequent editor work.
+    await page.getByRole("button", { name: "Undo" }).click();
+    const afterHumanUndo = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const unsafeUndo = await mcp.call("undo_operation", { documentId: afterHumanUndo.documentId, operationId: edited.operationId, expectedDocumentRevision: afterHumanUndo.documentRevision });
+    expect(unsafeUndo.result?.isError).toBe(true);
+    await page.getByRole("button", { name: "Redo" }).click();
+
+    const current = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const savedResponse = await mcp.call("save_document", { path: "stdio-roundtrip.draw", documentId: current.documentId, expectedDocumentRevision: current.documentRevision });
+    expect(savedResponse.error).toBeUndefined();
+    const savedFile = JSON.parse(await readFile(join(directory, "stdio-roundtrip.draw"), "utf8"));
+    expect(savedFile.format).toBe("draw");
+    expect(savedFile.document.elements.some((element: any) => element.id === created.nodes.first)).toBe(true);
+
+    const exportedResponse = await mcp.call("export_image", { documentId: current.documentId, format: "png", scope: "canvas" });
+    expect(exportedResponse.error).toBeUndefined();
+    expect(exportedResponse.result.content.some((part: any) => part.type === "image" && part.mimeType === "image/png" && part.data.length > 100)).toBe(true);
+
+    const confirmationResponse = await mcp.call("open_document", { path: "stdio-roundtrip.draw", documentId: current.documentId, expectedDocumentRevision: current.documentRevision });
+    const challenge = JSON.parse(confirmationResponse.result.content[0].text);
+    expect(challenge.status).toBe("NEEDS_CONFIRMATION");
+    await expect(page.getByRole("dialog", { name: "Open a Draw document?" })).toBeVisible();
+    await page.getByRole("button", { name: "Keep current canvas" }).click();
+    const denied = await mcp.call("open_document", { path: "stdio-roundtrip.draw", documentId: current.documentId, expectedDocumentRevision: current.documentRevision, confirmationToken: challenge.confirmationToken });
+    expect(JSON.parse(denied.result.content[0].text).status).toBe("DENIED");
+    const approvedChallengeResponse = await mcp.call("open_document", { path: "stdio-roundtrip.draw", documentId: current.documentId, expectedDocumentRevision: current.documentRevision });
+    const approvedChallenge = JSON.parse(approvedChallengeResponse.result.content[0].text);
+    await expect(page.getByRole("dialog", { name: "Open a Draw document?" })).toBeVisible();
+    await page.getByRole("button", { name: "Approve opening" }).click();
+    const openResponse = await mcp.call("open_document", { path: "stdio-roundtrip.draw", documentId: current.documentId, expectedDocumentRevision: current.documentRevision, confirmationToken: approvedChallenge.confirmationToken });
+    expect(openResponse.error).toBeUndefined();
+    expect(JSON.parse(openResponse.result.content[0].text).opened).toBe(true);
+    await expect.poll(async () => (await (await page.request.get("/__draw/api/document?flush=1")).json()).document.elements.some((element: any) => element.id === created.nodes.first)).toBe(true);
+    const unsafe = await mcp.call("open_document", { path: "../outside.draw", documentId: current.documentId, expectedDocumentRevision: current.documentRevision });
+    expect(unsafe.result?.isError ?? unsafe.error !== undefined).toBeTruthy();
+  } finally {
+    await mcp.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });

@@ -131,6 +131,50 @@ describe("Draw MCP Vite bridge", () => {
     expect(current.body.document.title).toBe("Active tab");
   });
 
+  it("binds dirty-open confirmation tokens to the active document revision and consumes them once", async () => {
+    const bridge = createBridgeHarness(createDrawMcpPlugin());
+    const document = createEmptyDocument("Active canvas");
+    document.document.elements.push({ id: "existing", type: "rectangle" });
+    await bridge.request("PUT", "/__draw/api/client", { clientId: "tab-1" });
+    await bridge.request("PUT", "/__draw/api/document", { clientId: "tab-1", document });
+    const challengeResponse = await bridge.request("POST", "/__draw/api/confirmations", {
+      action: "open_document", documentId: document.document.id, expectedDocumentRevision: 0,
+      filename: "incoming.draw", fingerprint: "a".repeat(64),
+    });
+    expect(challengeResponse.status).toBe(202);
+    expect(challengeResponse.body.status).toBe("NEEDS_CONFIRMATION");
+    const challenge = bridge.events.find(({ event }) => event === "draw:confirmation-required")?.data;
+    expect(challenge).toMatchObject({ clientId: "tab-1", action: "open_document", filename: "incoming.draw" });
+
+    expect((await bridge.request("POST", `/__draw/api/confirmations/${challengeResponse.body.confirmationToken}/respond`, { clientId: "tab-1", approved: true })).body.status).toBe("APPROVED");
+    const changed = structuredClone(document);
+    changed.document.documentRevision = 1;
+    await bridge.request("PUT", "/__draw/api/document", { clientId: "tab-1", document: changed });
+    const stale = await bridge.request("POST", `/__draw/api/confirmations/${challengeResponse.body.confirmationToken}/consume`, {
+      action: "open_document", documentId: document.document.id, expectedDocumentRevision: 0,
+      filename: "incoming.draw", fingerprint: "a".repeat(64),
+    });
+    expect(stale.body.status).toBe("STALE");
+    const reused = await bridge.request("POST", `/__draw/api/confirmations/${challengeResponse.body.confirmationToken}/consume`, {
+      action: "open_document", documentId: document.document.id, expectedDocumentRevision: 0,
+      filename: "incoming.draw", fingerprint: "a".repeat(64),
+    });
+    expect(reused.body.status).toBe("EXPIRED");
+
+    await bridge.request("PUT", "/__draw/api/client", { clientId: "tab-1" });
+    const takeoverChallenge = await bridge.request("POST", "/__draw/api/confirmations", {
+      action: "open_document", documentId: changed.document.id, expectedDocumentRevision: 1,
+      filename: "incoming.draw", fingerprint: "b".repeat(64),
+    });
+    await bridge.request("POST", `/__draw/api/confirmations/${takeoverChallenge.body.confirmationToken}/respond`, { clientId: "tab-1", approved: true });
+    await bridge.request("PUT", "/__draw/api/client", { clientId: "tab-2" });
+    const takenOver = await bridge.request("POST", `/__draw/api/confirmations/${takeoverChallenge.body.confirmationToken}/consume`, {
+      action: "open_document", documentId: changed.document.id, expectedDocumentRevision: 1,
+      filename: "incoming.draw", fingerprint: "b".repeat(64),
+    });
+    expect(takenOver.body.status).toBe("STALE");
+  });
+
   it("flushes the active tab before a freshness-requested canvas read", async () => {
     const bridge = createBridgeHarness(createDrawMcpPlugin({ flushTimeoutMs: 1_000 }));
     const original = createEmptyDocument("Before edit");
