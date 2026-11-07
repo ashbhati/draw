@@ -1,14 +1,18 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import { createHash } from "node:crypto";
+import { readLocalMcpCredential, getLocalMcpIdentity, writeLocalMcpCredential } from "./mcp-client-credentials";
 import * as z from "zod/v4";
 import { parseMcpToolInput, summarizeCurrentCanvas } from "./mcp-contract";
 import { loadDrawFileSnapshot, writeNewArtifact } from "./mcp-file-access";
 import { assertInlineArtifactSize } from "./mcp-result-limits";
 import { shouldRequireOpenConfirmation } from "../document/open-safety";
 import { serializeDrawFile } from "../document/document";
+import { readConfiguredPairingSecret } from "./mcp-pairing-config";
 
 const defaultBaseUrl = "http://127.0.0.1:5173";
 const requestTimeoutMs = 25_000;
+const pairingTimeoutMs = 125_000;
 const colorSchema = z.string().regex(/^#[\da-f]{6}$/i, "Use a six-digit hex color such as #f3c94c.");
 
 const createDiagramSchema = z.object({
@@ -116,14 +120,23 @@ function resolveLoopbackBaseUrl(): URL {
 
 const baseUrl = resolveLoopbackBaseUrl();
 
-async function bridgeRequest(path: string, init?: RequestInit): Promise<any> {
+async function bridgeRequest(path: string, init?: RequestInit, options: { pairing?: boolean; timeoutMs?: number } = {}): Promise<any> {
+  const pairing = options.pairing ?? false;
+  const credential = pairing ? null : await readLocalMcpCredential();
+  if (!pairing && (!credential?.clientIdentity || !credential.capability || (credential.expiresAt ?? 0) <= Date.now())) {
+    throw new Error("This MCP host is not paired with Draw. In Draw, open MCP clients, copy the one-time pairing secret into protected host configuration, then call pair_mcp_client.");
+  }
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? requestTimeoutMs);
   try {
     const response = await fetch(new URL(path, baseUrl), {
       ...init,
       signal: controller.signal,
-      headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
+      headers: {
+        "content-type": "application/json",
+        ...(!pairing && credential ? { "x-draw-client-identity": credential.clientIdentity!, authorization: `Bearer ${credential.capability!}` } : {}),
+        ...(init?.headers ?? {}),
+      },
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
@@ -150,6 +163,25 @@ function textResult(value: unknown) {
 
 function createServer() {
   const server = new McpServer({ name: "draw", version: "0.1.0" });
+
+  server.registerTool("pair_mcp_client", {
+    description: "Pair this MCP host with Draw. First copy Draw's one-time MCP pairing secret into protected host configuration as DRAW_MCP_PAIRING_SECRET. The tool submits that secret, a stable host fingerprint, and a configured client name; Draw asks the human owner to approve. The capability is saved locally with restrictive permissions and is never returned to the model.",
+    inputSchema: z.object({}).strict(),
+  }, async () => {
+    const pairingSecret = readConfiguredPairingSecret();
+    const local = await getLocalMcpIdentity();
+    const fingerprint = createHash("sha256").update(local.installationId).digest("hex");
+    const clientName = process.env.DRAW_MCP_CLIENT_NAME?.trim() || "Draw MCP client";
+    const paired = await bridgeRequest("/__draw/api/mcp/pair", {
+      method: "POST",
+      body: JSON.stringify({ pairingSecret, clientName, fingerprint }),
+    }, { pairing: true, timeoutMs: pairingTimeoutMs });
+    if (typeof paired.clientIdentity !== "string" || typeof paired.capability !== "string" || typeof paired.expiresAt !== "number") {
+      throw new Error("Draw returned an invalid MCP pairing result.");
+    }
+    await writeLocalMcpCredential({ ...local, clientIdentity: paired.clientIdentity, capability: paired.capability, expiresAt: paired.expiresAt });
+    return textResult({ paired: true, clientIdentity: paired.clientIdentity, expiresAt: paired.expiresAt, fingerprint });
+  });
 
   server.registerTool(
     "get_current_canvas",

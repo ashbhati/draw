@@ -24,11 +24,16 @@ import { createBridgeSynchronizer } from "./integrations/bridge-sync";
 import { applySceneEdit } from "./integrations/scene-operations";
 import { hasSceneContentChanged, sceneElementsChanged } from "./integrations/scene-revision";
 import { rebaseOpenedDocument, shouldRequireOpenConfirmation } from "./document/open-safety";
+import { canRestoreCancelledMcpCommand } from "./integrations/mcp-cancellation";
 
 type Status = "loading" | "ready" | "saving" | "saved" | "error";
-type BridgeCommand = { id: string; clientId: string; operation: string; input: any; document?: DrawDocument };
-type BridgeFlush = { id: string; clientId: string };
-type BridgeConfirmation = { token: string; clientId: string; action: "open_document"; filename: string; expiresAt: number };
+type BridgeCommand = { id: string; clientId: string; clientIdentity: string; operation: string; input: any; document?: DrawDocument };
+type BridgeFlush = { id: string; clientId: string; clientIdentity: string };
+type BridgeConfirmation = { token: string; clientId: string; clientIdentity: string; action: "open_document"; filename: string; expiresAt: number };
+type McpPairingRequest = { requestId: string; clientId: string; name: string; fingerprint: string; expiresAt: number; replacesName?: string };
+type McpClientRevokedEvent = { clientIdentity: string };
+type McpCommandRevokedEvent = { id: string; clientId: string; clientIdentity: string };
+type McpPairedClient = { clientIdentity: string; name: string; fingerprint: string; createdAt: number; expiresAt: number; revokedAt: number | null };
 const DEFAULT_COLOR: Record<DrawBackgroundPreset, string> = { blackboard: "#18191a", white: "#ffffff" };
 const EDITOR_UI_OPTIONS = {
   canvasActions: { loadScene: false, saveToActiveFile: false, export: false, toggleTheme: false, changeViewBackgroundColor: false },
@@ -129,6 +134,11 @@ export default function App() {
   const [connectOpen, setConnectOpen] = useState(false);
   const [launchCodeInput, setLaunchCodeInput] = useState("");
   const [connectError, setConnectError] = useState("");
+  const [mcpManagementOpen, setMcpManagementOpen] = useState(false);
+  const [mcpPairingSecret, setMcpPairingSecret] = useState("");
+  const [mcpClients, setMcpClients] = useState<McpPairedClient[]>([]);
+  const [mcpPairingRequest, setMcpPairingRequest] = useState<McpPairingRequest | null>(null);
+  const [mcpPairingError, setMcpPairingError] = useState("");
   const [autosaveBlocked, setAutosaveBlocked] = useState(false);
   const autosaveBlockedRef = useRef(autosaveBlocked);
   autosaveBlockedRef.current = autosaveBlocked;
@@ -138,6 +148,8 @@ export default function App() {
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
   const docRef = useRef<DrawDocument | null>(null);
   const clientId = useRef(randomId());
+  const revokedMcpCommandIds = useRef(new Set<string>());
+  const completedMcpCommandIds = useRef(new Set<string>());
   const editorSecret = useRef<string | null>(null);
   const bridgeSync = useMemo(() => createBridgeSynchronizer(clientId.current, () => editorSecret.current), []);
   const writerOwned = useRef(false);
@@ -423,6 +435,68 @@ export default function App() {
     }
   }, [bridgeSync, canWrite, launchCodeInput]);
 
+  const openMcpManagement = useCallback(async () => {
+    setMcpPairingError("");
+    if (!editorSecret.current || !canWrite) {
+      setMcpPairingError("Connect this Draw tab to the local bridge before pairing MCP clients.");
+      setMcpManagementOpen(true);
+      return;
+    }
+    try {
+      const headers = { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current };
+      const clientsResponse = await fetch("/__draw/api/mcp/clients", { headers: { "x-draw-editor-secret": editorSecret.current }, cache: "no-store" });
+      const clientsResult = await clientsResponse.json();
+      if (!clientsResponse.ok) throw new Error(clientsResult.error ?? "Could not list paired MCP clients.");
+      setMcpClients(clientsResult.clients ?? []);
+      const secretResponse = await fetch("/__draw/api/mcp/pairing-secret", { method: "POST", headers, body: JSON.stringify({}), cache: "no-store" });
+      const secretResult = await secretResponse.json();
+      if (!secretResponse.ok) {
+        setMcpPairingSecret("");
+        setMcpPairingError(secretResult.error ?? "Could not create an MCP pairing secret.");
+      } else setMcpPairingSecret(secretResult.pairingSecret);
+      setMcpManagementOpen(true);
+    } catch (error) {
+      setMcpPairingError(error instanceof Error ? error.message : "Could not prepare MCP pairing.");
+      setMcpManagementOpen(true);
+    }
+  }, [canWrite]);
+
+  const respondToMcpPairing = useCallback(async (approved: boolean) => {
+    const pending = mcpPairingRequest;
+    if (!pending) return;
+    try {
+      const response = await fetch(`/__draw/api/mcp/pairings/${encodeURIComponent(pending.requestId)}/respond`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
+        body: JSON.stringify({ clientId: clientId.current, approved }),
+      });
+      if (!response.ok) throw new Error("This MCP pairing request expired or the active Draw tab changed.");
+      setMcpPairingRequest(null);
+      setMcpPairingSecret("");
+      if (approved) setMessage(`Paired MCP client “${pending.name}”.`);
+      else setMessage("MCP pairing was denied.");
+      if (approved && editorSecret.current) {
+        const clients = await fetch("/__draw/api/mcp/clients", { headers: { "x-draw-editor-secret": editorSecret.current }, cache: "no-store" });
+        if (clients.ok) setMcpClients((await clients.json()).clients ?? []);
+      }
+    } catch (error) {
+      setMcpPairingRequest(null);
+      setMessage(error instanceof Error ? error.message : "Could not answer the MCP pairing request.");
+    }
+  }, [mcpPairingRequest]);
+
+  const revokeMcpClient = useCallback(async (identity: string) => {
+    try {
+      const response = await fetch(`/__draw/api/mcp/clients/${encodeURIComponent(identity)}`, {
+        method: "DELETE", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
+      });
+      if (!response.ok) throw new Error("Could not revoke this MCP client.");
+      setMcpClients((clients) => clients.map((client) => client.clientIdentity === identity ? { ...client, revokedAt: Date.now() } : client));
+    } catch (error) {
+      setMcpPairingError(error instanceof Error ? error.message : "Could not revoke this MCP client.");
+    }
+  }, []);
+
   const requestFreshEditorCode = useCallback(async () => {
     setConnectError("");
     try {
@@ -533,10 +607,52 @@ export default function App() {
   }, [canWrite, selectBackground]);
 
   const handleMcpCommand = useCallback(async (event: BridgeCommand) => {
+    if (completedMcpCommandIds.current.has(event.id)) return;
+    if (revokedMcpCommandIds.current.has(event.id)) {
+      revokedMcpCommandIds.current.delete(event.id);
+      completedMcpCommandIds.current.add(event.id);
+      while (completedMcpCommandIds.current.size > 256) completedMcpCommandIds.current.delete(completedMcpCommandIds.current.values().next().value!);
+      return;
+    }
     const api = apiRef.current;
     const current = docRef.current;
     if (!api || !current || !editorSecret.current || event.clientId !== clientId.current) return;
+    const commandStartElements = structuredClone([...api.getSceneElementsIncludingDeleted()]) as any[];
+    const commandStartAppState = api.getAppState() as any;
+    const commandStartSelection = structuredClone(commandStartAppState.selectedElementIds ?? {});
+    const restoreRevokedCommand = async (commandResult: DrawDocument | null) => {
+      const liveState = api.getAppState() as any;
+      const liveViewport = {
+        x: typeof liveState.scrollX === "number" ? liveState.scrollX : current.document.canvas.viewport.x,
+        y: typeof liveState.scrollY === "number" ? liveState.scrollY : current.document.canvas.viewport.y,
+        zoom: typeof liveState.zoom?.value === "number" ? liveState.zoom.value : current.document.canvas.viewport.zoom,
+      };
+      const liveSelection = (liveState.selectedElementIds ?? {}) as Record<string, boolean>;
+      if (!commandResult || !canRestoreCancelledMcpCommand(current, commandResult, docRef.current, liveViewport, liveSelection)) return false;
+      // Update the mounted scene in place. Remounting Excalidraw resets its
+      // history and selection; CaptureUpdateAction.NEVER keeps rollback out
+      // of the user's undo stack. The MCP edit's own history entry can make
+      // the first Undo a no-op after rollback, but older human history remains.
+      api.updateScene({
+        elements: commandStartElements,
+        appState: {
+          selectedElementIds: commandStartSelection,
+          scrollX: commandStartAppState.scrollX,
+          scrollY: commandStartAppState.scrollY,
+          zoom: commandStartAppState.zoom,
+        },
+        captureUpdate: CaptureUpdateAction.NEVER,
+      });
+      setDocument(current);
+      lastMcpOperation.current = null;
+      lastUndoneOperation.current = null;
+      autosave.schedule(current);
+      bridgeAutosave.schedule(current);
+      await Promise.all([autosave.flush(), bridgeAutosave.flush()]).catch(() => undefined);
+      return true;
+    };
     let applied: { document: DrawDocument; result: Record<string, unknown> } | null = null;
+    let commandResult: DrawDocument | null = null;
     try {
       if (!writerOwned.current) throw new Error("This Draw tab is read-only because another tab owns the autosave lock.");
       if (autosaveBlocked) throw new Error("Local autosave is unavailable; open a saved .draw file before using MCP edits.");
@@ -562,7 +678,7 @@ export default function App() {
         result = { selectedElementIds: event.input.ids };
         await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
           method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current },
-          body: JSON.stringify({ id: event.id, clientId: clientId.current, document: current, result }),
+          body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, document: current, result }),
         });
         return;
       }
@@ -739,10 +855,25 @@ export default function App() {
         });
       }
       if (!nextDocument) nextDocument = current;
+      commandResult = nextDocument;
+      if (revokedMcpCommandIds.current.has(event.id)) {
+        if (!await restoreRevokedCommand(commandResult)) setMessage("MCP client revoked after a newer canvas edit; that edit was preserved.");
+        return;
+      }
       const isTransient = event.operation === "export_image";
       setDocument(nextDocument);
       if (event.operation !== "open_document" && event.operation !== "undo_operation" && event.operation !== "redo_operation") {
-        api.updateScene({ elements, ...(event.operation === "set_canvas_settings" ? { appState: { viewBackgroundColor: nextDocument.document.appState.viewBackgroundColor, currentItemStrokeColor: nextDocument.document.appState.currentItemStrokeColor } as any } : {}), captureUpdate: captureUpdate });
+        api.updateScene({
+          elements,
+          appState: {
+            selectedElementIds: commandStartSelection,
+            ...(event.operation === "set_canvas_settings" ? {
+              viewBackgroundColor: nextDocument.document.appState.viewBackgroundColor,
+              currentItemStrokeColor: nextDocument.document.appState.currentItemStrokeColor,
+            } : {}),
+          } as any,
+          captureUpdate,
+        });
       }
       result = { ...result, operationId: event.id, documentRevision: nextDocument.document.documentRevision, viewRevision: nextDocument.document.viewRevision };
       if (!isTransient && ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements"].includes(event.operation)) {
@@ -755,32 +886,50 @@ export default function App() {
         saveCurrentDocument,
         syncBridgeDocument,
       );
+      if (revokedMcpCommandIds.current.has(event.id)) {
+        if (!await restoreRevokedCommand(commandResult)) setMessage("MCP client revoked after a newer canvas edit; that edit was preserved.");
+        return;
+      }
       if (warning) {
         setStatus("error");
         setMessage(warning);
       } else setStatus("saved");
       const acknowledgement = await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
         method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
-        body: JSON.stringify({ id: event.id, clientId: clientId.current, document: nextDocument, result, ...(warning ? { warning } : {}) }),
+        body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, document: nextDocument, result, ...(warning ? { warning } : {}) }),
       });
+      const acknowledgementBody = await acknowledgement.json().catch(() => ({})) as { revoked?: boolean };
+      if (revokedMcpCommandIds.current.has(event.id) || acknowledgement.status === 410 && acknowledgementBody.revoked === true) {
+        revokedMcpCommandIds.current.add(event.id);
+        if (!await restoreRevokedCommand(commandResult)) setMessage("MCP client revoked after a newer canvas edit; that edit was preserved.");
+        return;
+      }
       if (!acknowledgement.ok) throw new Error(`Draw MCP bridge rejected the command acknowledgement (HTTP ${acknowledgement.status}).`);
     } catch (error) {
+      if (revokedMcpCommandIds.current.has(event.id)) {
+        if (!await restoreRevokedCommand(commandResult)) setMessage("MCP client revoked after a newer canvas edit; that edit was preserved.");
+        return;
+      }
       if (applied) {
         const warning = `The edit was applied but the MCP acknowledgement failed: ${error instanceof Error ? error.message : String(error)}. Call get_current_canvas before retrying.`;
         setStatus("error");
         setMessage(warning);
         await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
           method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
-          body: JSON.stringify({ id: event.id, clientId: clientId.current, document: applied.document, result: applied.result, warning }),
+          body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, document: applied.document, result: applied.result, warning }),
         }).catch(() => undefined);
         return;
       }
       await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
         method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
-        body: JSON.stringify({ id: event.id, clientId: clientId.current, error: error instanceof Error ? error.message : String(error) }),
+        body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, error: error instanceof Error ? error.message : String(error) }),
       }).catch(() => undefined);
+    } finally {
+      revokedMcpCommandIds.current.delete(event.id);
+      completedMcpCommandIds.current.add(event.id);
+      while (completedMcpCommandIds.current.size > 256) completedMcpCommandIds.current.delete(completedMcpCommandIds.current.values().next().value!);
     }
-  }, [autosaveBlocked, loadDocument, setDocument, syncBridgeDocument]);
+  }, [autosave, autosaveBlocked, bridgeAutosave, setDocument]);
 
   const handleBridgeFlush = useCallback(async (event: BridgeFlush) => {
     const api = apiRef.current;
@@ -822,12 +971,12 @@ export default function App() {
       } else await syncBridgeDocument(next);
       await fetch(`/__draw/api/document/flush/${encodeURIComponent(event.id)}`, {
         method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
-        body: JSON.stringify({ id: event.id, clientId: clientId.current, document: next }),
+        body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, document: next }),
       });
     } catch (error) {
       await fetch(`/__draw/api/document/flush/${encodeURIComponent(event.id)}`, {
         method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
-        body: JSON.stringify({ id: event.id, clientId: clientId.current, error: error instanceof Error ? error.message : String(error) }),
+        body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, error: error instanceof Error ? error.message : String(error) }),
       }).catch(() => undefined);
     }
   }, [autosave, autosaveBlocked, bridgeAutosave, setDocument, syncBridgeDocument]);
@@ -835,6 +984,28 @@ export default function App() {
   const handleBridgeConfirmation = useCallback((event: BridgeConfirmation) => {
     if (event.clientId !== clientId.current || !writerOwned.current || !editorSecret.current) return;
     setConfirmation(event);
+  }, []);
+
+  const handleMcpPairingRequest = useCallback((event: McpPairingRequest) => {
+    if (event.clientId !== clientId.current || !writerOwned.current || !editorSecret.current) return;
+    setMcpPairingRequest(event);
+  }, []);
+
+  const handleMcpClientRevoked = useCallback((event: McpClientRevokedEvent) => {
+    setConfirmation((current) => current?.clientIdentity === event.clientIdentity ? null : current);
+    setMessage("An MCP client was revoked. Its pending requests were canceled.");
+  }, []);
+
+  const handleMcpCommandRevoked = useCallback((event: McpCommandRevokedEvent) => {
+    if (event.clientId !== clientId.current) return;
+    if (completedMcpCommandIds.current.has(event.id)) return;
+    revokedMcpCommandIds.current.add(event.id);
+  }, []);
+
+  const handleMcpConfirmationRevoked = useCallback((event: { token: string; clientId: string }) => {
+    if (event.clientId === clientId.current) {
+      setConfirmation((current) => current?.token === event.token ? null : current);
+    }
   }, []);
 
   const respondToConfirmation = useCallback(async (approved: boolean) => {
@@ -859,12 +1030,20 @@ export default function App() {
     import.meta.hot.on("draw:mcp-command", handleMcpCommand);
     import.meta.hot.on("draw:flush-document", handleBridgeFlush);
     import.meta.hot.on("draw:confirmation-required", handleBridgeConfirmation);
+    import.meta.hot.on("draw:mcp-pairing-required", handleMcpPairingRequest);
+    import.meta.hot.on("draw:mcp-client-revoked", handleMcpClientRevoked);
+    import.meta.hot.on("draw:confirmation-revoked", handleMcpConfirmationRevoked);
+    import.meta.hot.on("draw:mcp-command-revoked", handleMcpCommandRevoked);
     return () => {
       import.meta.hot?.off("draw:mcp-command", handleMcpCommand);
       import.meta.hot?.off("draw:flush-document", handleBridgeFlush);
       import.meta.hot?.off("draw:confirmation-required", handleBridgeConfirmation);
+      import.meta.hot?.off("draw:mcp-pairing-required", handleMcpPairingRequest);
+      import.meta.hot?.off("draw:mcp-client-revoked", handleMcpClientRevoked);
+      import.meta.hot?.off("draw:confirmation-revoked", handleMcpConfirmationRevoked);
+      import.meta.hot?.off("draw:mcp-command-revoked", handleMcpCommandRevoked);
     };
-  }, [handleBridgeConfirmation, handleBridgeFlush, handleMcpCommand]);
+  }, [handleBridgeConfirmation, handleBridgeFlush, handleMcpCommand, handleMcpPairingRequest, handleMcpClientRevoked, handleMcpConfirmationRevoked, handleMcpCommandRevoked]);
 
   const initialData = useMemo(() => {
     if (!doc) return undefined;
@@ -895,6 +1074,7 @@ export default function App() {
       <div className="toolbar-actions">
         <span className={`save-indicator ${status}`}><i />{statusText}</span>
         {import.meta.env.DEV && <button className="button button-quiet" disabled={!canWrite} onClick={() => { setConnectError(""); setConnectOpen(true); }} title="Pair this editor with the local MCP bridge">{editorConnected ? "MCP connected" : "Connect MCP"}</button>}
+        {import.meta.env.DEV && <button className="button button-quiet" disabled={!canWrite} onClick={() => void openMcpManagement()} title="Pair or revoke local MCP clients">MCP clients</button>}
         <button className="button button-quiet" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open an editable Draw document" : "Close the other Draw tab to open files here"}>Open .draw</button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
         <button className="button button-primary" onClick={saveFile} title="Save the complete editable Draw file"><span className="button-icon">↓</span>Save .draw</button>
@@ -929,6 +1109,34 @@ export default function App() {
           <button className="button button-quiet" onClick={() => void requestFreshEditorCode()}>Request fresh code</button>
           <button className="button button-quiet" onClick={() => setConnectOpen(false)}>Cancel</button>
           <button className="button button-primary" disabled={launchCodeInput.trim().length < 12} onClick={() => void connectEditorToMcp()}>Connect</button>
+        </div>
+      </section>
+    </div>}
+    {mcpManagementOpen && <div className="draw-confirmation-backdrop" role="presentation">
+      <section className="draw-confirmation" role="dialog" aria-modal="true" aria-labelledby="draw-mcp-clients-title">
+        <h2 id="draw-mcp-clients-title">MCP clients</h2>
+        <p>Copy this one-time pairing secret into the MCP host’s protected configuration as <code>DRAW_MCP_PAIRING_SECRET</code>. It expires in five minutes and can be used once. Then call its Draw pairing tool. Draw will ask you to approve the host name and fingerprint.</p>
+        {mcpPairingSecret && <div className="mcp-pairing-secret"><code>{mcpPairingSecret}</code><button className="button button-quiet" onClick={() => void navigator.clipboard.writeText(mcpPairingSecret)}>Copy secret</button></div>}
+        {mcpPairingError && <p role="alert">{mcpPairingError}</p>}
+        <h3>Paired hosts</h3>
+        {mcpClients.length === 0 && <p>No MCP clients have been paired.</p>}
+        {mcpClients.map((client) => <div className="mcp-client-row" key={client.clientIdentity}>
+          <span><strong>{client.name}</strong><small>{client.clientIdentity} · {client.revokedAt ? "revoked" : new Date(client.expiresAt).toLocaleDateString()}</small></span>
+          {!client.revokedAt && <button className="button button-quiet" onClick={() => void revokeMcpClient(client.clientIdentity)}>Revoke</button>}
+        </div>)}
+        <div className="draw-confirmation-actions"><button className="button button-quiet" onClick={() => { setMcpManagementOpen(false); setMcpPairingSecret(""); }}>Close</button></div>
+      </section>
+    </div>}
+    {mcpPairingRequest && <div className="draw-confirmation-backdrop" role="presentation">
+      <section className="draw-confirmation" role="dialog" aria-modal="true" aria-labelledby="draw-mcp-pairing-title">
+        <h2 id="draw-mcp-pairing-title">Approve MCP client?</h2>
+        <p><strong>{mcpPairingRequest.name}</strong> is requesting access to this Draw instance.</p>
+        <p>Client fingerprint: <code>{mcpPairingRequest.fingerprint}</code></p>
+        {mcpPairingRequest.replacesName && <p role="alert">Approving this host will revoke the existing paired client “{mcpPairingRequest.replacesName}” with the same fingerprint.</p>}
+        <p className="draw-confirmation-expiry">Approve only if this matches the host you are pairing. The request expires in two minutes.</p>
+        <div className="draw-confirmation-actions">
+          <button className="button button-quiet" onClick={() => void respondToMcpPairing(false)}>Deny</button>
+          <button className="button button-primary" onClick={() => void respondToMcpPairing(true)}>Approve client</button>
         </div>
       </section>
     </div>}

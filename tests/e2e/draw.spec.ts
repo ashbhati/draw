@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
-import { readFile } from "node:fs/promises";
+import { chmod, readFile, stat, writeFile } from "node:fs/promises";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,10 +10,22 @@ import { isBundledFontURL, isSameOriginURL } from "./config";
 const documentApi = "/__draw/api/document";
 const commandApi = "/__draw/api/commands";
 
-async function startStdioMcp(baseURL: string, documentDir: string) {
+function mcpAuthHeaders() {
+  const clientIdentity = process.env.DRAW_E2E_MCP_CLIENT_ID;
+  const capability = process.env.DRAW_E2E_MCP_CLIENT_SECRET;
+  if (!clientIdentity || !capability) throw new Error("The isolated E2E MCP client credential is unavailable.");
+  return { "x-draw-client-identity": clientIdentity, authorization: `Bearer ${capability}` };
+}
+
+async function startStdioMcp(baseURL: string, documentDir: string, pairingSecret?: string) {
+  const credentialPath = join(documentDir, "mcp-client-credential.json");
+  if (!pairingSecret) {
+    await writeFile(credentialPath, JSON.stringify({ installationId: "draw-e2e-mcp-host", clientIdentity: process.env.DRAW_E2E_MCP_CLIENT_ID, capability: process.env.DRAW_E2E_MCP_CLIENT_SECRET, expiresAt: Date.now() + 60 * 60_000 }), { mode: 0o600 });
+    await chmod(credentialPath, 0o600);
+  }
   const child = spawn(process.execPath, ["--import", "tsx/esm", "src/integrations/mcp-server.ts"], {
     cwd: process.cwd(),
-    env: { ...process.env, DRAW_MCP_BASE_URL: new URL(baseURL).origin, DRAW_MCP_DOCUMENT_DIR: documentDir },
+    env: { ...process.env, DRAW_MCP_BASE_URL: new URL(baseURL).origin, DRAW_MCP_DOCUMENT_DIR: documentDir, DRAW_MCP_CLIENT_CREDENTIAL_PATH: credentialPath, ...(pairingSecret ? { DRAW_MCP_PAIRING_SECRET: pairingSecret } : {}) },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let output = "";
@@ -52,6 +64,7 @@ async function startStdioMcp(baseURL: string, documentDir: string) {
   return {
     request,
     call: async (name: string, args: Record<string, unknown>) => request("tools/call", { name, arguments: args }),
+    credentialPath,
     close: async () => {
       child.stdin.end();
       await new Promise<void>((resolve) => { child.once("exit", () => resolve()); setTimeout(() => { child.kill(); resolve(); }, 2_000); });
@@ -60,13 +73,13 @@ async function startStdioMcp(baseURL: string, documentDir: string) {
 }
 
 async function currentBridgeDocument(page: Page) {
-  const response = await page.request.get(documentApi);
+  const response = await page.request.get(documentApi, { headers: mcpAuthHeaders() });
   expect(response.ok()).toBeTruthy();
   return response.json();
 }
 
 async function freshBridgeDocument(page: Page) {
-  const response = await page.request.get(`${documentApi}?flush=1`);
+  const response = await page.request.get(`${documentApi}?flush=1`, { headers: mcpAuthHeaders() });
   expect(response.ok(), await response.text()).toBeTruthy();
   return response.json();
 }
@@ -124,7 +137,9 @@ async function waitForBridge(page: Page) {
   await connectEditorToMcp(page);
   await expect.poll(async () => {
     const health = await (await page.request.get("/__draw/api/health")).json();
-    return health.clientReady && health.documentReady;
+    const document = await page.request.get(documentApi, { headers: mcpAuthHeaders() });
+    if (!health.ok || !document.ok()) return `${JSON.stringify(health)}; document HTTP ${document.status()}: ${await document.text()}`;
+    return true;
   }).toBe(true);
 }
 
@@ -504,7 +519,7 @@ test("Meta+Shift+E cannot open Excalidraw's image exporter", async ({ page }) =>
 });
 
 test("Blackboard texture is seam-safe across large live/PNG/JPEG canvases and shows through MCP nodes", async ({ page }) => {
-  const createResponse = await page.request.post(commandApi, { data: {
+  const createResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: { nodes: [
       { id: "dark-fill", label: "Readable node", x: 200, y: 180, width: 160, height: 72 },
@@ -569,7 +584,7 @@ test("Blackboard texture is seam-safe across large live/PNG/JPEG canvases and sh
 });
 
 test("natural Blackboard texture stays subdued behind a compact three-node flow in PNG and JPEG", async ({ page }) => {
-  const createdResponse = await page.request.post(commandApi, { data: {
+  const createdResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: {
       nodes: [
@@ -645,7 +660,7 @@ test("the Draw wordmark and Open .draw action do not overlap on narrow screens",
 });
 
 test("MCP create and update stay editable through save, reload, open, and image export", async ({ page }) => {
-  const createdResponse = await page.request.post(commandApi, { data: {
+  const createdResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: {
       title: "Spec → Validation",
@@ -678,7 +693,7 @@ test("MCP create and update stay editable through save, reload, open, and image 
 
   const editedElementId = created.result.nodes.spec;
   const longText = "A considerably longer label that should wrap inside the node";
-  const updateResponse = await page.request.post(commandApi, { data: {
+  const updateResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "update_elements",
     input: { updates: [{ id: editedElementId, patch: { text: longText, x: 96, y: 132 } }] },
   } });
@@ -731,7 +746,7 @@ test("MCP create and update stay editable through save, reload, open, and image 
 
 test("MCP diagram titles reserve at least their live Excalifont text width", async ({ page }) => {
   const title = "Specification → Implementation → Validation";
-  const response = await page.request.post(commandApi, { data: {
+  const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: {
       title,
@@ -758,7 +773,7 @@ test("MCP diagram titles reserve at least their live Excalifont text width", asy
 });
 
 test("Open .draw restores a downloaded file that remains editable through a second save and reopen", async ({ page }) => {
-  const createResponse = await page.request.post(commandApi, { data: {
+  const createResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: { nodes: [{ id: "roundtrip", label: "Downloaded editable diagram", x: 140, y: 120 }], edges: [] },
   } });
@@ -844,7 +859,7 @@ test("Open .draw restores a downloaded file that remains editable through a seco
   expect(Object.keys(localReopen.document.assets)).toHaveLength(Object.keys(firstFile.document.assets).length);
 
   const editedText = "Edited after opening the downloaded file";
-  const updateResponse = await page.request.post(commandApi, { data: {
+  const updateResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "update_elements",
     input: { updates: [{ id: created.result.nodes.roundtrip, patch: { text: editedText } }] },
   } });
@@ -872,7 +887,7 @@ test("Open .draw restores a downloaded file that remains editable through a seco
 });
 
 test("malformed .draw files leave the current canvas and local autosave untouched", async ({ page }) => {
-  const create = await page.request.post(commandApi, { data: {
+  const create = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: { nodes: [{ id: "keep", label: "Keep this work", x: 100, y: 100 }], edges: [] },
   } });
@@ -956,7 +971,7 @@ test("loads fonts and exports the hand-drawn scene without network access", asyn
   });
   await waitForBridge(page);
   await expect(page.getByRole("button", { name: "Blackboard", exact: true })).toBeEnabled();
-  const response = await page.request.post(commandApi, { data: {
+  const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: { nodes: [{ id: "offline", label: "Offline hand-drawn text 中文 日本語 한국어", x: 100, y: 100, color: "#f2d27a" }], edges: [] },
   } });
@@ -981,7 +996,7 @@ test("loads fonts and exports the hand-drawn scene without network access", asyn
 
 test("background changes recolor Draw defaults, preserve custom colors, and undo and redo", async ({ page }) => {
   await page.getByRole("button", { name: "Blackboard", exact: true }).click();
-  const response = await page.request.post(commandApi, { data: {
+  const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: {
       title: "Preset test",
@@ -1020,7 +1035,7 @@ test("background changes recolor Draw defaults, preserve custom colors, and undo
     return current.document.elements.find((element: any) => element.id === created.result.nodes.accent)?.strokeColor;
   }).toBe("#8a6418");
 
-  const whiteNodeResponse = await page.request.post(commandApi, { data: {
+  const whiteNodeResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: { nodes: [{ id: "white-default", label: "White default", x: 580, y: 100 }], edges: [] },
   } });
@@ -1046,7 +1061,7 @@ test("background changes recolor Draw defaults, preserve custom colors, and undo
 });
 
 test("blackboard background survives reload and is present in PNG and JPEG exports", async ({ page }) => {
-  const response = await page.request.post(commandApi, { data: {
+  const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: { nodes: [{ id: "pixel-check", label: "Background pixel check", x: 160, y: 100 }], edges: [] },
   } });
@@ -1090,7 +1105,7 @@ test("fresh MCP canvas reads flush a just-drawn freehand edit", async ({ page })
 
 test("MCP creates rendered editable primitives with relationships that stay editable after reopen", async ({ page }) => {
   await page.getByRole("button", { name: "Whiteboard", exact: true }).click();
-  const response = await page.request.post(commandApi, { data: {
+  const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_elements",
     input: { elements: [
       { id: "box", type: "rectangle", x: 100, y: 100, width: 140, height: 72, strokeColor: "#e64b45", label: "Source" },
@@ -1195,7 +1210,7 @@ test("MCP creates rendered editable primitives with relationships that stay edit
 });
 
 test("one infinite canvas pans and zooms across multiple independent diagrams", async ({ page }) => {
-  const response = await page.request.post(commandApi, { data: {
+  const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: { nodes: [
       { id: "near", label: "First diagram", x: 100, y: 120 },
@@ -1258,7 +1273,7 @@ test("rapid Chrome pan events debounce viewport revision and preserve scene revi
 });
 
 test("a reloaded .draw node remains selectable and manually editable", async ({ page }) => {
-  const response = await page.request.post(commandApi, { data: {
+  const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: { nodes: [{ id: "editable", label: "Before reload", x: 100, y: 100, width: 180, height: 72 }], edges: [] },
   } });
@@ -1285,7 +1300,7 @@ test("a reloaded .draw node remains selectable and manually editable", async ({ 
 });
 
 test("long MCP labels fit inside ellipse and diamond outlines and reroute connected arrows", async ({ page }) => {
-  const create = await page.request.post(commandApi, { data: {
+  const create = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: {
       nodes: [
@@ -1300,7 +1315,7 @@ test("long MCP labels fit inside ellipse and diamond outlines and reroute connec
   expect(create.ok()).toBeTruthy();
   const created = await create.json();
   const longText = "A considerably longer label that should wrap to several lines inside this shape";
-  const update = await page.request.post(commandApi, { data: {
+  const update = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "update_elements",
     input: { updates: [
       { id: created.result.nodes.oval, patch: { text: longText } },
@@ -1333,7 +1348,7 @@ test("long MCP labels fit inside ellipse and diamond outlines and reroute connec
 });
 
 test("routes a feedback edge around the middle node and keeps its label clear after node growth", async ({ page }) => {
-  const create = await page.request.post(commandApi, { data: {
+  const create = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: {
       title: "Specification → Validation",
@@ -1381,7 +1396,7 @@ test("routes a feedback edge around the middle node and keeps its label clear af
     return current;
   };
   await assertBackEdgeClear();
-  const longUpdate = await page.request.post(commandApi, { data: {
+  const longUpdate = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "update_elements",
     input: { updates: [{ id: created.result.nodes.implementation, patch: { text: "Implementation\nHow we build and validate the intended outcome" } }] },
   } });
@@ -1406,7 +1421,7 @@ test("the supplied reference fixture keeps chalk, layout, and editable nodes aft
   await expect.poll(async () => {
     const health = await (await page.request.get("/__draw/api/health")).json();
     const local = await readLocalDocument(page);
-    return health.clientReady && health.documentReady && typeof local.document.documentRevision === "number";
+    return health.ok && typeof local.document.documentRevision === "number";
   }).toBe(true);
   await expect.poll(async () => {
     const local = await readLocalDocument(page);
@@ -1517,7 +1532,7 @@ test("embedded image assets survive autosave and editable Draw save/reopen", asy
 });
 
 test("PNG and JPEG exports keep the complete editable scene even when an object is selected", async ({ page }) => {
-  const createdResponse = await page.request.post(commandApi, { data: {
+  const createdResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: {
       title: "Export fixture: complete scene",
@@ -1655,13 +1670,295 @@ test("selection-only export reports an empty selection when the image format cha
   expect(await unexpectedDownload).toBe(false);
 });
 
+test("a human pairs an MCP host, the secret stays out of tool output, and revocation blocks it", async ({ page, baseURL }) => {
+  if (!baseURL) throw new Error("Playwright baseURL is required for the MCP pairing test.");
+  const directory = await mkdtemp(join(tmpdir(), "draw-mcp-pairing-e2e-"));
+  const secondDirectory = await mkdtemp(join(tmpdir(), "draw-mcp-pairing-second-e2e-"));
+  let replacementMcp: Awaited<ReturnType<typeof startStdioMcp>> | null = null;
+  let secondMcp: Awaited<ReturnType<typeof startStdioMcp>> | null = null;
+  await page.goto("/");
+  await connectEditorToMcp(page);
+  await expect(page.getByRole("button", { name: "MCP clients" })).toBeVisible();
+  await page.getByRole("button", { name: "MCP clients" }).click();
+  const pairingSecret = await page.locator(".mcp-pairing-secret code").innerText();
+  expect(pairingSecret).toMatch(/^[a-f\d]{64}$/i);
+  const mcp = await startStdioMcp(baseURL, directory, pairingSecret);
+  try {
+    const pairing = mcp.call("pair_mcp_client", {});
+    await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
+    const visibleFingerprint = await page.locator("section[aria-labelledby='draw-mcp-pairing-title'] code").innerText();
+    expect(visibleFingerprint).toMatch(/^[a-f\d]{64}$/i);
+    await page.getByRole("button", { name: "Approve client" }).click();
+    const paired = await pairing;
+    expect(paired.result.isError).not.toBe(true);
+    const publicResult = JSON.parse(paired.result.content[0].text);
+    expect(publicResult).toMatchObject({ paired: true, fingerprint: visibleFingerprint });
+    expect(paired.result.content[0].text).not.toContain(pairingSecret);
+    const credential = JSON.parse(await readFile(mcp.credentialPath, "utf8"));
+    expect(credential.capability).toMatch(/^[a-f\d]{64}$/i);
+    expect(credential.clientIdentity).toBe(publicResult.clientIdentity);
+    expect((await stat(mcp.credentialPath)).mode & 0o777).toBe(0o600);
+    expect(paired.result.content[0].text).not.toContain(credential.capability);
+    expect((await mcp.call("get_current_canvas", {})).result.isError).not.toBe(true);
+
+    const clientRow = page.locator(".mcp-client-row").filter({ hasText: publicResult.clientIdentity });
+    await expect(clientRow).toBeVisible();
+    await page.getByRole("button", { name: "Close" }).click();
+    // Pairing-secret requests are intentionally rate-limited to one per five seconds.
+    await page.waitForTimeout(5_000);
+    await page.getByRole("button", { name: "MCP clients" }).click();
+    const replacementSecret = await page.locator(".mcp-pairing-secret code").innerText();
+    const sameHostMcp = await startStdioMcp(baseURL, directory, replacementSecret);
+    replacementMcp = sameHostMcp;
+    const replacementPairing = sameHostMcp.call("pair_mcp_client", {});
+    await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
+    await expect(page.getByRole("alert")).toContainText("will revoke the existing paired client");
+    await page.getByRole("button", { name: "Approve client" }).click();
+    const replacementPaired = await replacementPairing;
+    expect(replacementPaired.result.isError).not.toBe(true);
+    const replacementPublicResult = JSON.parse(replacementPaired.result.content[0].text);
+    expect(replacementPublicResult.clientIdentity).not.toBe(publicResult.clientIdentity);
+    await expect(clientRow).toContainText("revoked");
+
+    await page.getByRole("button", { name: "Close" }).click();
+    await page.waitForTimeout(5_000);
+    await page.getByRole("button", { name: "MCP clients" }).click();
+    const secondPairingSecret = await page.locator(".mcp-pairing-secret code").innerText();
+    const mcp2 = await startStdioMcp(baseURL, secondDirectory, secondPairingSecret);
+    secondMcp = mcp2;
+    const secondPairing = mcp2.call("pair_mcp_client", {});
+    await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
+    const secondFingerprint = await page.locator("section[aria-labelledby='draw-mcp-pairing-title'] code").innerText();
+    expect(secondFingerprint).toMatch(/^[a-f\d]{64}$/i);
+    await page.getByRole("button", { name: "Approve client" }).click();
+    const secondPaired = await secondPairing;
+    expect(secondPaired.result.isError).not.toBe(true);
+    const secondPublicResult = JSON.parse(secondPaired.result.content[0].text);
+    expect(secondPublicResult.clientIdentity).not.toBe(publicResult.clientIdentity);
+    expect((await mcp2.call("get_current_canvas", {})).result.isError).not.toBe(true);
+
+    const replacementRow = page.locator(".mcp-client-row").filter({ hasText: replacementPublicResult.clientIdentity });
+    const revocationResponse = page.waitForResponse((response) => response.url().includes(`/__draw/api/mcp/clients/${replacementPublicResult.clientIdentity}`) && response.request().method() === "DELETE");
+    await replacementRow.getByRole("button", { name: "Revoke" }).click();
+    expect((await revocationResponse).status()).toBe(200);
+    await expect(replacementRow).toContainText("revoked");
+    const afterRevocation = await mcp.call("get_current_canvas", {});
+    expect(Boolean(afterRevocation.error || afterRevocation.result?.isError)).toBe(true);
+    expect((await mcp2.call("get_current_canvas", {})).result.isError).not.toBe(true);
+  } finally {
+    await secondMcp?.close();
+    await replacementMcp?.close();
+    await mcp.close();
+    await rm(secondDirectory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("revoking an MCP client cancels its pending command without overwriting a later human edit", async ({ page, baseURL }) => {
+  if (!baseURL) throw new Error("Playwright baseURL is required for the in-flight revocation test.");
+  const directory = await mkdtemp(join(tmpdir(), "draw-mcp-revocation-e2e-"));
+  let mcp: Awaited<ReturnType<typeof startStdioMcp>> | null = null;
+  let resumeAck!: () => void;
+  let ackIntercepted!: () => void;
+  let ackContinued!: () => void;
+  let didIntercept = false;
+  let credential: any;
+  let command: any;
+  const ackGate = new Promise<void>((resolve) => { resumeAck = resolve; });
+  const ackSeen = new Promise<void>((resolve) => { ackIntercepted = resolve; });
+  const ackDone = new Promise<void>((resolve) => { ackContinued = resolve; });
+  try {
+    await page.goto("/");
+    await connectEditorToMcp(page);
+    await page.waitForTimeout(5_000);
+    await page.getByRole("button", { name: "MCP clients" }).click();
+    const pairingSecret = await page.locator(".mcp-pairing-secret code").innerText();
+    mcp = await startStdioMcp(baseURL, directory, pairingSecret);
+    const pairing = mcp.call("pair_mcp_client", {});
+    await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
+    await page.getByRole("button", { name: "Approve client" }).click();
+    expect((await pairing).result.isError).not.toBe(true);
+    credential = JSON.parse(await readFile(mcp.credentialPath, "utf8"));
+    await page.getByRole("button", { name: "Close" }).click();
+    const initial = await currentBridgeDocument(page);
+    await page.route("**/__draw/api/commands/*/ack", async (route) => {
+      didIntercept = true;
+      ackIntercepted();
+      await ackGate;
+      try { await route.continue(); } finally { ackContinued(); }
+    });
+    command = {
+      operation: "create_diagram",
+      input: {
+        documentId: initial.document.id,
+        expectedDocumentRevision: initial.document.documentRevision,
+        nodes: [{ id: "cancel-node", label: "MCP edit", x: 180, y: 160, width: 220, height: 90 }],
+        edges: [],
+      },
+    };
+    await page.evaluate(({ body, headers }) => {
+      (window as any).__pendingMcpResponse = fetch("/__draw/api/commands", {
+        method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body),
+      }).then(async (response) => ({ status: response.status, body: await response.json() }));
+    }, { body: command, headers: { "x-draw-client-identity": credential.clientIdentity, authorization: `Bearer ${credential.capability}` } });
+    await ackSeen;
+    const afterMcp = await currentBridgeDocument(page);
+    expect(afterMcp.document.elements.some((element: any) => element.text === "MCP edit" || element.originalText === "MCP edit")).toBe(true);
+    const node = afterMcp.document.elements.find((element: any) => element.id === afterMcp.document.elements.find((candidate: any) => candidate.text === "MCP edit" || candidate.originalText === "MCP edit")?.containerId) as any;
+    const canvas = page.locator(".excalidraw canvas").last();
+    const bounds = await canvas.boundingBox();
+    if (!bounds || !node) throw new Error("Could not locate the pending MCP node.");
+    await page.mouse.click(bounds.x + node.x + node.width / 2, bounds.y + node.y + node.height / 2);
+    await page.keyboard.press("Enter");
+    const editor = page.locator(".excalidraw textarea").last();
+    await expect(editor).toBeVisible();
+    await editor.fill("Human edit after MCP");
+    await page.keyboard.press("Control+Enter");
+    await expect.poll(async () => (await currentBridgeDocument(page)).document.elements.some((element: any) => element.originalText === "Human edit after MCP")).toBe(true);
+
+    await page.waitForTimeout(5_000);
+    await page.getByRole("button", { name: "MCP clients" }).click();
+    const row = page.locator(".mcp-client-row").filter({ hasText: credential.clientIdentity });
+    await row.getByRole("button", { name: "Revoke" }).click();
+    await expect(row).toContainText("revoked");
+  } finally {
+    resumeAck();
+    if (didIntercept) {
+      await ackDone;
+      await page.unroute("**/__draw/api/commands/*/ack");
+    }
+    await mcp?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+  const response = await page.evaluate(async () => await (window as any).__pendingMcpResponse);
+  expect(response.status).toBe(401);
+  const retry = await page.request.post("/__draw/api/commands", {
+    headers: { "x-draw-client-identity": credential.clientIdentity, authorization: `Bearer ${credential.capability}` },
+    data: command,
+  });
+  expect(retry.status()).toBe(401);
+  await page.getByRole("button", { name: "Close" }).click();
+  const savedFile = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Save .draw" }).click();
+  const saved = JSON.parse(await readFile(await (await savedFile).path(), "utf8"));
+  expect(saved.document.elements).toEqual(expect.arrayContaining([expect.objectContaining({ originalText: "Human edit after MCP" })]));
+  expect(saved.document.elements.filter((element: any) => element.originalText === "Human edit after MCP")).toHaveLength(1);
+});
+
+test("revocation rolls back in place and retains the selected human scene and undo history", async ({ page, baseURL }) => {
+  if (!baseURL) throw new Error("Playwright baseURL is required for the rollback-history test.");
+  const directory = await mkdtemp(join(tmpdir(), "draw-mcp-rollback-history-e2e-"));
+  let mcp: Awaited<ReturnType<typeof startStdioMcp>> | null = null;
+  let resumeAck!: () => void;
+  let ackIntercepted!: () => void;
+  let ackStatus: number | null = null;
+  let editorSecret = "";
+  const ackGate = new Promise<void>((resolve) => { resumeAck = resolve; });
+  const ackSeen = new Promise<void>((resolve) => { ackIntercepted = resolve; });
+  try {
+    await page.goto("/");
+    await connectEditorToMcp(page);
+    page.on("request", (request) => {
+      if (request.url().endsWith("/__draw/api/mcp/clients")) editorSecret = request.headers()["x-draw-editor-secret"] ?? editorSecret;
+    });
+    await page.waitForTimeout(5_000);
+    await page.getByRole("button", { name: "MCP clients" }).click();
+    const pairingSecret = await page.locator(".mcp-pairing-secret code").innerText();
+    mcp = await startStdioMcp(baseURL, directory, pairingSecret);
+    const pairing = mcp.call("pair_mcp_client", {});
+    await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
+    await page.getByRole("button", { name: "Approve client" }).click();
+    expect((await pairing).result.isError).not.toBe(true);
+    const credential = JSON.parse(await readFile(mcp.credentialPath, "utf8"));
+    await page.getByRole("button", { name: "Close" }).click();
+
+    const beforeFixture = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const fixtureResponse = await mcp.call("create_diagram", {
+      documentId: beforeFixture.documentId, expectedDocumentRevision: beforeFixture.documentRevision,
+      nodes: [{ id: "update-target", label: "Existing MCP node", x: 650, y: 180, width: 220, height: 90 }], edges: [],
+    });
+    expect(fixtureResponse.error).toBeUndefined();
+    const fixture = JSON.parse(fixtureResponse.result.content[0].text);
+    const updateTargetId = fixture.nodes["update-target"];
+
+    await page.locator('.excalidraw label[title^="Rectangle"]').click();
+    const canvas = page.locator(".excalidraw canvas").last();
+    const bounds = await canvas.boundingBox();
+    if (!bounds) throw new Error("Could not locate the canvas.");
+    const startX = bounds.x + bounds.width / 2 - 70;
+    const startY = bounds.y + bounds.height / 2 - 30;
+    await page.mouse.move(startX, startY);
+    await page.mouse.down();
+    await page.mouse.move(startX + 140, startY + 100);
+    await page.mouse.up();
+    await expect.poll(async () => (await currentBridgeDocument(page)).document.elements.some((element: any) => element.type === "rectangle")).toBe(true);
+    const initial = await currentBridgeDocument(page);
+    const humanRectangle = initial.document.elements.find((element: any) => element.type === "rectangle");
+    await page.locator('.excalidraw label[title^="Selection"]').click();
+    await page.mouse.click(bounds.x + humanRectangle.x + humanRectangle.width / 2, bounds.y + humanRectangle.y + humanRectangle.height / 2);
+    await expect.poll(async () => (await currentBridgeDocument(page)).document.appState.selectedElementIds?.[humanRectangle.id]).toBe(true);
+    const beforeUpdate = await currentBridgeDocument(page);
+
+    await page.route("**/__draw/api/commands/*/ack", async (route) => {
+      ackIntercepted();
+      await ackGate;
+      const response = await route.fetch();
+      ackStatus = response.status();
+      await route.fulfill({ response });
+    });
+    await page.evaluate(({ headers, documentId, documentRevision, updateTargetId }) => {
+      (window as any).__pendingMcpResponse = fetch("/__draw/api/commands", {
+        method: "POST", headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify({ operation: "update_elements", input: {
+          documentId,
+          expectedDocumentRevision: documentRevision,
+          updates: [{ id: updateTargetId, patch: { text: "Should roll back" } }],
+        } }),
+      }).then(async (response) => ({ status: response.status, body: await response.json() }));
+    }, {
+      headers: { "x-draw-client-identity": credential.clientIdentity, authorization: `Bearer ${credential.capability}` },
+      documentId: beforeUpdate.document.id,
+      documentRevision: beforeUpdate.document.documentRevision,
+      updateTargetId,
+    });
+    await ackSeen;
+    expect((await currentBridgeDocument(page)).document.elements.some((element: any) => element.originalText === "Should roll back")).toBe(true);
+
+    const revokeResponse = await page.request.delete(`/__draw/api/mcp/clients/${credential.clientIdentity}`, {
+      headers: { "content-type": "application/json", origin: new URL(page.url()).origin, "x-draw-editor-secret": editorSecret }, data: {},
+    });
+    expect(revokeResponse.status()).toBe(200);
+    resumeAck();
+    await expect.poll(() => ackStatus).toBe(410);
+    await expect.poll(async () => (await currentBridgeDocument(page)).document.elements.some((element: any) => element.originalText === "Should roll back")).toBe(false);
+    const canceledResponse = await page.evaluate(async () => await (window as any).__pendingMcpResponse);
+    expect(canceledResponse.status).toBe(401);
+    expect(ackStatus).toBe(410);
+    await expect.poll(async () => (await currentBridgeDocument(page)).document.appState.selectedElementIds?.[humanRectangle.id]).toBe(true);
+    const undoButton = page.getByRole("button", { name: "Undo" });
+    await expect(undoButton).toBeEnabled();
+    let humanRectangleStillPresent = true;
+    for (let attempt = 0; attempt < 6 && humanRectangleStillPresent && await undoButton.isEnabled(); attempt += 1) {
+      await undoButton.click();
+      await page.waitForTimeout(80);
+      humanRectangleStillPresent = (await currentBridgeDocument(page)).document.elements.some((element: any) => element.id === humanRectangle.id && element.isDeleted !== true);
+    }
+    await expect.poll(async () => (await currentBridgeDocument(page)).document.elements.some((element: any) => element.id === humanRectangle.id && element.isDeleted !== true)).toBe(false);
+  } finally {
+    resumeAck();
+    await page.unroute("**/__draw/api/commands/*/ack").catch(() => undefined);
+    await mcp?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject paths safely", async ({ page, baseURL }) => {
   if (!baseURL) throw new Error("Playwright baseURL is required for the MCP integration test.");
   const directory = await mkdtemp(join(tmpdir(), "draw-mcp-e2e-"));
   const mcp = await startStdioMcp(baseURL, directory);
   try {
     await page.locator(".excalidraw canvas").first().waitFor();
-    await expect.poll(async () => (await (await page.request.get("/__draw/api/health")).json())).toMatchObject({ clientReady: true, documentReady: true });
+    await expect.poll(async () => (await (await page.request.get("/__draw/api/health")).json())).toMatchObject({ ok: true });
     const initializedTools = await mcp.request("tools/list", {});
     expect(initializedTools.result.tools.map((tool: any) => tool.name)).toEqual(expect.arrayContaining([
       "create_diagram", "update_elements", "delete_elements", "duplicate_elements", "set_selection",
@@ -1775,7 +2072,7 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
     const openResponse = await mcp.call("open_document", { path: "stdio-roundtrip.draw", documentId: current.documentId, expectedDocumentRevision: current.documentRevision, confirmationToken: approvedChallenge.confirmationToken });
     expect(openResponse.error).toBeUndefined();
     expect(JSON.parse(openResponse.result.content[0].text).opened).toBe(true);
-    await expect.poll(async () => (await (await page.request.get("/__draw/api/document?flush=1")).json()).document.elements.some((element: any) => element.id === created.nodes.first)).toBe(true);
+    await expect.poll(async () => (await (await page.request.get("/__draw/api/document?flush=1", { headers: mcpAuthHeaders() })).json()).document.elements.some((element: any) => element.id === created.nodes.first)).toBe(true);
     const reopened = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
     expect(reopened.documentRevision).toBeGreaterThan(current.documentRevision);
     const reusedToken = await mcp.call("open_document", { path: "stdio-roundtrip.draw", documentId: reopened.documentId, expectedDocumentRevision: reopened.documentRevision, confirmationToken: approvedChallenge.confirmationToken });
