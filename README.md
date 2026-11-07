@@ -58,6 +58,6 @@ Switching between Blackboard and Whiteboard adapts Draw's default chalk and its 
 
 The drawing engine is the `@excalidraw/excalidraw` package. Draw uses its editor API and maintains its own `.draw` document format; it does not promise Excalidraw file import/export compatibility.
 
-The editor's bundled font files are served locally so diagrams render offline, including CJK glyphs. Their family-specific attributions and license texts are in [public/fonts/LICENSES.md](./public/fonts/LICENSES.md). The CJK font subsets are retained for multilingual documents and account for most of the font bundle's size.
+The editor's bundled font files are served locally so diagrams render offline, including CJK glyphs. Their family-specific attributions and license texts are in [public/fonts/LICENSES.md](./public/fonts/LICENSES.md). The CJK font subsets are retained for multilingual documents and account for most of the font bundle's size. The Blackboard background's generation source and applicable terms are recorded in [docs/ASSET_ATTRIBUTION.md](./docs/ASSET_ATTRIBUTION.md).
 
 See [PLAN.md](./PLAN.md) for the V1 scope, acceptance checks, and deferred capabilities.
