@@ -1015,6 +1015,62 @@ test("fresh MCP canvas reads flush a just-drawn freehand edit", async ({ page })
   expect(current.document.elements.some((element: any) => element.type === "freedraw" && element.isDeleted !== true)).toBe(true);
 });
 
+test("MCP creates editable shapes, standalone text, lines, arrows, and freehand in a reopenable Draw file", async ({ page }) => {
+  const response = await page.request.post(commandApi, { data: {
+    operation: "create_elements",
+    input: { elements: [
+      { id: "box", type: "rectangle", x: 100, y: 100, width: 140, height: 72, strokeColor: "#e64b45" },
+      { id: "oval", type: "ellipse", x: 300, y: 100, width: 120, height: 72 },
+      { id: "decision", type: "diamond", x: 480, y: 100, width: 120, height: 72, fillStyle: "hachure" },
+      { id: "caption", type: "text", x: 100, y: 220, text: "Agent authored", fontSize: 24, strokeColor: "#f2d27a" },
+      { id: "connector", type: "line", x: 100, y: 300, points: [[0, 0], [120, 18]], strokeStyle: "dashed" },
+      { id: "flow", type: "arrow", x: 260, y: 300, points: [[0, 0], [120, 18]], endArrowhead: "triangle" },
+      { id: "chalk", type: "freedraw", x: 440, y: 300, points: [[0, 0], [18, 14, 0.6], [36, 0]] },
+    ] },
+  } });
+  expect(response.ok(), await response.text()).toBeTruthy();
+  const created = await response.json();
+  expect(created.result.elementIds).toMatchObject({ box: expect.any(String), oval: expect.any(String), decision: expect.any(String), caption: expect.any(String), connector: expect.any(String), flow: expect.any(String), chalk: expect.any(String) });
+  expect(created.result.addedElementIds).toHaveLength(7);
+
+  const current = await freshBridgeDocument(page);
+  const byInputId = Object.fromEntries(Object.entries(created.result.elementIds).map(([key, id]) => [key, current.document.elements.find((element: any) => element.id === id)]));
+  expect(byInputId.box).toMatchObject({ type: "rectangle", width: 140, height: 72, strokeColor: "#e64b45" });
+  expect(byInputId.oval).toMatchObject({ type: "ellipse", width: 120, height: 72 });
+  expect(byInputId.decision).toMatchObject({ type: "diamond", fillStyle: "hachure" });
+  expect(byInputId.caption).toMatchObject({ type: "text", text: "Agent authored", fontSize: 24 });
+  expect(byInputId.connector).toMatchObject({ type: "line", strokeStyle: "dashed" });
+  expect(byInputId.flow).toMatchObject({ type: "arrow", endArrowhead: "triangle" });
+  expect(byInputId.chalk).toMatchObject({ type: "freedraw" });
+  expect(byInputId.chalk.points).toHaveLength(3);
+
+  await page.getByRole("button", { name: "Undo" }).click();
+  await expect.poll(async () => {
+    const undone = await freshBridgeDocument(page);
+    return Object.values(created.result.elementIds).some((id: any) => undone.document.elements.some((element: any) => element.id === id && element.isDeleted !== true));
+  }).toBe(false);
+  await page.getByRole("button", { name: "Redo" }).click();
+  await expect.poll(async () => {
+    const redone = await freshBridgeDocument(page);
+    return Object.values(created.result.elementIds).every((id: any) => redone.document.elements.some((element: any) => element.id === id && element.isDeleted !== true));
+  }).toBe(true);
+
+  const downloadWait = page.waitForEvent("download");
+  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  const drawBuffer = await readFile(await (await downloadWait).path());
+  const saved = JSON.parse(drawBuffer.toString("utf8"));
+  expect(saved.format).toBe("draw");
+  for (const id of Object.values(created.result.elementIds)) {
+    expect(saved.document.elements.some((element: any) => element.id === id && element.isDeleted !== true)).toBe(true);
+  }
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.locator('input[type="file"]').setInputFiles({ name: "mcp-primitives.draw", mimeType: "application/vnd.draw+json", buffer: drawBuffer });
+  await expect.poll(async () => {
+    const reopened = await freshBridgeDocument(page);
+    return Object.values(created.result.elementIds).every((id: any) => reopened.document.elements.some((element: any) => element.id === id && element.isDeleted !== true));
+  }).toBe(true);
+});
+
 test("one infinite canvas pans and zooms across multiple independent diagrams", async ({ page }) => {
   const response = await page.request.post(commandApi, { data: {
     operation: "create_diagram",

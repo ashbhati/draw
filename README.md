@@ -44,6 +44,7 @@ Available tools:
 
 - `get_current_canvas`: flush and read the active document before returning its summary and element IDs. Optional `offset` (default `0`) and `limit` (default `250`, maximum `250`) paginate the active elements; use the returned `nextOffset` when `hasMore` is true.
 - `create_diagram`: add editable labeled nodes and arrows to the open canvas.
+- `create_elements`: add native editable rectangles, ellipses, diamonds, standalone text, lines, arrows, and freehand strokes. Provide a unique caller-side `id` for each element; the result maps those IDs to Draw element IDs. Coordinates use canvas units. `line`, `arrow`, and `freedraw` points are offsets relative to the element's `x` and `y`.
 - `update_elements`: move, resize, recolor, or change text on existing elements.
 
 `create_diagram` returns `nodes`, mapping each caller-provided node ID to its Draw element ID; `nodeLabels` maps those node IDs to their bound text IDs. `edges` contains each created arrow's `elementId`, optional `labelElementId`, and input index. The result also includes `addedElementIds` and, when supplied, `titleElementId`. Use these returned IDs with `update_elements`.

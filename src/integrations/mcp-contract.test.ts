@@ -140,4 +140,43 @@ describe("MCP tool input contract", () => {
       }),
     ).toThrow(/unsupported update field/i);
   });
+
+  it("accepts native standalone text, line, arrow, and freehand elements", () => {
+    expect(parseMcpToolInput("create_elements", {
+      elements: [
+        { id: "title", type: "text", x: 20, y: 30, text: "Decision point", fontSize: 24 },
+        { id: "connector", type: "line", x: 10, y: 80, points: [[0, 0], [120, 30]] },
+        { id: "flow", type: "arrow", x: 10, y: 140, points: [[0, 0], [120, 30]], endArrowhead: "arrow" },
+        { id: "chalk", type: "freedraw", x: 10, y: 200, points: [[0, 0], [24, 12], [48, 0]] },
+      ],
+    })).toEqual({
+      operation: "create_elements",
+      input: { elements: [
+        { id: "title", type: "text", x: 20, y: 30, text: "Decision point", fontSize: 24 },
+        { id: "connector", type: "line", x: 10, y: 80, points: [[0, 0], [120, 30]] },
+        { id: "flow", type: "arrow", x: 10, y: 140, points: [[0, 0], [120, 30]], endArrowhead: "arrow" },
+        { id: "chalk", type: "freedraw", x: 10, y: 200, points: [[0, 0], [24, 12], [48, 0]] },
+      ] },
+    });
+  });
+
+  it("rejects malformed primitive geometry and duplicate input IDs", () => {
+    expect(() => parseMcpToolInput("create_elements", { elements: [] })).toThrow(/at least one element/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "dup", type: "text", x: 0, y: 0, text: "A" },
+      { id: "dup", type: "text", x: 0, y: 0, text: "B" },
+    ] })).toThrow(/duplicate/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "bad", type: "freedraw", x: 0, y: 0, points: [[0, 0]] },
+    ] })).toThrow(/between 2 and/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "bad", type: "shape", x: 0, y: 0, width: 20, height: 20 },
+    ] })).toThrow(/type is unsupported/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "bad", type: "text", x: 0, y: 0, text: "A", strokeWidth: 2 },
+    ] })).toThrow(/unsupported field/i);
+    expect(() => parseMcpToolInput("create_elements", { elements: [
+      { id: "bad", type: "rectangle", x: 0, y: 0, strokeColor: "transparent" },
+    ] })).toThrow(/six-digit hex/i);
+  });
 });

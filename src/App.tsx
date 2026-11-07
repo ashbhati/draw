@@ -17,11 +17,12 @@ import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
 import { createDebouncedSaver } from "./ui/autosave";
 import { buildDiagramSkeletons } from "./integrations/diagram-builder";
+import { buildPrimitiveSkeletons } from "./integrations/primitive-builder";
 import { persistAppliedDocument } from "./integrations/command-persistence";
 import { createBridgeSynchronizer } from "./integrations/bridge-sync";
 
 type Status = "loading" | "ready" | "saving" | "saved" | "error";
-type BridgeCommand = { id: string; clientId: string; operation: "create_diagram" | "update_elements"; input: any };
+type BridgeCommand = { id: string; clientId: string; operation: "create_diagram" | "create_elements" | "update_elements"; input: any };
 type BridgeFlush = { id: string; clientId: string };
 const DEFAULT_COLOR: Record<DrawBackgroundPreset, string> = { blackboard: "#18191a", white: "#ffffff" };
 const EDITOR_UI_OPTIONS = {
@@ -52,6 +53,33 @@ function renderedTextWidth(text: string, fontSize: number): number {
   if (!context) return 0;
   context.font = `${fontSize}px Excalifont`;
   return Math.max(...text.split("\n").map((line) => context.measureText(line).width));
+}
+
+async function materializeMcpElements(skeletons: Record<string, unknown>[]) {
+  const textSkeletons = skeletons.flatMap((skeleton) => {
+    const nestedLabel = skeleton.label && typeof skeleton.label === "object" ? [skeleton.label as Record<string, unknown>] : [];
+    return [skeleton, ...nestedLabel].filter((candidate) => typeof candidate.text === "string");
+  });
+  await Promise.all(textSkeletons.map((skeleton) => {
+    const fontSize = typeof skeleton.fontSize === "number" ? skeleton.fontSize : 20;
+    return document.fonts.load(`${fontSize}px Excalifont`, skeleton.text as string);
+  }));
+  await document.fonts.ready;
+  const measuredSkeletons = skeletons.map((skeleton) => {
+    const measured = { ...skeleton };
+    if (measured.type === "text") measured.fontFamily = FONT_FAMILY.Excalifont;
+    if (measured.label && typeof measured.label === "object") {
+      measured.label = { ...(measured.label as Record<string, unknown>), fontFamily: FONT_FAMILY.Excalifont };
+    }
+    return measured;
+  });
+  const created = convertToExcalidrawElements(measuredSkeletons as any[], { regenerateIds: false }) as any[];
+  for (const element of created) {
+    if (element.type !== "text" || element.containerId || typeof element.text !== "string") continue;
+    const size = typeof element.fontSize === "number" ? element.fontSize : 20;
+    element.width = Math.max(element.width ?? 0, Math.ceil(renderedTextWidth(element.text, size)) + 2);
+  }
+  return created;
 }
 
 function download(blob: Blob, filename: string) {
@@ -355,31 +383,9 @@ export default function App() {
       let result: Record<string, unknown>;
       if (event.operation === "create_diagram") {
         const built = buildDiagramSkeletons(event.input, current.document.canvas.background.preset, randomId);
-        const textSkeletons = built.skeletons.flatMap((skeleton) => {
-          const nestedLabel = skeleton.label && typeof skeleton.label === "object" ? [skeleton.label as Record<string, unknown>] : [];
-          return [skeleton, ...nestedLabel].filter((candidate) => typeof candidate.text === "string");
-        });
-        await Promise.all(textSkeletons.map((skeleton) => {
-          const fontSize = typeof skeleton.fontSize === "number" ? skeleton.fontSize : 20;
-          return document.fonts.load(`${fontSize}px Excalifont`, skeleton.text as string);
-        }));
-        await document.fonts.ready;
-        const measuredSkeletons = built.skeletons.map((skeleton) => {
-          const measured = { ...skeleton };
-          if (measured.type === "text") measured.fontFamily = FONT_FAMILY.Excalifont;
-          if (measured.label && typeof measured.label === "object") {
-            measured.label = { ...(measured.label as Record<string, unknown>), fontFamily: FONT_FAMILY.Excalifont };
-          }
-          return measured;
-        });
         // Keep the IDs minted by Draw so the MCP result can reliably map the
         // caller's node and edge IDs back to editable scene elements.
-        const created = convertToExcalidrawElements(measuredSkeletons as any[], { regenerateIds: false });
-        for (const element of created as any[]) {
-          if (element.type !== "text" || element.containerId || typeof element.text !== "string") continue;
-          const size = typeof element.fontSize === "number" ? element.fontSize : 20;
-          element.width = Math.max(element.width ?? 0, Math.ceil(renderedTextWidth(element.text, size)) + 2);
-        }
+        const created = await materializeMcpElements(built.skeletons);
         const labelIds = new Map<string, string>();
         for (const element of created as any[]) {
           if (element.type === "text" && element.containerId) labelIds.set(element.containerId, element.id);
@@ -401,6 +407,14 @@ export default function App() {
           addedElementIds: created.map((element: any) => element.id),
           nodes, nodeLabels, edges,
           ...(titleElement ? { titleElementId: titleElement.id } : {}),
+        };
+      } else if (event.operation === "create_elements") {
+        const built = buildPrimitiveSkeletons(event.input, current.document.canvas.background.preset, randomId);
+        const created = await materializeMcpElements(built.skeletons);
+        elements = [...elements, ...created];
+        result = {
+          addedElementIds: created.map((element: any) => element.id),
+          elementIds: built.elementIds,
         };
       } else {
         const update = applyElementUpdates(elements, event.input.updates, measureTextWithExcalidraw);

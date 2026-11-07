@@ -27,6 +27,36 @@ const createDiagramSchema = z.object({
   })).max(200),
 });
 
+const pointSchema = z.array(z.number().finite()).min(2).max(3);
+const primitiveBaseSchema = {
+  id: z.string().min(1).max(100),
+  x: z.number().finite(),
+  y: z.number().finite(),
+  strokeColor: colorSchema.optional(),
+};
+const primitiveStrokeSchema = {
+  ...primitiveBaseSchema,
+  strokeWidth: z.number().finite().min(1).max(8).optional(),
+  strokeStyle: z.enum(["solid", "dashed", "dotted"]).optional(),
+  roughness: z.union([z.literal(0), z.literal(1), z.literal(2)]).optional(),
+};
+const createPrimitiveSchema = z.discriminatedUnion("type", [
+  z.object({
+    ...primitiveStrokeSchema, type: z.enum(["rectangle", "ellipse", "diamond"]),
+    width: z.number().finite().min(24).max(5000).optional(), height: z.number().finite().min(24).max(5000).optional(),
+    backgroundColor: z.union([colorSchema, z.literal("transparent")]).optional(),
+    fillStyle: z.enum(["solid", "hachure", "cross-hatch", "zigzag", "dots"]).optional(),
+  }).strict(),
+  z.object({ ...primitiveBaseSchema, type: z.literal("text"), text: z.string().min(1).max(500), fontSize: z.number().finite().min(8).max(128).optional() }).strict(),
+  z.object({ ...primitiveStrokeSchema, type: z.literal("line"), points: z.array(pointSchema).min(2).max(2000) }).strict(),
+  z.object({
+    ...primitiveStrokeSchema, type: z.literal("arrow"), points: z.array(pointSchema).min(2).max(2000),
+    endArrowhead: z.enum(["arrow", "bar", "dot", "triangle"]).nullable().optional(),
+  }).strict(),
+  z.object({ ...primitiveStrokeSchema, type: z.literal("freedraw"), points: z.array(pointSchema).min(2).max(2000) }).strict(),
+]);
+const createElementsSchema = z.object({ elements: z.array(createPrimitiveSchema).min(1).max(100) }).strict();
+
 const updateElementsSchema = z.object({
   updates: z.array(z.object({
     id: z.string().min(1).max(100),
@@ -109,6 +139,22 @@ function createServer() {
     },
     async (input) => {
       const command = parseMcpToolInput("create_diagram", input);
+      const result = await bridgeRequest("/__draw/api/commands", {
+        method: "POST",
+        body: JSON.stringify(command),
+      });
+      return textResult(result.warning ? { ...result.result, warning: result.warning } : result.result ?? result);
+    },
+  );
+
+  server.registerTool(
+    "create_elements",
+    {
+      description: "Create editable native Draw shapes, text, lines, arrows, and freehand strokes on the open canvas. Use local canvas coordinates; line and freedraw points are offsets from each element's x/y. Returns input IDs mapped to Draw element IDs.",
+      inputSchema: createElementsSchema,
+    },
+    async (input) => {
+      const command = parseMcpToolInput("create_elements", input);
       const result = await bridgeRequest("/__draw/api/commands", {
         method: "POST",
         body: JSON.stringify(command),
