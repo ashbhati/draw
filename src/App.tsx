@@ -13,7 +13,7 @@ import {
 import { isSafeHttpsUrl } from "./document/attribution";
 import { composeBackgroundSvg, hasSelectedExportElements, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorForBackgroundPreset } from "./export/background-recolor";
-import { saveCurrentDocument, loadCurrentDocument, commitMcpOperation, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createCanvas, duplicateCanvas, deleteCanvas, deleteWorkspace, listCanvases, listWorkspaces, loadCanvasDocument, renameCanvas, renameWorkspace, setActiveCanvas, type DrawCanvas, type DrawWorkspace } from "./ui/storage";
+import { saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createCanvas, duplicateCanvas, deleteCanvas, deleteWorkspace, listCanvases, listWorkspaces, loadCanvasDocument, renameCanvas, renameWorkspace, setActiveCanvas, type DrawCanvas, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
 import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
 import { createDebouncedSaver } from "./ui/autosave";
@@ -32,7 +32,10 @@ import { fetchOpenverseImage, imageAttributionFromOpenverseResult, searchOpenver
 type Status = "loading" | "ready" | "saving" | "saved" | "error";
 type BridgeCommand = { id: string; clientId: string; clientIdentity: string; operation: string; input: any; document?: DrawDocument };
 type BridgeFlush = { id: string; clientId: string; clientIdentity: string };
-type BridgeConfirmation = { token: string; clientId: string; clientIdentity: string; action: "open_document"; filename: string; expiresAt: number };
+type BridgeConfirmation = {
+  token: string; clientId: string; clientIdentity: string; action: "open_document" | "delete_canvas" | "delete_workspace";
+  filename?: string; targetId?: string; targetName?: string; workspaceName?: string; canvasCount?: number; expectedCatalogRevision?: number; expiresAt: number;
+};
 type McpPairingRequest = { requestId: string; clientId: string; name: string; fingerprint: string; expiresAt: number; replacesName?: string };
 type McpClientRevokedEvent = { clientIdentity: string };
 type McpCommandRevokedEvent = { id: string; clientId: string; clientIdentity: string };
@@ -905,6 +908,118 @@ export default function App() {
     </div>;
   }, [canWrite, selectBackground]);
 
+  const handleMcpWorkspaceCommand = useCallback(async (event: BridgeCommand) => {
+    let api = apiRef.current;
+    let current = docRef.current;
+    if (!editorSecret.current || event.clientId !== clientId.current) return;
+    // A previous workspace operation may have switched document IDs and be
+    // remounting Excalidraw. The bridge can deliver the next queued MCP call
+    // before the new editor instance has published its API; wait for that
+    // instance instead of silently dropping the command (and timing out it).
+    const editorReadyUntil = Date.now() + 10_000;
+    while ((!apiRef.current || !docRef.current) && Date.now() < editorReadyUntil) {
+      await new Promise((resolve) => window.setTimeout(resolve, 25));
+    }
+    api = apiRef.current;
+    current = docRef.current;
+    if (!api || !current) return;
+    const acknowledge = async (document: DrawDocument, result: Record<string, unknown>, error?: string) => {
+      const response = await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
+        method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
+        body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, document, ...(error ? { error } : { result }) }),
+      });
+      if (!response.ok) throw new Error(`Draw MCP bridge rejected the workspace acknowledgement (HTTP ${response.status}).`);
+    };
+    try {
+      if (!writerOwned.current) throw new Error("This Draw tab is read-only because another tab owns the autosave lock.");
+      if (autosaveBlocked) throw new Error("Local autosave is unavailable; MCP workspace changes are disabled.");
+      await Promise.all([autosave.flush(), bridgeAutosave.flush()]);
+      current = docRef.current;
+      if (!current) throw new Error("The active Draw document changed before the workspace operation could run.");
+      const liveState = api.getAppState() as any;
+      const liveBackground = liveState.viewBackgroundColor === "transparent" ? "blackboard" : liveState.viewBackgroundColor === DEFAULT_COLOR.white ? "white" : current.document.canvas.background.preset;
+      if (hasSceneContentChanged(current, api.getSceneElementsIncludingDeleted() as any[], api.getFiles(), liveBackground)) {
+        throw new Error("CONFLICT: The active canvas has unsynchronized edits. Wait for autosave, list the catalog, and retry with its latest revision.");
+      }
+      const input = event.input as Record<string, any>;
+      const catalog = await getMcpWorkspaceCatalog();
+      const action = input.action as string;
+      if (action === "list_workspaces" || action === "list_canvases") {
+        const result = action === "list_workspaces"
+          ? catalog
+          : { ...catalog, canvases: catalog.canvases.filter((canvas) => canvas.workspaceId === input.workspaceId) };
+        await acknowledge(catalog.activeDocument, result as unknown as Record<string, unknown>);
+        return;
+      }
+      if (typeof input.idempotencyKey !== "string" || !input.idempotencyKey) throw new Error("A stable idempotencyKey is required for every workspace mutation.");
+      const payload = action === "import_draw_file_as_canvas" ? { ...input, document: event.document } : input;
+      const payloadHash = await hashMcpOperation("workspace_action", payload);
+      const replay = await loadMcpWorkspaceOperationReceipt(event.clientIdentity, input.idempotencyKey, payloadHash);
+      if (replay) {
+        // Receipt replay reports the operation's stable IDs alongside the
+        // latest stored catalog/document. Never restore an old active-document
+        // snapshot from an idempotency receipt into the editor or bridge.
+        await acknowledge(replay.activeDocument, { ...replay, replayed: true } as unknown as Record<string, unknown>);
+        return;
+      }
+      if (input.expectedCatalogRevision !== catalog.catalogRevision) {
+        throw new Error(`CONFLICT: Workspace catalog revision is ${catalog.catalogRevision}, expected ${input.expectedCatalogRevision}. List the catalog and retry.`);
+      }
+      if (action === "delete_canvas" || action === "delete_workspace") {
+        if (typeof input.confirmationToken !== "string") throw new Error("NEEDS_CONFIRMATION: Call this tool again with the one-time token after approving deletion in Draw.");
+        const targetId = action === "delete_canvas" ? input.canvasId : input.workspaceId;
+        const confirmationResponse = await fetch(`/__draw/api/confirmations/${encodeURIComponent(input.confirmationToken)}/consume`, {
+          method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
+          body: JSON.stringify({
+            action, targetId, documentId: catalog.activeDocument.document.id,
+            expectedDocumentRevision: catalog.activeDocument.document.documentRevision,
+            expectedCatalogRevision: input.expectedCatalogRevision, idempotencyKey: input.idempotencyKey,
+            clientId: clientId.current, clientIdentity: event.clientIdentity,
+          }),
+        });
+        const confirmation = await confirmationResponse.json().catch(() => ({})) as { status?: string; error?: string };
+        if (!confirmationResponse.ok || confirmation.status !== "APPROVED") throw new Error(`${confirmation.status ?? "CONFIRMATION_FAILED"}: ${confirmation.error ?? "The deletion approval is pending, stale, denied, or expired."}`);
+      }
+      api.updateScene({ appState: { viewModeEnabled: true }, captureUpdate: CaptureUpdateAction.NEVER });
+      let storageAction = { ...input, type: action } as unknown as StorageMcpWorkspaceAction;
+      if (action === "import_draw_file_as_canvas") {
+        if (!event.document) throw new Error("Import command is missing its validated Draw file.");
+        storageAction = { type: "import_draw_file_as_canvas", workspaceId: input.workspaceId, ...(input.name ? { name: input.name } : {}), document: event.document };
+      } else if (action === "delete_canvas" || action === "delete_workspace") {
+        const { confirmationToken: _token, ...withoutToken } = input;
+        storageAction = { ...withoutToken, type: action } as unknown as StorageMcpWorkspaceAction;
+      }
+      if (revokedMcpCommandIds.current.has(event.id)) throw new Error("MCP command was revoked before the workspace operation committed.");
+      const committed = await commitMcpWorkspaceOperation({
+        clientIdentity: event.clientIdentity,
+        idempotencyKey: input.idempotencyKey,
+        payloadHash,
+        expectedCatalogRevision: input.expectedCatalogRevision,
+        action: storageAction,
+      });
+      if (revokedMcpCommandIds.current.has(event.id)) throw new Error("MCP command was revoked after the workspace operation committed; read the catalog before retrying.");
+      setWorkspaces(committed.workspaces);
+      setActiveWorkspaceId(committed.activeWorkspaceId);
+      setCanvases(committed.canvases.filter((canvas) => canvas.workspaceId === committed.activeWorkspaceId));
+      setActiveCanvasId(committed.activeCanvasId);
+      setDocument(committed.activeDocument);
+      if (committed.activeDocument.document.id !== current.document.id) setEditorKey((key) => key + 1);
+      await syncBridgeDocument(committed.activeDocument);
+      setStatus("saved");
+      await acknowledge(committed.activeDocument, committed as unknown as Record<string, unknown>);
+    } catch (error) {
+      const active = docRef.current ?? current;
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus("error"); setMessage(message);
+      if (active) await acknowledge(active, {}, message).catch(() => undefined);
+    } finally {
+      const activeApi = apiRef.current;
+      if (activeApi) activeApi.updateScene({ appState: { viewModeEnabled: !canWrite }, captureUpdate: CaptureUpdateAction.NEVER });
+      completedMcpCommandIds.current.add(event.id);
+      while (completedMcpCommandIds.current.size > 256) completedMcpCommandIds.current.delete(completedMcpCommandIds.current.values().next().value!);
+    }
+  }, [autosave, autosaveBlocked, bridgeAutosave, canWrite, setDocument, syncBridgeDocument]);
+
   const handleMcpCommand = useCallback(async (event: BridgeCommand) => {
     if (completedMcpCommandIds.current.has(event.id)) return;
     if (revokedMcpCommandIds.current.has(event.id)) {
@@ -916,6 +1031,10 @@ export default function App() {
     const api = apiRef.current;
     let current = docRef.current;
     if (!api || !current || !editorSecret.current || event.clientId !== clientId.current) return;
+    if (event.operation === "workspace_action") {
+      await handleMcpWorkspaceCommand(event);
+      return;
+    }
     const durableMutation = ["create_diagram", "create_elements", "insert_image", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "set_canvas_settings", "set_viewport", "undo_operation", "redo_operation"].includes(event.operation);
     let operationHash: string | null = null;
     try {
@@ -1426,7 +1545,7 @@ export default function App() {
       completedMcpCommandIds.current.add(event.id);
       while (completedMcpCommandIds.current.size > 256) completedMcpCommandIds.current.delete(completedMcpCommandIds.current.values().next().value!);
     }
-  }, [autosave, autosaveBlocked, bridgeAutosave, setDocument]);
+  }, [autosave, autosaveBlocked, bridgeAutosave, handleMcpWorkspaceCommand, setDocument]);
 
   const handleBridgeFlush = useCallback(async (event: BridgeFlush) => {
     const api = apiRef.current;
@@ -1484,7 +1603,30 @@ export default function App() {
 
   const handleBridgeConfirmation = useCallback((event: BridgeConfirmation) => {
     if (event.clientId !== clientId.current || !writerOwned.current || !editorSecret.current) return;
-    setConfirmation(event);
+    if (event.action === "open_document") { setConfirmation(event); return; }
+    void (async () => {
+      try {
+        const catalog = await getMcpWorkspaceCatalog();
+        if (catalog.catalogRevision !== event.expectedCatalogRevision) throw new Error("The workspace catalog changed. The agent must list workspaces and request deletion again.");
+        const canvas = event.action === "delete_canvas" ? catalog.canvases.find((item) => item.id === event.targetId) : undefined;
+        const workspace = event.action === "delete_workspace"
+          ? catalog.workspaces.find((item) => item.id === event.targetId)
+          : catalog.workspaces.find((item) => item.id === canvas?.workspaceId);
+        if (!workspace || event.action === "delete_canvas" && !canvas) throw new Error("The requested workspace or canvas no longer exists; no deletion was approved.");
+        setConfirmation({
+          ...event,
+          targetName: event.action === "delete_canvas" ? canvas!.name : workspace.name,
+          workspaceName: workspace.name,
+          ...(event.action === "delete_workspace" ? { canvasCount: catalog.canvases.filter((item) => item.workspaceId === workspace.id).length } : {}),
+        });
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : "Could not verify the requested deletion target.");
+        await fetch(`/__draw/api/confirmations/${encodeURIComponent(event.token)}/respond`, {
+          method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
+          body: JSON.stringify({ clientId: clientId.current, approved: false }),
+        }).catch(() => undefined);
+      }
+    })();
   }, []);
 
   const handleMcpPairingRequest = useCallback((event: McpPairingRequest) => {
@@ -1519,7 +1661,7 @@ export default function App() {
       });
       if (!response.ok) throw new Error("This confirmation request expired or the active Draw tab changed.");
       setConfirmation(null);
-      if (!approved) setMessage("Document open was denied. The active canvas was left unchanged.");
+      if (!approved) setMessage(pending.action === "open_document" ? "Document open was denied. The active canvas was left unchanged." : "Deletion was denied. The workspace and canvases were left unchanged.");
     } catch (error) {
       setConfirmation(null);
       setMessage(error instanceof Error ? error.message : "Could not answer the confirmation request.");
@@ -1686,12 +1828,16 @@ export default function App() {
     </div>
     {confirmation && <div className="draw-confirmation-backdrop" role="presentation">
       <section className="draw-confirmation" role="dialog" aria-modal="true" aria-labelledby="draw-confirmation-title" aria-describedby="draw-confirmation-copy">
-        <h2 id="draw-confirmation-title">Open a Draw document?</h2>
-        <p id="draw-confirmation-copy">An agent wants to open <strong>{confirmation.filename}</strong> and replace the current canvas. Save the current drawing first if you need to keep it.</p>
+        <h2 id="draw-confirmation-title">{confirmation.action === "open_document" ? "Open a Draw document?" : confirmation.action === "delete_canvas" ? "Delete this canvas?" : "Delete this workspace?"}</h2>
+        <p id="draw-confirmation-copy">{confirmation.action === "open_document"
+          ? <>An agent wants to open <strong>{confirmation.filename}</strong> and replace the current canvas. Save the current drawing first if you need to keep it.</>
+          : confirmation.action === "delete_canvas"
+            ? <>An agent wants to delete canvas <strong>{confirmation.targetName}</strong> from workspace <strong>{confirmation.workspaceName}</strong>. Its editable drawing and local history will be removed.</>
+            : <>An agent wants to delete workspace <strong>{confirmation.targetName}</strong> and its {confirmation.canvasCount ?? 0} canvas(es). Their editable drawings and local history will be removed.</>}</p>
         <p className="draw-confirmation-expiry">This one-time approval expires in two minutes.</p>
         <div className="draw-confirmation-actions">
-          <button className="button button-quiet" onClick={() => void respondToConfirmation(false)}>Keep current canvas</button>
-          <button className="button button-primary" onClick={() => void respondToConfirmation(true)}>Approve opening</button>
+          <button className="button button-quiet" onClick={() => void respondToConfirmation(false)}>{confirmation.action === "open_document" ? "Keep current canvas" : "Keep drawings"}</button>
+          <button className="button button-primary" onClick={() => void respondToConfirmation(true)}>{confirmation.action === "open_document" ? "Approve opening" : "Approve deletion"}</button>
         </div>
       </section>
     </div>}

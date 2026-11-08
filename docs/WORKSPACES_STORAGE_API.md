@@ -4,7 +4,7 @@ Draw stores workspaces and canvases locally in IndexedDB. A workspace groups can
 
 ## Migration and compatibility
 
-The database moves from schema version 4 to 6. During upgrade, the former `documents["current"]` record is copied under its existing `document.id`, attached to a default workspace and canvas, and selected as active. Its portable document content, assets, scene/view revisions, app state and viewport are preserved. Malformed legacy content is quarantined and reported as a `DrawStorageRecoveryError`; it does not abort the IndexedDB upgrade. Data created by the earlier V5 draft is re-keyed. The old `current` row remains only as a compatibility alias for V1 clients; namespaced IndexedDB keys protect it from arbitrary document IDs. Existing MCP operation history remains keyed by the same document ID.
+The database moves through schema version 8. During upgrade, the former `documents["current"]` record is copied under its existing `document.id`, attached to a default workspace and canvas, and selected as active. Its portable document content, assets, scene/view revisions, app state and viewport are preserved. Malformed legacy content is quarantined and reported as a `DrawStorageRecoveryError`; it does not abort the IndexedDB upgrade. Data created by the earlier V5 draft is re-keyed. The old `current` row remains only as a compatibility alias for V1 clients; namespaced IndexedDB keys protect it from arbitrary document IDs. Existing MCP operation history remains keyed by the same document ID. Schema 7 added the workspace receipt store and catalog revision metadata; schema 8 compacts receipts into operation IDs/revisions, migrates away historical document snapshots, and prunes to 30 days and 1,000 entries.
 
 Fresh installs create their default workspace and first canvas on the first document save. A successful V1 `.draw` import should be passed to `createCanvas`; that API gives it a new document ID, resets local revision counters, and copies the scene and embedded assets, so import behaves as “open as new” and never overwrites the source document.
 
@@ -14,7 +14,7 @@ Fresh installs create their default workspace and first canvas on the first docu
 
 On load, a missing or dangling active pointer is repaired to the first intact canvas. If canvas records exist but none has a valid document, or a quarantined legacy document needs recovery, storage raises `DrawStorageRecoveryError`. A missing canvas document is not treated as a new empty drawing. If every canvas was intentionally deleted, new autosaves do not silently recreate a deleted canvas.
 
-These functions are exported from `src/ui/storage.ts`. They provide the model and persistence surface for the workspace UI in the next PR; this PR intentionally does not add UI.
+These functions are exported from `src/ui/storage.ts`. The editor UI and the issue #52 MCP tools use these APIs. MCP mutations run through the authenticated active editor and commit their workspace/document change and idempotency receipt in one IndexedDB transaction. Exact retries rebuild the response from current catalog/document storage, never a stale snapshot; a reused key with a different payload conflicts. `.draw` import through MCP creates a new canvas/document and preserves the source and currently saved canvases. Both MCP and human deletes remove compact receipts that refer to the deleted workspace/canvas in the same transaction.
 
 ## Failure behavior
 

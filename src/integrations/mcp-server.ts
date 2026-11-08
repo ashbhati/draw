@@ -105,6 +105,67 @@ const commandTool = (server: McpServer, name: string, description: string, input
     return textResult(result.warning ? { ...result.result, warning: result.warning } : result.result ?? result);
   });
 };
+const workspaceContextSchema = { expectedCatalogRevision: z.number().int().nonnegative(), idempotencyKey: idempotencyKeySchema };
+const workspaceStringSchema = z.string().min(1).max(200);
+const workspaceInputSchemas: Record<string, any> = {
+  list_workspaces: z.object({}).strict(),
+  list_canvases: z.object({ workspaceId: workspaceStringSchema }).strict(),
+  create_workspace: z.object({ ...workspaceContextSchema, name: z.string().min(1).max(200) }).strict(),
+  rename_workspace: z.object({ ...workspaceContextSchema, workspaceId: workspaceStringSchema, name: z.string().min(1).max(200) }).strict(),
+  select_workspace: z.object({ ...workspaceContextSchema, workspaceId: workspaceStringSchema }).strict(),
+  create_canvas: z.object({ ...workspaceContextSchema, workspaceId: workspaceStringSchema, name: z.string().min(1).max(200) }).strict(),
+  rename_canvas: z.object({ ...workspaceContextSchema, canvasId: workspaceStringSchema, name: z.string().min(1).max(200) }).strict(),
+  duplicate_canvas: z.object({ ...workspaceContextSchema, canvasId: workspaceStringSchema, name: z.string().min(1).max(200).optional() }).strict(),
+  select_canvas: z.object({ ...workspaceContextSchema, workspaceId: workspaceStringSchema, canvasId: workspaceStringSchema }).strict(),
+  delete_canvas: z.object({ ...workspaceContextSchema, canvasId: workspaceStringSchema, confirmationToken: z.string().min(1).max(200).optional() }).strict(),
+  delete_workspace: z.object({ ...workspaceContextSchema, workspaceId: workspaceStringSchema, confirmationToken: z.string().min(1).max(200).optional() }).strict(),
+  import_draw_file_as_canvas: z.object({ ...workspaceContextSchema, workspaceId: workspaceStringSchema, path: z.string().min(1).max(160), name: z.string().min(1).max(200).optional() }).strict(),
+};
+
+function registerWorkspaceTool(server: McpServer, toolName: string, action: string, description: string) {
+  server.registerTool(toolName, { description, inputSchema: workspaceInputSchemas[action] }, async (input: Record<string, unknown>) => {
+    const command = parseMcpToolInput("workspace_action", { ...input, action });
+    if (command.operation !== "workspace_action") throw new Error("Invalid workspace MCP command.");
+    const workspaceInput = command.input as Record<string, unknown>;
+    if (action === "delete_canvas" || action === "delete_workspace") {
+      if (typeof workspaceInput.confirmationToken !== "string") {
+        const catalogResponse = await bridgeRequest("/__draw/api/commands", {
+          method: "POST", body: JSON.stringify({ operation: "workspace_action", input: { action: "list_workspaces" } }),
+        });
+        const catalog = catalogResponse.result;
+        const targetId = action === "delete_canvas" ? workspaceInput.canvasId : workspaceInput.workspaceId;
+        const targetCanvas = action === "delete_canvas" ? catalog?.canvases?.find((item: any) => item.id === targetId) : undefined;
+        const targetWorkspace = action === "delete_workspace"
+          ? catalog?.workspaces?.find((item: any) => item.id === targetId)
+          : catalog?.workspaces?.find((item: any) => item.id === targetCanvas?.workspaceId);
+        if (!targetWorkspace || action === "delete_canvas" && !targetCanvas) throw new Error("The requested workspace or canvas no longer exists. List the catalog and retry.");
+        if (catalog.catalogRevision !== workspaceInput.expectedCatalogRevision) throw new Error(`CONFLICT: Workspace catalog revision is ${catalog.catalogRevision}, expected ${workspaceInput.expectedCatalogRevision}. List the catalog and retry.`);
+        const activeDocument = catalog.activeDocument;
+        const confirmationPayload = {
+          action, documentId: activeDocument.document.id,
+          expectedDocumentRevision: activeDocument.document.documentRevision,
+          expectedCatalogRevision: workspaceInput.expectedCatalogRevision,
+          targetId,
+          idempotencyKey: workspaceInput.idempotencyKey,
+        };
+        const fingerprint = createHash("sha256").update(JSON.stringify(confirmationPayload)).digest("hex");
+        const confirmation = await bridgeRequest("/__draw/api/confirmations", {
+          method: "POST", body: JSON.stringify({ ...confirmationPayload, fingerprint }),
+        });
+        return textResult({ status: "NEEDS_CONFIRMATION", action, targetId, targetName: action === "delete_canvas" ? targetCanvas.name : targetWorkspace.name, confirmationToken: confirmation.confirmationToken, expiresAt: confirmation.expiresAt });
+      }
+    }
+    let document: unknown;
+    if (action === "import_draw_file_as_canvas") {
+      const snapshot = await loadDrawFileSnapshot(fileRoot(), workspaceInput.path as string);
+      document = snapshot.document;
+    }
+    const result = await bridgeRequest("/__draw/api/commands", {
+      method: "POST", body: JSON.stringify({ ...command, ...(document ? { document } : {}) }),
+    });
+    return textResult(result.warning ? { ...result.result, warning: result.warning } : result.result ?? result);
+  });
+}
 const fileRoot = () => {
   const root = process.env.DRAW_MCP_DOCUMENT_DIR;
   if (!root) throw new Error("Set DRAW_MCP_DOCUMENT_DIR to an absolute, user-approved folder for MCP open/save/export tools.");
@@ -332,6 +393,19 @@ function createServer() {
     idempotencyKey: idempotencyKeySchema,
     action: z.enum(["fit_content", "set"]), x: z.number().finite().optional(), y: z.number().finite().optional(), zoom: z.number().finite().min(0.1).max(10).optional(),
   });
+
+  registerWorkspaceTool(server, "list_workspaces", "list_workspaces", "List all Draw workspaces with stable IDs, active state, canvases, and the current catalog revision.");
+  registerWorkspaceTool(server, "list_canvases", "list_canvases", "List canvases in a workspace by its stable ID.");
+  registerWorkspaceTool(server, "create_workspace", "create_workspace", "Create and select a project workspace with its first editable canvas. Supply expectedCatalogRevision and an idempotencyKey.");
+  registerWorkspaceTool(server, "rename_workspace", "rename_workspace", "Rename a workspace by stable ID. Supply expectedCatalogRevision and an idempotencyKey.");
+  registerWorkspaceTool(server, "select_workspace", "select_workspace", "Select a workspace and its first canvas by stable ID. Supply expectedCatalogRevision and an idempotencyKey.");
+  registerWorkspaceTool(server, "create_canvas", "create_canvas", "Create and select an empty editable canvas in a workspace by stable ID. Supply expectedCatalogRevision and an idempotencyKey.");
+  registerWorkspaceTool(server, "rename_canvas", "rename_canvas", "Rename an editable canvas by stable ID. Supply expectedCatalogRevision and an idempotencyKey.");
+  registerWorkspaceTool(server, "duplicate_canvas", "duplicate_canvas", "Duplicate an editable canvas, including scene and embedded assets, under a new stable ID. Supply expectedCatalogRevision and an idempotencyKey.");
+  registerWorkspaceTool(server, "select_canvas", "select_canvas", "Select a canvas in a workspace by stable IDs. Supply expectedCatalogRevision and an idempotencyKey.");
+  registerWorkspaceTool(server, "delete_canvas", "delete_canvas", "Delete a canvas only after explicit approval in Draw. First call returns NEEDS_CONFIRMATION; approve it and retry with the same idempotencyKey and confirmationToken.");
+  registerWorkspaceTool(server, "delete_workspace", "delete_workspace", "Delete a workspace and its canvases only after explicit approval in Draw. First call returns NEEDS_CONFIRMATION; approve it and retry with the same idempotencyKey and confirmationToken.");
+  registerWorkspaceTool(server, "import_draw_file_as_canvas", "import_draw_file_as_canvas", "Import a .draw file from DRAW_MCP_DOCUMENT_DIR into a new editable canvas; the source and existing canvases are preserved. Supply expectedCatalogRevision and an idempotencyKey.");
 
   server.registerTool("open_document", {
     description: "Open a native editable .draw file from DRAW_MCP_DOCUMENT_DIR. The MCP path is only a plain filename; this tool cannot read outside that configured directory. Replacing a non-empty canvas returns NEEDS_CONFIRMATION and a one-use token; approve it in the Draw app, then retry with that token.",

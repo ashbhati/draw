@@ -83,6 +83,25 @@ describe("MCP tool input contract", () => {
     expect(() => summarizeCurrentCanvas(document, { offset: 0, limit: 251 })).toThrow(/limit/i);
   });
 
+  it("parses workspace and canvas MCP actions with stable IDs and catalog revisions", () => {
+    expect(parseMcpToolInput("workspace_action", {
+      action: "create_workspace", name: "Research", expectedCatalogRevision: 4, idempotencyKey: "create-research",
+    })).toEqual({ operation: "workspace_action", input: {
+      action: "create_workspace", name: "Research", expectedCatalogRevision: 4, idempotencyKey: "create-research",
+    } });
+    expect(parseMcpToolInput("workspace_action", {
+      action: "select_canvas", workspaceId: "workspace-stable-id", canvasId: "canvas-stable-id",
+      expectedCatalogRevision: 4, idempotencyKey: "select-canvas",
+    })).toMatchObject({ operation: "workspace_action", input: { workspaceId: "workspace-stable-id", canvasId: "canvas-stable-id" } });
+  });
+
+  it("rejects display-name identity, stale-revision omissions, unknown workspace fields, and unsafe import paths", () => {
+    expect(() => parseMcpToolInput("workspace_action", { action: "select_canvas", canvasName: "Board", idempotencyKey: "x", expectedCatalogRevision: 0 })).toThrow(/canvasName|canvasId/i);
+    expect(() => parseMcpToolInput("workspace_action", { action: "create_canvas", workspaceId: "w", name: "Board", idempotencyKey: "x" })).toThrow(/expectedCatalogRevision/i);
+    expect(() => parseMcpToolInput("workspace_action", { action: "create_workspace", name: "Board", idempotencyKey: "x", expectedCatalogRevision: 0, extra: true })).toThrow(/unknown|unsupported|extra/i);
+    expect(() => parseMcpToolInput("workspace_action", { action: "import_draw_file_as_canvas", workspaceId: "w", path: "../secret.draw", expectedCatalogRevision: 0, idempotencyKey: "x" })).toThrow(/filename|path/i);
+  });
+
   it("accepts an editable node-and-edge diagram specification", () => {
     expect(
       parseMcpToolInput("create_diagram", {

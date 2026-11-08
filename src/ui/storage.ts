@@ -3,15 +3,17 @@ import { normalizeDrawImageAttributions } from "../document/attribution";
 import { compactOperationLedger, operationLedgerKey, OPERATION_SNAPSHOT_RETENTION_MS, OPERATION_TOMBSTONE_RETENTION_MS, sameSceneSnapshot, type DurableMcpOperation, type DurableMcpOperationResult, type DurableMcpRedo, type DurableMcpTombstone, type OperationLedgerEntry } from "../integrations/operation-ledger";
 
 const DATABASE_NAME = "draw-local";
-const DATABASE_VERSION = 6;
+const DATABASE_VERSION = 8;
 const DOCUMENTS_STORE = "documents";
 const MCP_OPERATIONS_STORE = "mcpOperations";
+const MCP_WORKSPACE_OPERATIONS_STORE = "mcpWorkspaceOperations";
 const MCP_UNDO_STORE = "mcpUndo";
 const MCP_REDO_STORE = "mcpRedo";
 const MCP_META_STORE = "mcpMeta";
 const WORKSPACES_STORE = "workspaces";
 const CANVASES_STORE = "canvases";
 const WORKSPACE_META_STORE = "workspaceMeta";
+const WORKSPACE_CATALOG_REVISION_KEY = "workspace-catalog-revision";
 const MIGRATION_MARKER_KEY = "migration-v6-complete";
 const LEGACY_RECOVERY_KEY = "legacy-recovery";
 const CURRENT_DOCUMENT_KEY = "current";
@@ -22,12 +24,58 @@ const AUTOSAVE_SESSION_ID = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-
 let autosaveSequence = 0;
 const MCP_COMPACTION_INTERVAL = 32;
 const MAX_DOCUMENT_SNAPSHOTS = 100;
+export const MCP_WORKSPACE_RECEIPT_LIMIT = 1_000;
+const MCP_WORKSPACE_RECEIPT_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 
 type AutosaveOrder = { sessionId: string; sequence: number };
 
 export interface DrawWorkspace { id: string; name: string; createdAt: number; updatedAt: number }
 export interface DrawCanvas { id: string; workspaceId: string; name: string; documentId: string; createdAt: number; updatedAt: number }
 interface ActiveCanvasPointer { workspaceId: string; canvasId: string }
+
+export type McpWorkspaceAction =
+  | { type: "create_workspace"; name: string }
+  | { type: "rename_workspace"; workspaceId: string; name: string }
+  | { type: "select_workspace"; workspaceId: string }
+  | { type: "create_canvas"; workspaceId: string; name: string }
+  | { type: "rename_canvas"; canvasId: string; name: string }
+  | { type: "duplicate_canvas"; canvasId: string; name?: string }
+  | { type: "select_canvas"; workspaceId: string; canvasId: string }
+  | { type: "delete_canvas"; canvasId: string }
+  | { type: "delete_workspace"; workspaceId: string }
+  | { type: "import_draw_file_as_canvas"; workspaceId: string; name?: string; document: DrawDocument };
+
+export interface McpWorkspaceOperationRequest {
+  clientIdentity: string;
+  idempotencyKey: string;
+  payloadHash: string;
+  expectedCatalogRevision: number;
+  action: McpWorkspaceAction;
+}
+
+export interface McpWorkspaceOperationResult {
+  catalogRevision: number;
+  activeWorkspaceId: string;
+  activeCanvasId: string;
+  activeDocument: DrawDocument;
+  workspace?: DrawWorkspace;
+  canvas?: DrawCanvas;
+  workspaces: DrawWorkspace[];
+  canvases: DrawCanvas[];
+  operation?: { type: string; workspaceId?: string; canvasId?: string; committedCatalogRevision?: number };
+}
+
+interface McpWorkspaceOperationReceipt {
+  clientIdentity: string;
+  idempotencyKey: string;
+  payloadHash: string;
+  completedAt: number;
+  operation: { type: string; workspaceId?: string; canvasId?: string; committedCatalogRevision: number };
+  workspaceIds: string[];
+  canvasIds: string[];
+}
+
+export interface McpWorkspaceCatalog extends McpWorkspaceOperationResult {}
 
 export class DrawStorageRecoveryError extends Error {
   constructor(message: string) { super(message); this.name = "DrawStorageRecoveryError"; }
@@ -56,6 +104,9 @@ function openDatabase(): Promise<IDBDatabase> {
       }
       if (!database.objectStoreNames.contains(MCP_OPERATIONS_STORE)) {
         database.createObjectStore(MCP_OPERATIONS_STORE);
+      }
+      if (!database.objectStoreNames.contains(MCP_WORKSPACE_OPERATIONS_STORE)) {
+        database.createObjectStore(MCP_WORKSPACE_OPERATIONS_STORE);
       }
       if (!database.objectStoreNames.contains(MCP_UNDO_STORE)) {
         const undo = database.createObjectStore(MCP_UNDO_STORE);
@@ -143,6 +194,43 @@ function openDatabase(): Promise<IDBDatabase> {
             };
           }
         };
+      }
+      if (event.oldVersion < 8) {
+        const receipts = request.transaction!.objectStore(MCP_WORKSPACE_OPERATIONS_STORE);
+        const keys = receipts.getAllKeys();
+        const values = receipts.getAll();
+        let pending = 2;
+        const compactLegacyReceipts = () => {
+          pending -= 1;
+          if (pending) return;
+          const rows = (values.result as Array<any>).map((row, index) => {
+            if (!row || typeof row !== "object" || typeof row.clientIdentity !== "string" || typeof row.idempotencyKey !== "string" || typeof row.payloadHash !== "string") return null;
+            const oldResult = row?.result;
+            const operation = oldResult?.operation;
+            const workspaceId = operation?.workspaceId ?? oldResult?.workspace?.id ?? oldResult?.activeWorkspaceId;
+            const canvasId = operation?.canvasId ?? oldResult?.canvas?.id ?? oldResult?.activeCanvasId;
+            const compact: McpWorkspaceOperationReceipt = {
+              clientIdentity: row.clientIdentity,
+              idempotencyKey: row.idempotencyKey,
+              payloadHash: row.payloadHash,
+              completedAt: Number.isFinite(row.completedAt) ? row.completedAt : Date.now(),
+              operation: {
+                type: typeof operation?.type === "string" ? operation.type : "legacy_workspace_operation",
+                ...(typeof workspaceId === "string" ? { workspaceId } : {}),
+                ...(typeof canvasId === "string" ? { canvasId } : {}),
+                committedCatalogRevision: Number.isSafeInteger(oldResult?.catalogRevision) ? oldResult.catalogRevision : 0,
+              },
+              workspaceIds: typeof workspaceId === "string" ? [workspaceId] : [],
+              canvasIds: typeof canvasId === "string" ? [canvasId] : [],
+            };
+            return { key: (keys.result as IDBValidKey[])[index], compact };
+          }).filter((entry): entry is { key: IDBValidKey; compact: McpWorkspaceOperationReceipt } => !!entry && entry.compact.completedAt >= Date.now() - MCP_WORKSPACE_RECEIPT_RETENTION_MS)
+            .sort((a, b) => b.compact.completedAt - a.compact.completedAt).slice(0, MCP_WORKSPACE_RECEIPT_LIMIT);
+          const retained = new Set(rows.map((entry) => JSON.stringify(entry.key)));
+          (keys.result as IDBValidKey[]).forEach((key) => { if (!retained.has(JSON.stringify(key))) receipts.delete(key); });
+          rows.forEach(({ key, compact }) => receipts.put(compact, key));
+        };
+        keys.onsuccess = values.onsuccess = compactLegacyReceipts;
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -265,6 +353,7 @@ export async function saveCurrentDocument(document: DrawDocument, options: { rep
         next.document.viewRevision = Math.max(document.document.viewRevision, current.document.viewRevision + 1);
       }
       const oldDocumentId = canvas.documentId;
+      const previousCanvasName = canvas.name;
       const nextCanvas = { ...canvas, documentId: next.document.id, name: next.document.title, updatedAt: Date.now() };
       if (options.replaceDocument) {
         documents.delete(documentKey(oldDocumentId));
@@ -292,6 +381,7 @@ export async function saveCurrentDocument(document: DrawDocument, options: { rep
         documents.put(writeOrder, writeOrderKey(next.document.id));
         documents.put(next, CURRENT_DOCUMENT_KEY);
         canvases.put(nextCanvas, nextCanvas.id);
+        if (nextCanvas.name !== previousCanvasName) incrementWorkspaceCatalogRevision(meta);
         meta.put(true, INITIALIZED_KEY);
         savedDocument = next;
       }
@@ -359,6 +449,397 @@ export async function listCanvases(workspaceId: string): Promise<DrawCanvas[]> {
   } finally { db.close(); }
 }
 
+/** Return the active project catalog and its monotonic revision for MCP optimistic concurrency. */
+export async function getMcpWorkspaceCatalog(): Promise<McpWorkspaceCatalog> {
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction([WORKSPACES_STORE, CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE], "readonly");
+    const workspacesRequest = tx.objectStore(WORKSPACES_STORE).getAll();
+    const canvasesRequest = tx.objectStore(CANVASES_STORE).getAll();
+    const pointerRequest = tx.objectStore(WORKSPACE_META_STORE).get(ACTIVE_POINTER_KEY);
+    const revisionRequest = tx.objectStore(WORKSPACE_META_STORE).get(WORKSPACE_CATALOG_REVISION_KEY);
+    const documentRequest = tx.objectStore(DOCUMENTS_STORE).get(CURRENT_DOCUMENT_KEY);
+    const [workspaces, canvases, pointer, revision, activeDocument] = await Promise.all([
+      requestValue<DrawWorkspace[]>(workspacesRequest), requestValue<DrawCanvas[]>(canvasesRequest),
+      requestValue<ActiveCanvasPointer | undefined>(pointerRequest), requestValue<number | undefined>(revisionRequest),
+      requestValue<DrawDocument | undefined>(documentRequest), waitForTransaction(tx),
+    ]).then(([a, b, c, d, e]) => [a, b, c, d, e] as const);
+    if (!pointer || !activeDocument) throw new DrawStorageRecoveryError("There is no active Draw canvas for MCP workspace operations.");
+    validateDrawDocument(activeDocument);
+    return {
+      catalogRevision: Number.isSafeInteger(revision) ? revision! : 0,
+      activeWorkspaceId: pointer.workspaceId,
+      activeCanvasId: pointer.canvasId,
+      activeDocument,
+      workspaces: workspaces.sort((a, b) => a.createdAt - b.createdAt),
+      canvases: canvases.sort((a, b) => a.createdAt - b.createdAt),
+    };
+  } finally { db.close(); }
+}
+
+export async function loadMcpWorkspaceOperationReceipt(
+  clientIdentity: string,
+  idempotencyKey: string,
+  payloadHash: string,
+): Promise<McpWorkspaceOperationResult | null> {
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction([MCP_WORKSPACE_OPERATIONS_STORE, WORKSPACES_STORE, CANVASES_STORE, WORKSPACE_META_STORE, DOCUMENTS_STORE], "readonly");
+    const key = JSON.stringify([clientIdentity, idempotencyKey]);
+    const receiptRequest = tx.objectStore(MCP_WORKSPACE_OPERATIONS_STORE).get(key);
+    const workspaceRequest = tx.objectStore(WORKSPACES_STORE).getAll();
+    const canvasRequest = tx.objectStore(CANVASES_STORE).getAll();
+    const pointerRequest = tx.objectStore(WORKSPACE_META_STORE).get(ACTIVE_POINTER_KEY);
+    const revisionRequest = tx.objectStore(WORKSPACE_META_STORE).get(WORKSPACE_CATALOG_REVISION_KEY);
+    const documentRequest = tx.objectStore(DOCUMENTS_STORE).get(CURRENT_DOCUMENT_KEY);
+    const [receipt, workspaces, canvases, pointer, revision, activeDocument] = await Promise.all([
+      requestValue<McpWorkspaceOperationReceipt | undefined>(receiptRequest), requestValue<DrawWorkspace[]>(workspaceRequest),
+      requestValue<DrawCanvas[]>(canvasRequest), requestValue<ActiveCanvasPointer | undefined>(pointerRequest),
+      requestValue<number | undefined>(revisionRequest), requestValue<DrawDocument | undefined>(documentRequest), waitForTransaction(tx),
+    ]).then(([a, b, c, d, e, f]) => [a, b, c, d, e, f] as const);
+    if (!receipt) return null;
+    if (!Number.isFinite(receipt.completedAt) || receipt.completedAt < Date.now() - MCP_WORKSPACE_RECEIPT_RETENTION_MS) return null;
+    if (receipt.payloadHash !== payloadHash) throw new Error("IDEMPOTENCY_KEY_REUSE: This key was already used with a different workspace payload.");
+    if (!receipt.operation || !pointer || !activeDocument) throw new Error("The workspace MCP receipt or active catalog is malformed; refusing to replay it.");
+    validateDrawDocument(activeDocument);
+    const sortedWorkspaces = workspaces.sort((a, b) => a.createdAt - b.createdAt);
+    const sortedCanvases = canvases.sort((a, b) => a.createdAt - b.createdAt);
+    return {
+      catalogRevision: Number.isSafeInteger(revision) ? revision! : 0,
+      activeWorkspaceId: pointer.workspaceId,
+      activeCanvasId: pointer.canvasId,
+      activeDocument,
+      workspaces: sortedWorkspaces,
+      canvases: sortedCanvases,
+      ...(receipt.operation.workspaceId ? { workspace: sortedWorkspaces.find((item) => item.id === receipt.operation.workspaceId) } : {}),
+      ...(receipt.operation.canvasId ? { canvas: sortedCanvases.find((item) => item.id === receipt.operation.canvasId) } : {}),
+      operation: { ...receipt.operation },
+    };
+  } finally { db.close(); }
+}
+
+/**
+ * Apply a workspace/canvas MCP mutation and its durable replay receipt in one
+ * IndexedDB transaction. A retry with the same caller/key returns the saved
+ * result before checking the now-stale catalog revision.
+ */
+export async function commitMcpWorkspaceOperation(request: McpWorkspaceOperationRequest): Promise<McpWorkspaceOperationResult> {
+  if (!request.clientIdentity || !request.idempotencyKey || !request.payloadHash) throw new Error("Workspace MCP operations require caller identity, idempotency key, and payload hash.");
+  if (!Number.isSafeInteger(request.expectedCatalogRevision) || request.expectedCatalogRevision < 0) throw new Error("expectedCatalogRevision must be a non-negative integer.");
+  if (request.action.type === "import_draw_file_as_canvas") validateDrawDocument(request.action.document);
+  const db = await openDatabase();
+  const receiptKey = JSON.stringify([request.clientIdentity, request.idempotencyKey]);
+  return new Promise<McpWorkspaceOperationResult>((resolve, reject) => {
+    const stores = [WORKSPACES_STORE, CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE, MCP_WORKSPACE_OPERATIONS_STORE];
+    const tx = db.transaction(stores, "readwrite");
+    const workspaceStore = tx.objectStore(WORKSPACES_STORE);
+    const canvasStore = tx.objectStore(CANVASES_STORE);
+    const documents = tx.objectStore(DOCUMENTS_STORE);
+    const meta = tx.objectStore(WORKSPACE_META_STORE);
+    const receipts = tx.objectStore(MCP_WORKSPACE_OPERATIONS_STORE);
+    let failure: Error | undefined;
+    let result: McpWorkspaceOperationResult | undefined;
+    let activeDocument: DrawDocument | undefined;
+    let activePointer: ActiveCanvasPointer | undefined;
+    let workspaces: DrawWorkspace[] = [];
+    let canvases: DrawCanvas[] = [];
+    let originalCanvases: DrawCanvas[] = [];
+    let currentRevision = 0;
+    let processing = false;
+    const abort = (error: unknown) => {
+      if (failure) return;
+      failure = error instanceof Error ? error : new Error(String(error));
+      try { tx.abort(); } catch { /* the transaction may already be closing */ }
+    };
+    const now = () => Date.now();
+    const makeCanvas = (workspaceId: string, name: string, source?: DrawDocument): { canvas: DrawCanvas; document: DrawDocument } => {
+      const title = name.trim() || "Untitled canvas";
+      const doc = source ? structuredClone(source) : createEmptyDocument(title);
+      validateDrawDocument(doc);
+      const canvas: DrawCanvas = { id: crypto.randomUUID(), workspaceId, name: title, documentId: crypto.randomUUID(), createdAt: now(), updatedAt: now() };
+      doc.document.id = canvas.documentId;
+      doc.document.title = title;
+      doc.document.documentRevision = 0;
+      doc.document.viewRevision = 0;
+      documents.put(doc, documentKey(doc.document.id));
+      canvasStore.put(canvas, canvas.id);
+      canvases.push(canvas);
+      return { canvas, document: doc };
+    };
+    const setActive = (canvas: DrawCanvas, doc: DrawDocument) => {
+      activePointer = { workspaceId: canvas.workspaceId, canvasId: canvas.id };
+      activeDocument = doc;
+      meta.put(activePointer, ACTIVE_POINTER_KEY);
+      documents.put(doc, CURRENT_DOCUMENT_KEY);
+      documents.delete(CURRENT_WRITE_ORDER_KEY);
+    };
+    const readCanvasDocument = (canvas: DrawCanvas, callback: (doc: DrawDocument) => void) => {
+      const docRequest = documents.get(documentKey(canvas.documentId));
+      docRequest.onerror = () => abort(docRequest.error ?? new Error("Could not read the canvas document."));
+      docRequest.onsuccess = () => {
+        try {
+          const doc = docRequest.result as DrawDocument | undefined;
+          if (!doc) throw new DrawStorageRecoveryError(`Canvas ${canvas.id} is damaged: its editable document is missing.`);
+          validateDrawDocument(doc);
+          callback(doc);
+        } catch (error) { abort(error); }
+      };
+    };
+    const finalize = (workspace?: DrawWorkspace, canvas?: DrawCanvas) => {
+      if (failure || !activePointer || !activeDocument) { if (!failure) abort(new DrawStorageRecoveryError("Workspace operation left Draw without an active canvas.")); return; }
+      const nextRevision = currentRevision + 1;
+      meta.put(nextRevision, WORKSPACE_CATALOG_REVISION_KEY);
+      workspaces.sort((a, b) => a.createdAt - b.createdAt);
+      canvases.sort((a, b) => a.createdAt - b.createdAt);
+      result = {
+        catalogRevision: nextRevision,
+        activeWorkspaceId: activePointer.workspaceId,
+        activeCanvasId: activePointer.canvasId,
+        activeDocument,
+        ...(workspace ? { workspace } : {}),
+        ...(canvas ? { canvas } : {}),
+        workspaces: structuredClone(workspaces),
+        canvases: structuredClone(canvases),
+        operation: {
+          type: request.action.type,
+          ...(request.action.type !== "delete_workspace" && request.action.type !== "delete_canvas" && workspace ? { workspaceId: workspace.id } : {}),
+          ...(request.action.type !== "delete_workspace" && request.action.type !== "delete_canvas" && canvas ? { canvasId: canvas.id } : {}),
+          committedCatalogRevision: nextRevision,
+        },
+      };
+      const receipt: McpWorkspaceOperationReceipt = {
+        clientIdentity: request.clientIdentity,
+        idempotencyKey: request.idempotencyKey,
+        payloadHash: request.payloadHash,
+        completedAt: now(),
+        operation: { ...result.operation!, committedCatalogRevision: nextRevision },
+        workspaceIds: result.operation?.workspaceId ? [result.operation.workspaceId] : [],
+        canvasIds: result.operation?.canvasId ? [result.operation.canvasId] : [],
+      };
+      receipts.put(receipt, receiptKey);
+      const keysRequest = receipts.getAllKeys();
+      const valuesRequest = receipts.getAll();
+      let pendingPruneReads = 2;
+      const pruneReceipts = () => {
+        pendingPruneReads -= 1;
+        if (pendingPruneReads) return;
+        const keys = keysRequest.result as IDBValidKey[];
+        const rows = valuesRequest.result as McpWorkspaceOperationReceipt[];
+        const cutoff = now() - MCP_WORKSPACE_RECEIPT_RETENTION_MS;
+        const keep = rows.map((row, index) => ({ row, key: keys[index] }))
+          .filter(({ row }) => row?.completedAt >= cutoff)
+          .sort((a, b) => (b.row.operation?.committedCatalogRevision ?? 0) - (a.row.operation?.committedCatalogRevision ?? 0))
+          .slice(0, MCP_WORKSPACE_RECEIPT_LIMIT);
+        const kept = new Set(keep.map(({ key }) => JSON.stringify(key)));
+        keys.forEach((key) => { if (!kept.has(JSON.stringify(key))) receipts.delete(key); });
+      };
+      keysRequest.onsuccess = valuesRequest.onsuccess = pruneReceipts;
+    };
+    const selectFirstCanvas = (workspace: DrawWorkspace, callback: (canvas: DrawCanvas, doc: DrawDocument) => void) => {
+      const candidate = canvases.filter((item) => item.workspaceId === workspace.id).sort((a, b) => a.createdAt - b.createdAt)[0]
+        ?? makeCanvas(workspace.id, "Untitled drawing").canvas;
+      readCanvasDocument(candidate, (doc) => callback(candidate, doc));
+    };
+    const apply = () => {
+      if (processing || failure) return;
+      processing = true;
+      try {
+        const receipt = tx.objectStore(MCP_WORKSPACE_OPERATIONS_STORE).get(receiptKey);
+        // The initial receipt check is asynchronous; this is a continuation so
+        // the mutation and receipt remain in this same transaction.
+        receipt.onerror = () => abort(receipt.error ?? new Error("Could not read workspace MCP operation receipt."));
+        receipt.onsuccess = () => {
+          const findWorkspace = (id: string) => workspaces.find((item) => item.id === id);
+          const findCanvas = (id: string) => canvases.find((item) => item.id === id);
+          const stored = receipt.result as McpWorkspaceOperationReceipt | undefined;
+          if (stored) {
+            if (!Number.isFinite(stored.completedAt) || stored.completedAt < now() - MCP_WORKSPACE_RECEIPT_RETENTION_MS) {
+              receipts.delete(receiptKey);
+            } else {
+            if (stored.payloadHash !== request.payloadHash) { abort(new Error("IDEMPOTENCY_KEY_REUSE: This key was already used with a different workspace payload.")); return; }
+            if (!stored.operation || !activePointer || !activeDocument) { abort(new Error("The workspace MCP receipt or active catalog is malformed; refusing to replay it.")); return; }
+            const operationWorkspace = stored.operation.workspaceId ? findWorkspace(stored.operation.workspaceId) : undefined;
+            const operationCanvas = stored.operation.canvasId ? findCanvas(stored.operation.canvasId) : undefined;
+            result = {
+              catalogRevision: currentRevision,
+              activeWorkspaceId: activePointer.workspaceId,
+              activeCanvasId: activePointer.canvasId,
+              activeDocument: structuredClone(activeDocument),
+              workspaces: structuredClone(workspaces),
+              canvases: structuredClone(canvases),
+              ...(operationWorkspace ? { workspace: structuredClone(operationWorkspace) } : {}),
+              ...(operationCanvas ? { canvas: structuredClone(operationCanvas) } : {}),
+              operation: { ...stored.operation },
+            };
+            return;
+            }
+          }
+          if (currentRevision !== request.expectedCatalogRevision) {
+            abort(new Error(`CONFLICT: Workspace catalog revision is ${currentRevision}, expected ${request.expectedCatalogRevision}. Read the workspace list and retry.`));
+            return;
+          }
+          const action = request.action;
+          switch (action.type) {
+            case "create_workspace": {
+              const timestamp = now();
+              const created: DrawWorkspace = { id: crypto.randomUUID(), name: action.name.trim() || "Untitled workspace", createdAt: timestamp, updatedAt: timestamp };
+              workspaceStore.put(created, created.id); workspaces.push(created);
+              const createdDoc = makeCanvas(created.id, "Untitled drawing");
+              setActive(createdDoc.canvas, createdDoc.document); finalize(created, createdDoc.canvas); break;
+            }
+            case "rename_workspace": {
+              const target = findWorkspace(action.workspaceId);
+              if (!target) { abort(new Error("Workspace does not exist.")); break; }
+              const renamed = { ...target, name: action.name.trim() || "Untitled workspace", updatedAt: now() };
+              workspaceStore.put(renamed, renamed.id); workspaces = workspaces.map((item) => item.id === renamed.id ? renamed : item);
+              finalize(renamed); break;
+            }
+            case "select_workspace": {
+              const target = findWorkspace(action.workspaceId);
+              if (!target) { abort(new Error("Workspace does not exist.")); break; }
+              selectFirstCanvas(target, (canvas, doc) => { setActive(canvas, doc); finalize(target, canvas); }); break;
+            }
+            case "create_canvas": {
+              const target = findWorkspace(action.workspaceId);
+              if (!target) { abort(new Error("Workspace does not exist.")); break; }
+              const created = makeCanvas(target.id, action.name);
+              setActive(created.canvas, created.document); finalize(target, created.canvas); break;
+            }
+            case "rename_canvas": {
+              const target = findCanvas(action.canvasId);
+              if (!target) { abort(new Error("Canvas does not exist.")); break; }
+              readCanvasDocument(target, (doc) => {
+                const nextName = action.name.trim() || "Untitled canvas";
+                doc.document.title = nextName; doc.document.documentRevision += 1;
+                const renamed = { ...target, name: nextName, updatedAt: now() };
+                documents.put(doc, documentKey(doc.document.id)); canvasStore.put(renamed, renamed.id);
+                canvases = canvases.map((item) => item.id === renamed.id ? renamed : item);
+                const owner = findWorkspace(target.workspaceId);
+                if (activePointer?.canvasId === target.id) setActive(renamed, doc);
+                finalize(owner, renamed);
+              }); break;
+            }
+            case "duplicate_canvas": {
+              const target = findCanvas(action.canvasId);
+              if (!target) { abort(new Error("Canvas does not exist.")); break; }
+              readCanvasDocument(target, (doc) => {
+                const created = makeCanvas(target.workspaceId, action.name?.trim() || `${target.name} copy`, doc);
+                setActive(created.canvas, created.document); finalize(findWorkspace(target.workspaceId), created.canvas);
+              }); break;
+            }
+            case "select_canvas": {
+              const target = findCanvas(action.canvasId);
+              if (!target || target.workspaceId !== action.workspaceId) { abort(new Error("Canvas does not exist in the requested workspace.")); break; }
+              readCanvasDocument(target, (doc) => { setActive(target, doc); finalize(findWorkspace(target.workspaceId), target); }); break;
+            }
+            case "import_draw_file_as_canvas": {
+              const target = findWorkspace(action.workspaceId);
+              if (!target) { abort(new Error("Workspace does not exist.")); break; }
+              const created = makeCanvas(target.id, action.name?.trim() || action.document.document.title, action.document);
+              setActive(created.canvas, created.document); finalize(target, created.canvas); break;
+            }
+            case "delete_canvas": {
+              const target = findCanvas(action.canvasId);
+              if (!target) { abort(new Error("Canvas does not exist.")); break; }
+              const owner = findWorkspace(target.workspaceId);
+              if (!owner) { abort(new Error("The canvas workspace does not exist.")); break; }
+              canvases = canvases.filter((item) => item.id !== target.id); canvasStore.delete(target.id);
+              documents.delete(documentKey(target.documentId)); documents.delete(writeOrderKey(target.documentId));
+              tx.objectStore(MCP_UNDO_STORE).delete(target.documentId); tx.objectStore(MCP_REDO_STORE).delete(target.documentId);
+              if (activePointer?.canvasId !== target.id) { finalize(owner); break; }
+              const sibling = canvases.filter((item) => item.workspaceId === owner.id).sort((a, b) => a.createdAt - b.createdAt)[0]
+                ?? canvases.sort((a, b) => a.createdAt - b.createdAt)[0];
+              if (sibling) readCanvasDocument(sibling, (doc) => { setActive(sibling, doc); finalize(findWorkspace(sibling.workspaceId), sibling); });
+              else {
+                const fresh = makeCanvas(owner.id, "Untitled drawing"); setActive(fresh.canvas, fresh.document); finalize(owner, fresh.canvas);
+              }
+              break;
+            }
+            case "delete_workspace": {
+              const target = findWorkspace(action.workspaceId);
+              if (!target) { abort(new Error("Workspace does not exist.")); break; }
+              const deleted = canvases.filter((item) => item.workspaceId === target.id);
+              workspaces = workspaces.filter((item) => item.id !== target.id); workspaceStore.delete(target.id);
+              canvases = canvases.filter((item) => item.workspaceId !== target.id);
+              for (const canvas of deleted) {
+                canvasStore.delete(canvas.id); documents.delete(documentKey(canvas.documentId)); documents.delete(writeOrderKey(canvas.documentId));
+                tx.objectStore(MCP_UNDO_STORE).delete(canvas.documentId); tx.objectStore(MCP_REDO_STORE).delete(canvas.documentId);
+              }
+              if (activePointer?.workspaceId !== target.id) { finalize(); break; }
+              let nextWorkspace = workspaces.sort((a, b) => a.createdAt - b.createdAt)[0];
+              if (!nextWorkspace) {
+                const timestamp = now(); nextWorkspace = { id: crypto.randomUUID(), name: "My workspace", createdAt: timestamp, updatedAt: timestamp };
+                workspaces.push(nextWorkspace); workspaceStore.put(nextWorkspace, nextWorkspace.id);
+              }
+              selectFirstCanvas(nextWorkspace, (canvas, doc) => { setActive(canvas, doc); finalize(nextWorkspace, canvas); }); break;
+            }
+          }
+        };
+      } catch (error) { abort(error); }
+    };
+    const [revisionRequest, pointerRequest, workspacesRequest, canvasesRequest, aliasRequest] = [
+      meta.get(WORKSPACE_CATALOG_REVISION_KEY), meta.get(ACTIVE_POINTER_KEY),
+      workspaceStore.getAll(), canvasStore.getAll(), documents.get(CURRENT_DOCUMENT_KEY),
+    ];
+    let remaining = 5;
+    const ready = () => { remaining -= 1; if (remaining !== 0) return; };
+    for (const requestItem of [revisionRequest, pointerRequest, workspacesRequest, canvasesRequest, aliasRequest]) requestItem.onerror = () => abort(requestItem.error ?? new Error("Could not inspect workspace catalog."));
+    revisionRequest.onsuccess = () => { currentRevision = Number.isSafeInteger(revisionRequest.result) ? revisionRequest.result as number : 0; ready(); };
+    pointerRequest.onsuccess = () => { activePointer = pointerRequest.result as ActiveCanvasPointer | undefined; ready(); };
+    workspacesRequest.onsuccess = () => { workspaces = workspacesRequest.result as DrawWorkspace[]; ready(); };
+    canvasesRequest.onsuccess = () => { canvases = canvasesRequest.result as DrawCanvas[]; originalCanvases = [...canvases]; ready(); };
+    aliasRequest.onsuccess = () => { activeDocument = aliasRequest.result as DrawDocument | undefined; ready(); };
+    tx.oncomplete = () => { db.close(); if (failure) reject(failure); else if (result) resolve(result); else reject(new Error("Workspace operation completed without a result.")); };
+    tx.onerror = tx.onabort = () => { db.close(); reject(failure ?? tx.error ?? new Error("Workspace MCP operation was cancelled.")); };
+    // Define an atomic ledger cleanup helper after initial catalog reads, then
+    // apply. (The helper body is assigned in the continuation below.)
+    const kick = () => {
+      if (remaining !== 0 || processing) return;
+      const action = request.action;
+      if (action.type === "delete_canvas" || action.type === "delete_workspace") {
+        const keysRequest = tx.objectStore(MCP_OPERATIONS_STORE).getAllKeys();
+        const valuesRequest = tx.objectStore(MCP_OPERATIONS_STORE).getAll();
+        let left = 2;
+        const prune = () => {
+          left -= 1; if (left) return;
+          const deletedCanvases = action.type === "delete_canvas"
+            ? originalCanvases.filter((item) => item.id === action.canvasId)
+            : originalCanvases.filter((item) => item.workspaceId === action.workspaceId);
+          const ids = new Set(deletedCanvases.map((item) => item.documentId));
+          (valuesRequest.result as Array<{ documentId?: string }>).forEach((item, index) => {
+            if (item?.documentId && ids.has(item.documentId)) tx.objectStore(MCP_OPERATIONS_STORE).delete((keysRequest.result as IDBValidKey[])[index]);
+          });
+            const workspaceReceiptStore = tx.objectStore(MCP_WORKSPACE_OPERATIONS_STORE);
+            const receiptKeys = workspaceReceiptStore.getAllKeys();
+            const receiptValues = workspaceReceiptStore.getAll();
+            let receiptReads = 2;
+            const pruneWorkspaceReceipts = () => {
+              receiptReads -= 1; if (receiptReads) return;
+              const removedCanvasIds = new Set(deletedCanvases.map((item) => item.id));
+              const removedWorkspaceIds = action.type === "delete_workspace" ? new Set([action.workspaceId]) : new Set<string>();
+              (receiptValues.result as Array<Partial<McpWorkspaceOperationReceipt>>).forEach((receipt, index) => {
+                const refersToRemovedWorkspace = (receipt.workspaceIds ?? []).some((id) => removedWorkspaceIds.has(id));
+                const refersToRemovedCanvas = (receipt.canvasIds ?? []).some((id) => removedCanvasIds.has(id));
+                if (refersToRemovedWorkspace || refersToRemovedCanvas) workspaceReceiptStore.delete((receiptKeys.result as IDBValidKey[])[index]);
+              });
+              apply();
+            };
+            receiptKeys.onsuccess = receiptValues.onsuccess = pruneWorkspaceReceipts;
+            receiptKeys.onerror = receiptValues.onerror = () => abort(new Error("Could not inspect workspace MCP receipts before deletion."));
+        };
+        keysRequest.onsuccess = valuesRequest.onsuccess = prune;
+        keysRequest.onerror = valuesRequest.onerror = () => abort(new Error("Could not inspect document history before deletion."));
+      } else apply();
+    };
+    // Use request completion ordering to defer mutations until every initial
+    // row is available; transaction remains live because all events are IDB callbacks.
+    for (const item of [revisionRequest, pointerRequest, workspacesRequest, canvasesRequest, aliasRequest]) {
+      const original = item.onsuccess;
+      item.onsuccess = (event) => { original?.call(item, event); kick(); };
+    }
+  });
+}
+
 async function readAll<T>(storeName: string): Promise<T[]> {
   const db = await openDatabase();
   try { const tx = db.transaction(storeName, "readonly"); const req = tx.objectStore(storeName).getAll(); const [items] = await Promise.all([requestValue<T[]>(req), waitForTransaction(tx)]); return items.sort((a: any, b: any) => a.createdAt - b.createdAt); }
@@ -366,6 +847,11 @@ async function readAll<T>(storeName: string): Promise<T[]> {
 }
 
 function requestValue<T>(request: IDBRequest<T>): Promise<T> { return new Promise((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error ?? new Error("IndexedDB request failed.")); }); }
+
+function incrementWorkspaceCatalogRevision(meta: IDBObjectStore): void {
+  const request = meta.get(WORKSPACE_CATALOG_REVISION_KEY);
+  request.onsuccess = () => meta.put((Number.isSafeInteger(request.result) ? Number(request.result) : 0) + 1, WORKSPACE_CATALOG_REVISION_KEY);
+}
 
 /** Repair a missing/dangling active pointer by selecting the first intact canvas. */
 async function resolveActiveCanvas(database: IDBDatabase): Promise<DrawCanvas | null> {
@@ -439,14 +925,14 @@ export async function loadCanvasDocument(canvasId: string): Promise<DrawDocument
 export async function createWorkspace(name: string): Promise<DrawWorkspace> {
   const workspace = { id: crypto.randomUUID(), name: name.trim() || "Untitled workspace", createdAt: Date.now(), updatedAt: Date.now() } satisfies DrawWorkspace;
   const db = await openDatabase();
-  try { const tx = db.transaction(WORKSPACES_STORE, "readwrite"); tx.objectStore(WORKSPACES_STORE).put(workspace, workspace.id); await waitForTransaction(tx); return workspace; }
+  try { const tx = db.transaction([WORKSPACES_STORE, WORKSPACE_META_STORE], "readwrite"); tx.objectStore(WORKSPACES_STORE).put(workspace, workspace.id); incrementWorkspaceCatalogRevision(tx.objectStore(WORKSPACE_META_STORE)); await waitForTransaction(tx); return workspace; }
   finally { db.close(); }
 }
 
 export async function renameWorkspace(workspaceId: string, name: string): Promise<DrawWorkspace> {
   const db = await openDatabase();
   try {
-    const tx = db.transaction(WORKSPACES_STORE, "readwrite");
+    const tx = db.transaction([WORKSPACES_STORE, WORKSPACE_META_STORE], "readwrite");
     const store = tx.objectStore(WORKSPACES_STORE);
     const request = store.get(workspaceId);
     let renamed: DrawWorkspace | undefined;
@@ -455,6 +941,7 @@ export async function renameWorkspace(workspaceId: string, name: string): Promis
       if (!request.result) { failure = new Error("Workspace does not exist."); tx.abort(); return; }
       renamed = { ...(request.result as DrawWorkspace), name: name.trim() || "Untitled workspace", updatedAt: Date.now() };
       store.put(renamed, workspaceId);
+      incrementWorkspaceCatalogRevision(tx.objectStore(WORKSPACE_META_STORE));
     };
     try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
     return renamed!;
@@ -464,7 +951,7 @@ export async function renameWorkspace(workspaceId: string, name: string): Promis
 export async function renameCanvas(canvasId: string, name: string): Promise<DrawCanvas> {
   const db = await openDatabase();
   try {
-    const tx = db.transaction([CANVASES_STORE, DOCUMENTS_STORE], "readwrite");
+    const tx = db.transaction([CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE], "readwrite");
     const canvases = tx.objectStore(CANVASES_STORE);
     const request = canvases.get(canvasId);
     let renamed: DrawCanvas | undefined;
@@ -484,6 +971,7 @@ export async function renameCanvas(canvasId: string, name: string): Promise<Draw
           renamed = { ...canvas, name: nextName, updatedAt: Date.now() };
           tx.objectStore(DOCUMENTS_STORE).put(document, documentKey(canvas.documentId));
           canvases.put(renamed, canvasId);
+          incrementWorkspaceCatalogRevision(tx.objectStore(WORKSPACE_META_STORE));
         } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); tx.abort(); }
       };
       docRequest.onerror = () => { failure = docRequest.error ?? new Error("Could not read the canvas document."); tx.abort(); };
@@ -518,6 +1006,7 @@ export async function duplicateCanvas(canvasId: string, name?: string): Promise<
           tx.objectStore(DOCUMENTS_STORE).put(sourceDocument, documentKey(duplicate.documentId));
           tx.objectStore(CANVASES_STORE).put(duplicate, duplicate.id);
           tx.objectStore(WORKSPACE_META_STORE).put(true, INITIALIZED_KEY);
+          incrementWorkspaceCatalogRevision(tx.objectStore(WORKSPACE_META_STORE));
         } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); tx.abort(); }
       };
       documentRequest.onerror = () => { failure = documentRequest.error ?? new Error("Could not read the canvas document."); tx.abort(); };
@@ -530,7 +1019,7 @@ export async function duplicateCanvas(canvasId: string, name?: string): Promise<
 export async function deleteWorkspace(workspaceId: string): Promise<void> {
   const db = await openDatabase();
   try {
-    const tx = db.transaction([WORKSPACES_STORE, CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE], "readwrite");
+    const tx = db.transaction([WORKSPACES_STORE, CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE, MCP_WORKSPACE_OPERATIONS_STORE], "readwrite");
     const workspaces = tx.objectStore(WORKSPACES_STORE);
     const canvases = tx.objectStore(CANVASES_STORE);
     const documents = tx.objectStore(DOCUMENTS_STORE);
@@ -543,6 +1032,8 @@ export async function deleteWorkspace(workspaceId: string): Promise<void> {
       documents.get(CURRENT_DOCUMENT_KEY),
       tx.objectStore(MCP_OPERATIONS_STORE).getAllKeys(),
       tx.objectStore(MCP_OPERATIONS_STORE).getAll(),
+      tx.objectStore(MCP_WORKSPACE_OPERATIONS_STORE).getAllKeys(),
+      tx.objectStore(MCP_WORKSPACE_OPERATIONS_STORE).getAll(),
     ];
     let pending = requests.length;
     let failure: Error | undefined;
@@ -557,8 +1048,12 @@ export async function deleteWorkspace(workspaceId: string): Promise<void> {
       const alias = requests[4].result as DrawDocument | undefined;
       const operationKeys = requests[5].result as IDBValidKey[];
       const operations = requests[6].result as Array<{ documentId?: string }>;
+      const workspaceReceiptKeys = requests[7].result as IDBValidKey[];
+      const workspaceReceipts = requests[8].result as Array<Partial<McpWorkspaceOperationReceipt>>;
       const removedIds = new Set(removed.map((canvas) => canvas.documentId));
+      const removedCanvasIds = new Set(removed.map((canvas) => canvas.id));
       workspaces.delete(workspaceId);
+      incrementWorkspaceCatalogRevision(meta);
       for (const canvas of removed) {
         canvases.delete(canvas.id);
         documents.delete(documentKey(canvas.documentId));
@@ -567,6 +1062,11 @@ export async function deleteWorkspace(workspaceId: string): Promise<void> {
         tx.objectStore(MCP_REDO_STORE).delete(canvas.documentId);
       }
       operations.forEach((operation, index) => { if (operation?.documentId && removedIds.has(operation.documentId)) tx.objectStore(MCP_OPERATIONS_STORE).delete(operationKeys[index]); });
+      workspaceReceipts.forEach((receipt, index) => {
+        if ((receipt.workspaceIds ?? []).includes(workspaceId) || (receipt.canvasIds ?? []).some((id) => removedCanvasIds.has(id))) {
+          tx.objectStore(MCP_WORKSPACE_OPERATIONS_STORE).delete(workspaceReceiptKeys[index]);
+        }
+      });
       if (!active || !removed.some((canvas) => canvas.id === active.canvasId)) return;
       const candidates = allCanvases.filter((canvas) => canvas.workspaceId !== workspaceId).sort((a, b) => a.createdAt - b.createdAt);
       let index = 0;
@@ -618,6 +1118,7 @@ export async function createCanvas(workspaceId: string, name: string, source?: D
       try { hooks.afterDocumentWrite?.(); } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); tx.abort(); return; }
       tx.objectStore(CANVASES_STORE).put(canvas, canvas.id);
       tx.objectStore(WORKSPACE_META_STORE).put(true, INITIALIZED_KEY);
+      incrementWorkspaceCatalogRevision(tx.objectStore(WORKSPACE_META_STORE));
     };
     try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
     return canvas;
@@ -628,7 +1129,7 @@ export async function setActiveCanvas(canvasId: string): Promise<void> {
   const db = await openDatabase();
   try {
     const tx = db.transaction([CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE], "readwrite"); const canvases = tx.objectStore(CANVASES_STORE); const req = canvases.get(canvasId); let failure: Error | undefined;
-    req.onsuccess = () => { const canvas = req.result as DrawCanvas | undefined; if (!canvas) { failure = new Error("Canvas does not exist."); tx.abort(); return; } const docRequest = tx.objectStore(DOCUMENTS_STORE).get(documentKey(canvas.documentId)); docRequest.onsuccess = () => { try { if (!docRequest.result) throw new Error("missing"); validateDrawDocument(docRequest.result); tx.objectStore(WORKSPACE_META_STORE).put({ workspaceId: canvas.workspaceId, canvasId } satisfies ActiveCanvasPointer, ACTIVE_POINTER_KEY); tx.objectStore(DOCUMENTS_STORE).put(docRequest.result, CURRENT_DOCUMENT_KEY); } catch { failure = new DrawStorageRecoveryError(`Canvas ${canvas.id} is damaged: its editable document is missing or invalid.`); tx.abort(); } }; docRequest.onerror = () => { failure = docRequest.error ?? new Error("Could not inspect the canvas document."); tx.abort(); }; };
+    req.onsuccess = () => { const canvas = req.result as DrawCanvas | undefined; if (!canvas) { failure = new Error("Canvas does not exist."); tx.abort(); return; } const docRequest = tx.objectStore(DOCUMENTS_STORE).get(documentKey(canvas.documentId)); docRequest.onsuccess = () => { try { if (!docRequest.result) throw new Error("missing"); validateDrawDocument(docRequest.result); const meta = tx.objectStore(WORKSPACE_META_STORE); const oldPointer = meta.get(ACTIVE_POINTER_KEY); oldPointer.onsuccess = () => { if (oldPointer.result?.canvasId !== canvasId) incrementWorkspaceCatalogRevision(meta); }; meta.put({ workspaceId: canvas.workspaceId, canvasId } satisfies ActiveCanvasPointer, ACTIVE_POINTER_KEY); tx.objectStore(DOCUMENTS_STORE).put(docRequest.result, CURRENT_DOCUMENT_KEY); } catch { failure = new DrawStorageRecoveryError(`Canvas ${canvas.id} is damaged: its editable document is missing or invalid.`); tx.abort(); } }; docRequest.onerror = () => { failure = docRequest.error ?? new Error("Could not inspect the canvas document."); tx.abort(); }; };
     try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
   } finally { db.close(); }
 }
@@ -636,11 +1137,12 @@ export async function setActiveCanvas(canvasId: string): Promise<void> {
 export async function deleteCanvas(canvasId: string): Promise<void> {
   const db = await openDatabase();
   try {
-    const tx = db.transaction([CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE], "readwrite");
+    const tx = db.transaction([CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE, MCP_WORKSPACE_OPERATIONS_STORE], "readwrite");
     const canvases = tx.objectStore(CANVASES_STORE); const req = canvases.get(canvasId); const meta = tx.objectStore(WORKSPACE_META_STORE);
     const activeRequest = meta.get(ACTIVE_POINTER_KEY);
     const aliasRequest = tx.objectStore(DOCUMENTS_STORE).get(CURRENT_DOCUMENT_KEY);
     let reads = 3;
+    let failure: Error | undefined;
     let canvas: DrawCanvas | undefined;
     let active: ActiveCanvasPointer | undefined;
     let alias: DrawDocument | undefined;
@@ -651,6 +1153,7 @@ export async function deleteCanvas(canvasId: string): Promise<void> {
       active = activeRequest.result as ActiveCanvasPointer | undefined;
       alias = aliasRequest.result as DrawDocument | undefined;
       if (!canvas) return;
+      incrementWorkspaceCatalogRevision(meta);
       const documents = tx.objectStore(DOCUMENTS_STORE);
       canvases.delete(canvasId);
       documents.delete(documentKey(canvas.documentId));
@@ -658,6 +1161,19 @@ export async function deleteCanvas(canvasId: string): Promise<void> {
       documents.delete(CURRENT_WRITE_ORDER_KEY);
       tx.objectStore(MCP_UNDO_STORE).delete(canvas.documentId);
       tx.objectStore(MCP_REDO_STORE).delete(canvas.documentId);
+      const workspaceReceiptStore = tx.objectStore(MCP_WORKSPACE_OPERATIONS_STORE);
+      const workspaceReceiptKeys = workspaceReceiptStore.getAllKeys();
+      const workspaceReceiptValues = workspaceReceiptStore.getAll();
+      let workspaceReceiptReads = 2;
+      const pruneWorkspaceReceipts = () => {
+        workspaceReceiptReads -= 1;
+        if (workspaceReceiptReads) return;
+        (workspaceReceiptValues.result as Array<Partial<McpWorkspaceOperationReceipt>>).forEach((receipt, index) => {
+          if ((receipt.canvasIds ?? []).includes(canvas!.id)) workspaceReceiptStore.delete((workspaceReceiptKeys.result as IDBValidKey[])[index]);
+        });
+      };
+      workspaceReceiptKeys.onsuccess = workspaceReceiptValues.onsuccess = pruneWorkspaceReceipts;
+      workspaceReceiptKeys.onerror = workspaceReceiptValues.onerror = () => { failure = new Error("Could not clean workspace MCP receipts before canvas deletion."); tx.abort(); };
       const operationStore = tx.objectStore(MCP_OPERATIONS_STORE);
       const operationKeys = operationStore.getAllKeys();
       const operationValues = operationStore.getAll();
@@ -702,7 +1218,7 @@ export async function deleteCanvas(canvasId: string): Promise<void> {
     req.onsuccess = finish;
     activeRequest.onsuccess = finish;
     aliasRequest.onsuccess = finish;
-    await waitForTransaction(tx);
+    try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
   } finally { db.close(); }
 }
 

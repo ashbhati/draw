@@ -47,10 +47,15 @@ type PendingConfirmation = {
   clientIdentity: string;
   documentId: string;
   expectedDocumentRevision: number;
-  filename: string;
+  action: "open_document" | "delete_canvas" | "delete_workspace";
+  filename?: string;
+  targetId?: string;
+  expectedCatalogRevision?: number;
+  idempotencyKey?: string;
   fingerprint: string;
   expiresAt: number;
   decision: "pending" | "approved" | "denied";
+  consumedForIdempotencyKey?: string;
 };
 
 export type DrawMcpBridgeOptions = {
@@ -141,6 +146,10 @@ function asMcpCommand(body: unknown): McpCommand {
   const command = parseMcpToolInput(body.operation, body.input);
   if (command.operation === "open_document") {
     if (!isDrawDocument(body.document)) throw new Error("open_document must include a valid Draw document loaded from the configured folder.");
+    return { ...command, document: parseDrawFile(body.document) };
+  }
+  if (command.operation === "workspace_action" && command.input.action === "import_draw_file_as_canvas") {
+    if (!isDrawDocument(body.document)) throw new Error("import_draw_file_as_canvas must include a valid Draw document loaded from the configured folder.");
     return { ...command, document: parseDrawFile(body.document) };
   }
   return command;
@@ -562,7 +571,8 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
             const authenticated = await authenticatedMcpClient(request);
             if (!authenticated) { sendJson(response, 401, { error: "MCP authentication is required." }); return; }
             const body = await readJsonBody(request, maxBodyBytes);
-            if (!isRecord(body) || body.action !== "open_document" || typeof body.documentId !== "string" || typeof body.expectedDocumentRevision !== "number" || typeof body.filename !== "string" || typeof body.fingerprint !== "string" || !/^[a-f\d]{64}$/i.test(body.fingerprint)) {
+            if (!isRecord(body) || !["open_document", "delete_canvas", "delete_workspace"].includes(body.action as string)
+              || typeof body.documentId !== "string" || !Number.isSafeInteger(body.expectedDocumentRevision) || typeof body.fingerprint !== "string" || !/^[a-f\d]{64}$/i.test(body.fingerprint)) {
               sendJson(response, 400, { error: "Confirmation request is invalid." });
               return;
             }
@@ -570,18 +580,33 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               sendJson(response, 409, { error: "Confirmation context is stale. Read the active canvas again." });
               return;
             }
-            if (body.filename.length > 160 || body.filename.includes("/") || body.filename.includes("\\")) {
-              sendJson(response, 400, { error: "Confirmation filename must be a basename." });
-              return;
+            const action = body.action as PendingConfirmation["action"];
+            if (action === "open_document") {
+              if (typeof body.filename !== "string" || body.filename.length > 160 || body.filename.includes("/") || body.filename.includes("\\")) {
+                sendJson(response, 400, { error: "Confirmation filename must be a basename." }); return;
+              }
+            } else if (typeof body.targetId !== "string" || body.targetId.length > 200
+              || !Number.isSafeInteger(body.expectedCatalogRevision) || (body.expectedCatalogRevision as number) < 0
+              || typeof body.idempotencyKey !== "string" || body.idempotencyKey.length < 1 || body.idempotencyKey.length > 200) {
+              sendJson(response, 400, { error: "Workspace deletion confirmation is invalid." }); return;
             }
             const token = randomUUID();
             const expiresAt = Date.now() + 120_000;
             confirmations.set(token, {
               token, clientId: activeClientId, clientIdentity: authenticated.clientIdentity, documentId: document.document.id,
-              expectedDocumentRevision: document.document.documentRevision, filename: body.filename,
+              expectedDocumentRevision: document.document.documentRevision, action,
+              ...(action === "open_document" ? { filename: body.filename as string } : {
+                targetId: body.targetId as string,
+                expectedCatalogRevision: body.expectedCatalogRevision as number, idempotencyKey: body.idempotencyKey as string,
+              }),
               fingerprint: body.fingerprint, expiresAt, decision: "pending",
             });
-            server.ws.send("draw:confirmation-required", { token, clientId: activeClientId, clientIdentity: authenticated.clientIdentity, action: "open_document", filename: body.filename, expiresAt });
+            server.ws.send("draw:confirmation-required", {
+              token, clientId: activeClientId, clientIdentity: authenticated.clientIdentity, action, expiresAt,
+              ...(action === "open_document" ? { filename: body.filename as string } : {
+                targetId: body.targetId as string, expectedCatalogRevision: body.expectedCatalogRevision as number,
+              }),
+            });
             sendJson(response, 202, { status: "NEEDS_CONFIRMATION", confirmationToken: token, expiresAt });
             return;
           }
@@ -617,7 +642,8 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
           const confirmationConsumeMatch = path.match(/^\/__draw\/api\/confirmations\/([^/]+)\/consume$/);
           if (request.method === "POST" && confirmationConsumeMatch) {
             const authenticated = await authenticatedMcpClient(request);
-            if (!authenticated) { sendJson(response, 401, { error: "MCP authentication is required." }); return; }
+            const authenticatedEditor = authenticated ? null : await authorizedEditor(request);
+            if (!authenticated && !authenticatedEditor) { sendJson(response, 401, { error: "MCP or active editor authentication is required." }); return; }
             const body = await readJsonBody(request, maxBodyBytes);
             const token = decodeURIComponent(confirmationConsumeMatch[1]);
             const confirmation = confirmations.get(token);
@@ -626,11 +652,21 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               sendJson(response, 200, { status: "EXPIRED" });
               return;
             }
-            if (confirmation.clientIdentity !== authenticated.clientIdentity) {
+            const suppliedClientIdentity = isRecord(body) ? body.clientIdentity : undefined;
+            if (confirmation.clientIdentity !== authenticated?.clientIdentity && confirmation.clientIdentity !== suppliedClientIdentity) {
               sendJson(response, 404, { status: "EXPIRED" });
               return;
             }
-            if (!isRecord(body) || confirmation.clientId !== activeClientId || body.action !== "open_document" || body.documentId !== confirmation.documentId || body.expectedDocumentRevision !== confirmation.expectedDocumentRevision || body.filename !== confirmation.filename || body.fingerprint !== confirmation.fingerprint || !document || document.document.id !== confirmation.documentId || document.document.documentRevision !== confirmation.expectedDocumentRevision) {
+            const workspaceConfirmation = confirmation.action === "delete_canvas" || confirmation.action === "delete_workspace";
+            const matchesWorkspace = workspaceConfirmation && isRecord(body)
+              && body.action === confirmation.action && body.targetId === confirmation.targetId
+              && body.expectedCatalogRevision === confirmation.expectedCatalogRevision && body.idempotencyKey === confirmation.idempotencyKey;
+            const matchesOpen = confirmation.action === "open_document" && isRecord(body)
+              && body.action === "open_document" && body.filename === confirmation.filename && body.fingerprint === confirmation.fingerprint;
+            if (!isRecord(body) || confirmation.clientId !== activeClientId || authenticatedEditor && authenticatedEditor.clientId !== confirmation.clientId
+              || body.clientId !== undefined && body.clientId !== confirmation.clientId
+              || body.documentId !== confirmation.documentId || body.expectedDocumentRevision !== confirmation.expectedDocumentRevision
+              || !(matchesWorkspace || matchesOpen) || !document || document.document.id !== confirmation.documentId || document.document.documentRevision !== confirmation.expectedDocumentRevision) {
               confirmations.delete(token);
               sendJson(response, 200, { status: "STALE" });
               return;
@@ -639,8 +675,22 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               sendJson(response, 200, { status: "PENDING" });
               return;
             }
-            confirmations.delete(token);
-            sendJson(response, 200, { status: confirmation.decision === "approved" ? "APPROVED" : "DENIED" });
+            if (confirmation.decision === "denied") {
+              confirmations.delete(token);
+              sendJson(response, 200, { status: "DENIED" });
+              return;
+            }
+            if (workspaceConfirmation) {
+              const idempotencyKey = body.idempotencyKey as string;
+              if (confirmation.consumedForIdempotencyKey && confirmation.consumedForIdempotencyKey !== idempotencyKey) {
+                sendJson(response, 200, { status: "STALE" }); return;
+              }
+              // Keep an approved deletion token replayable for the same durable
+              // intent until its short expiry. The IndexedDB receipt prevents
+              // the deletion from being applied twice after a lost ack.
+              confirmation.consumedForIdempotencyKey = idempotencyKey;
+            } else confirmations.delete(token);
+            sendJson(response, 200, { status: "APPROVED" });
             return;
           }
 
