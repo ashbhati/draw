@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { DrawAsset, DrawElement } from "../document/document";
-import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, shouldPersistLibraryChange } from "./draw-library";
+import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, reloadLibraryAfterConflict, shouldPersistLibraryChange } from "./draw-library";
 
 describe("Draw reusable library items", () => {
   it("captures selected elements with bound labels and preserves element relationships", () => {
@@ -38,6 +38,20 @@ describe("Draw reusable library items", () => {
     expect(shouldPersistLibraryChange(false, stale, saved)).toBe(false);
     expect(shouldPersistLibraryChange(true, saved, saved)).toBe(false);
     expect(shouldPersistLibraryChange(true, stale, saved)).toBe(true);
+  });
+
+  it("distinguishes a library conflict reload from a workspace deleted during reload", async () => {
+    const directConflict = new Error("The library changed.");
+    directConflict.name = "WorkspaceLibraryConflictError";
+    await expect(reloadLibraryAfterConflict(directConflict, async () => ({ revision: 3 }))).resolves.toEqual({ state: { revision: 3 } });
+    await expect(reloadLibraryAfterConflict(new Error("Workspace does not exist."), async () => ({ revision: 3 }))).resolves.toEqual({ deleted: true });
+    const conflict = new Error("A library changed elsewhere.");
+    conflict.name = "WorkspaceLibraryConflictError";
+    await expect(reloadLibraryAfterConflict(conflict, async () => { throw new Error("Workspace does not exist."); })).resolves.toEqual({ deleted: true });
+    const shouldNotReload = vi.fn(async () => ({ revision: 3 }));
+    await expect(reloadLibraryAfterConflict(new Error("Workspace does not exist."), shouldNotReload)).resolves.toEqual({ deleted: true });
+    expect(shouldNotReload).not.toHaveBeenCalled();
+    await expect(reloadLibraryAfterConflict(new Error("IndexedDB is unavailable."), async () => ({ revision: 3 }))).rejects.toThrow("IndexedDB is unavailable");
   });
 
   it("inserts independent copies with fresh IDs and remapped labels, bindings, and groups", () => {

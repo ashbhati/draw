@@ -27,7 +27,8 @@ const MCP_COMPACTION_INTERVAL = 32;
 const MAX_DOCUMENT_SNAPSHOTS = 100;
 export const MCP_WORKSPACE_RECEIPT_LIMIT = 1_000;
 const MCP_WORKSPACE_RECEIPT_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
-const MAX_LIBRARY_OPERATION_RECEIPTS = 10_000;
+const MAX_LIBRARY_OPERATION_RECEIPTS = 256;
+const LIBRARY_OPERATION_RECEIPT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 
 type AutosaveOrder = { sessionId: string; sequence: number };
 
@@ -561,7 +562,7 @@ export async function commitMcpWorkspaceOperation(request: McpWorkspaceOperation
   const db = await openDatabase();
   const receiptKey = JSON.stringify([request.clientIdentity, request.idempotencyKey]);
   return new Promise<McpWorkspaceOperationResult>((resolve, reject) => {
-    const stores = [WORKSPACES_STORE, CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE, MCP_WORKSPACE_OPERATIONS_STORE];
+    const stores = [WORKSPACES_STORE, CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE, WORKSPACE_LIBRARY_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE, MCP_WORKSPACE_OPERATIONS_STORE];
     const tx = db.transaction(stores, "readwrite");
     const workspaceStore = tx.objectStore(WORKSPACES_STORE);
     const canvasStore = tx.objectStore(CANVASES_STORE);
@@ -791,6 +792,7 @@ export async function commitMcpWorkspaceOperation(request: McpWorkspaceOperation
               if (!target) { abort(new Error("Workspace does not exist.")); break; }
               const deleted = canvases.filter((item) => item.workspaceId === target.id);
               workspaces = workspaces.filter((item) => item.id !== target.id); workspaceStore.delete(target.id);
+              tx.objectStore(WORKSPACE_LIBRARY_STORE).delete(target.id);
               canvases = canvases.filter((item) => item.workspaceId !== target.id);
               for (const canvas of deleted) {
                 canvasStore.delete(canvas.id); documents.delete(documentKey(canvas.documentId)); documents.delete(writeOrderKey(canvas.documentId));
@@ -873,6 +875,15 @@ export async function commitMcpWorkspaceOperation(request: McpWorkspaceOperation
 
 function libraryReceiptKey(clientIdentity: string, idempotencyKey: string): string {
   return JSON.stringify([clientIdentity, idempotencyKey]);
+}
+
+function compactLibraryReceiptResult(result: Record<string, unknown>): Record<string, unknown> {
+  const item = result.item && typeof result.item === "object" ? result.item as Partial<DrawLibraryItem> : undefined;
+  return {
+    ...(item?.id || typeof result.itemId === "string" ? { itemId: item?.id ?? result.itemId as string } : {}),
+    ...(item?.name || typeof result.itemName === "string" ? { itemName: item?.name ?? result.itemName as string } : {}),
+    ...Object.fromEntries(Object.entries(result).filter(([key]) => key !== "item" && key !== "itemId")),
+  };
 }
 
 function readStoredWorkspaceLibrary(value: unknown): StoredWorkspaceLibrary {
@@ -1022,10 +1033,13 @@ async function mutateWorkspaceLibrary(
         if (current.revision !== context.expectedRevision) throw new WorkspaceLibraryConflictError("The workspace library changed. Read its latest revision and retry.", "LIBRARY_REVISION_CONFLICT");
         const mutation = mutate(structuredClone(current.items));
         const nextRevision = mutation.changed ? current.revision + 1 : current.revision;
-        const nextResult = structuredClone({ ...mutation.result, libraryRevision: nextRevision });
+        const nextResult = structuredClone(compactLibraryReceiptResult({ ...mutation.result, libraryRevision: nextRevision }));
+        const completedAt = Date.now();
         const receipts = {
-          ...current.receipts,
-          [key]: { clientIdentity: context.clientIdentity, idempotencyKey: context.idempotencyKey, payloadHash: context.payloadHash, result: nextResult, revision: nextRevision, completedAt: Date.now() },
+          ...Object.fromEntries(Object.entries(current.receipts)
+            .filter(([, receipt]) => Number.isFinite(receipt?.completedAt) && receipt.completedAt >= completedAt - LIBRARY_OPERATION_RECEIPT_RETENTION_MS)
+            .map(([receiptKey, receipt]) => [receiptKey, { ...receipt, result: compactLibraryReceiptResult(receipt.result ?? {}) }])),
+          [key]: { clientIdentity: context.clientIdentity, idempotencyKey: context.idempotencyKey, payloadHash: context.payloadHash, result: nextResult, revision: nextRevision, completedAt },
         };
         const boundedReceipts = Object.fromEntries(Object.entries(receipts)
           .sort(([, left], [, right]) => left.completedAt - right.completedAt)

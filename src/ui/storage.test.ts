@@ -181,6 +181,40 @@ describe("local Draw autosave", () => {
     expect(receiptJson).not.toContain("human-only-element");
   });
 
+  it("atomically removes workspace library rows and receipts during an MCP workspace deletion", async () => {
+    await saveCurrentDocument(createEmptyDocument("Root"));
+    const initial = await getMcpWorkspaceCatalog();
+    const created = await commitMcpWorkspaceOperation({
+      clientIdentity: "agent-one", idempotencyKey: "workspace-with-library", payloadHash: "workspace-with-library-payload",
+      expectedCatalogRevision: initial.catalogRevision, action: { type: "create_workspace", name: "Library workspace" },
+    });
+    await addWorkspaceLibraryItem(created.activeWorkspaceId, {
+      id: "image-backed", created: 1, elements: [{ id: "image", type: "image", fileId: "private-asset" }],
+      assets: { "private-asset": { id: "private-asset", dataURL: "data:image/png;base64,SECRET_IMAGE" } },
+    } as any, { clientIdentity: "agent-one", idempotencyKey: "add-image", payloadHash: "add-image-payload", expectedRevision: 0 });
+
+    await commitMcpWorkspaceOperation({
+      clientIdentity: "agent-one", idempotencyKey: "delete-library-workspace", payloadHash: "delete-library-workspace-payload",
+      expectedCatalogRevision: (await getMcpWorkspaceCatalog()).catalogRevision,
+      action: { type: "delete_workspace", workspaceId: created.activeWorkspaceId },
+    });
+
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("draw-local");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      const tx = db.transaction("workspaceLibrary", "readonly");
+      const row = await new Promise<unknown>((resolve, reject) => {
+        const request = tx.objectStore("workspaceLibrary").get(created.activeWorkspaceId);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      expect(row).toBeUndefined();
+    } finally { db.close(); }
+  });
+
   it("removes workspace receipts that refer to deleted local drawings and bounds receipt retention", async () => {
     await saveCurrentDocument(createEmptyDocument("Root"));
     const initial = await getMcpWorkspaceCatalog();
@@ -443,6 +477,97 @@ describe("local Draw autosave", () => {
     expect(retry).toMatchObject({ result: first.result, revision: first.revision, replayed: true });
     await expect(addWorkspaceLibraryItem(workspace.id, { ...item, name: "Changed" }, { ...context, payloadHash: "payload-b" }))
       .rejects.toMatchObject({ code: "IDEMPOTENCY_KEY_REUSE" });
+  });
+
+  it("removes image payloads from library receipts after deleting their item", async () => {
+    const workspace = await createWorkspace("Receipt cleanup");
+    const item = {
+      id: "sensitive-image-item", created: 1, elements: [{ id: "photo", type: "image", fileId: "private-asset" }],
+      assets: { "private-asset": { id: "private-asset", dataURL: "data:image/png;base64,PRIVATE_LIBRARY_IMAGE" } },
+    } as any;
+    const added = await addWorkspaceLibraryItem(workspace.id, item, { clientIdentity: "agent", idempotencyKey: "add-photo", payloadHash: "photo-add", expectedRevision: 0 });
+    await deleteWorkspaceLibraryItem(workspace.id, item.id, { clientIdentity: "agent", idempotencyKey: "delete-photo", payloadHash: "photo-delete", expectedRevision: 1 });
+
+    const state = await loadWorkspaceLibraryState(workspace.id);
+    expect(state.items).toEqual([]);
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("draw-local");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      const tx = db.transaction("workspaceLibrary", "readonly");
+      const row = await new Promise<any>((resolve, reject) => {
+        const request = tx.objectStore("workspaceLibrary").get(workspace.id);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const serialized = JSON.stringify(row);
+      expect(serialized).not.toContain("PRIVATE_LIBRARY_IMAGE");
+      expect(serialized).not.toContain('"item":');
+      expect(row.receipts[JSON.stringify(["agent", "add-photo"])].result).toMatchObject({ itemId: item.id, libraryRevision: 1 });
+      expect(Object.keys(row.receipts).length).toBeLessThanOrEqual(256);
+    } finally { db.close(); }
+    const replay = await addWorkspaceLibraryItem(workspace.id, item, { clientIdentity: "agent", idempotencyKey: "add-photo", payloadHash: "photo-add", expectedRevision: 0 });
+    expect(replay).toMatchObject({ result: added.result, replayed: true });
+  });
+
+  it("expires old library receipts and caps retained retry metadata", async () => {
+    const workspace = await createWorkspace("Bounded receipts");
+    const item = { id: "small-item", created: 1, name: "Stable", elements: [{ id: "shape", type: "rectangle" }], assets: {} } as any;
+    await saveWorkspaceLibrary(workspace.id, [item], 0);
+    for (let index = 0; index < 260; index += 1) {
+      await renameWorkspaceLibraryItem(workspace.id, item.id, "Stable", {
+        clientIdentity: "agent", idempotencyKey: `receipt-${index}`, payloadHash: `payload-${index}`, expectedRevision: 1,
+      });
+    }
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("draw-local");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      const tx = db.transaction("workspaceLibrary", "readwrite");
+      const store = tx.objectStore("workspaceLibrary");
+      const row = await new Promise<any>((resolve, reject) => {
+        const request = store.get(workspace.id);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      row.receipts[JSON.stringify(["agent", "expired"])] = {
+        clientIdentity: "agent", idempotencyKey: "expired", payloadHash: "expired", result: { renamed: true }, revision: 1,
+        completedAt: Date.now() - 100 * 24 * 60 * 60 * 1000,
+      };
+      row.receipts[JSON.stringify(["agent", "legacy-content"])] = {
+        clientIdentity: "agent", idempotencyKey: "legacy-content", payloadHash: "legacy-content", revision: 1,
+        result: { item: { id: "legacy-item", elements: [], assets: { photo: { dataURL: "data:image/png;base64,OLD_SECRET" } } } }, completedAt: Date.now(),
+      };
+      store.put(row, workspace.id);
+      await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); });
+    } finally { db.close(); }
+    await renameWorkspaceLibraryItem(workspace.id, item.id, "Stable", {
+      clientIdentity: "agent", idempotencyKey: "trigger-prune", payloadHash: "trigger-prune", expectedRevision: 1,
+    });
+    const state = await loadWorkspaceLibraryState(workspace.id);
+    expect(state.items).toMatchObject([{ id: "small-item", name: "Stable" }]);
+    const inspectDb = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("draw-local");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      const tx = inspectDb.transaction("workspaceLibrary", "readonly");
+      const row = await new Promise<any>((resolve, reject) => {
+        const request = tx.objectStore("workspaceLibrary").get(workspace.id);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      expect(Object.keys(row.receipts)).toHaveLength(256);
+      expect(row.receipts[JSON.stringify(["agent", "expired"])]).toBeUndefined();
+      expect(row.receipts[JSON.stringify(["agent", "receipt-0"])]).toBeUndefined();
+      expect(JSON.stringify(row)).not.toContain("OLD_SECRET");
+      expect(row.receipts[JSON.stringify(["agent", "legacy-content"])].result).toMatchObject({ itemId: "legacy-item" });
+    } finally { inspectDb.close(); }
   });
 
   it("uses a library revision compare-and-swap so concurrent stale renames conflict", async () => {

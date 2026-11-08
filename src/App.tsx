@@ -14,7 +14,7 @@ import { isSafeHttpsUrl } from "./document/attribution";
 import { composeBackgroundSvg, hasSelectedExportElements, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorForBackgroundPreset } from "./export/background-recolor";
 import { addWorkspaceLibraryItem, saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createCanvas, duplicateCanvas, deleteCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, listCanvases, listWorkspaces, loadCanvasDocument, loadWorkspaceLibrary, loadWorkspaceLibraryState, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, saveWorkspaceLibrary, setActiveCanvas, type DrawCanvas, type DrawLibraryItem, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
-import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, shouldPersistLibraryChange } from "./ui/draw-library";
+import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, reloadLibraryAfterConflict, shouldPersistLibraryChange } from "./ui/draw-library";
 import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
 import { createDebouncedSaver } from "./ui/autosave";
@@ -290,12 +290,30 @@ export default function App() {
       setLibraryItems(saved.items);
     } catch (error) {
       if (activeWorkspaceIdRef.current !== workspaceId) return;
-      const latest = await loadWorkspaceLibraryState(workspaceId);
-      libraryRevisionRef.current = latest.revision;
-      libraryItemsRef.current = latest.items;
-      setLibraryItems(latest.items);
-      if (apiRef.current) await apiRef.current.updateLibrary({ libraryItems: latest.items as unknown as LibraryItems, merge: false, prompt: false });
-      if (error instanceof Error && error.name !== "WorkspaceLibraryConflictError") throw error;
+      if (!(error instanceof Error)) throw error;
+      try {
+        const recovery = await reloadLibraryAfterConflict(error, () => loadWorkspaceLibraryState(workspaceId));
+        if (activeWorkspaceIdRef.current !== workspaceId) return;
+        if ("deleted" in recovery) {
+          libraryRevisionRef.current = 0;
+          libraryItemsRef.current = [];
+          setLibraryItems([]);
+          setLibraryManagerOpen(false);
+          setStatus("error");
+          setMessage("This workspace was deleted while its library was being edited. Choose an existing workspace to continue.");
+          return;
+        }
+        const latest = recovery.state;
+        libraryRevisionRef.current = latest.revision;
+        libraryItemsRef.current = latest.items;
+        setLibraryItems(latest.items);
+        if (apiRef.current) await apiRef.current.updateLibrary({ libraryItems: latest.items as unknown as LibraryItems, merge: false, prompt: false });
+        setStatus("error");
+        setMessage("The library changed in another tab or by an agent; your last library edit was not saved. The latest saved library is loaded; reapply your edit if needed.");
+      } catch (reloadError) {
+        if (activeWorkspaceIdRef.current !== workspaceId) return;
+        throw reloadError;
+      }
     }
   }, []);
 

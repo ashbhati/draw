@@ -64,6 +64,17 @@ export function shouldPersistLibraryChange(
   return writerOwned && !libraryItemsEquivalentForPersistence(previous, next);
 }
 
+export async function reloadLibraryAfterConflict<T>(saveError: unknown, loadLatest: () => Promise<T>): Promise<{ state: T } | { deleted: true }> {
+  if (!(saveError instanceof Error)) throw saveError;
+  if (/workspace does not exist/i.test(saveError.message)) return { deleted: true };
+  if (saveError.name !== "WorkspaceLibraryConflictError") throw saveError;
+  try { return { state: await loadLatest() }; }
+  catch (error) {
+    if (error instanceof Error && /workspace does not exist/i.test(error.message)) return { deleted: true };
+    throw error;
+  }
+}
+
 export function cloneLibraryElements<T extends DrawElement>(elements: readonly T[], createId: () => string, offset = 24): T[] {
   const idMap = new Map(elements.map((element) => [element.id, createId()]));
   const groupMap = new Map<string, string>();
