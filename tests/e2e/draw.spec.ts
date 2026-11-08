@@ -73,7 +73,7 @@ async function startStdioMcp(baseURL: string, documentDir: string, pairingSecret
   return {
     request,
     call: async (name: string, args: Record<string, unknown>) => {
-      const durableMutation = ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "undo_operation", "redo_operation", "set_canvas_settings", "set_viewport"].includes(name);
+      const durableMutation = ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "undo_operation", "redo_operation", "set_canvas_settings", "set_viewport", "insert_workspace_library_item"].includes(name);
       const argumentsWithKey = durableMutation && typeof args.idempotencyKey !== "string" ? { ...args, idempotencyKey: `e2e-${crypto.randomUUID()}` } : args;
       try { return await request("tools/call", { name, arguments: argumentsWithKey }); }
       catch (error) { throw new Error(`MCP tool ${name} failed: ${error instanceof Error ? error.message : String(error)}`); }
@@ -1003,6 +1003,55 @@ test("a second tab is read-only while the first tab owns local autosave", async 
   await expect(secondTab.getByText(/reload this tab to edit/i)).toBeVisible();
   await expect(secondTab.getByLabel("Drawing title")).toBeDisabled();
   await expect(secondTab.getByRole("button", { name: "Whiteboard", exact: true })).toBeDisabled();
+});
+
+test("a mounted read-only tab with an older library view cannot clear a newer library item", async ({ page }) => {
+  const staleTab = await page.context().newPage();
+  await staleTab.goto("/");
+  await staleTab.locator(".excalidraw canvas").first().waitFor();
+  await expect(staleTab.getByText(/reload this tab to edit/i)).toBeVisible();
+  await expect(staleTab.getByRole("button", { name: "Manage library (0)" })).toBeDisabled();
+
+  const createdResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
+    operation: "create_diagram",
+    input: { idempotencyKey: "readonly-library-create", nodes: [{ id: "readonly-library-node", label: "Persisted from writer", x: 100, y: 100 }], edges: [] },
+  } });
+  expect(createdResponse.ok(), await createdResponse.text()).toBeTruthy();
+  const created = await createdResponse.json();
+  const current = await freshBridgeDocument(page);
+  const emptyListResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: { operation: "list_workspace_library", input: { documentId: current.document.id } } });
+  expect(emptyListResponse.ok(), await emptyListResponse.text()).toBeTruthy();
+  const emptyList = await emptyListResponse.json();
+  const addedResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
+    operation: "add_selection_to_workspace_library",
+    input: {
+      documentId: current.document.id, expectedDocumentRevision: current.document.documentRevision,
+      expectedLibraryRevision: emptyList.result.libraryRevision, idempotencyKey: "readonly-library-add",
+      itemId: "readonly-library-item", elementIds: [created.result.nodes["readonly-library-node"]], name: "Writer's new item",
+    },
+  } });
+  expect(addedResponse.ok(), await addedResponse.text()).toBeTruthy();
+
+  await expect(staleTab.getByRole("button", { name: "Manage library (0)" })).toBeDisabled();
+  await staleTab.waitForTimeout(150);
+  const storedLibrary = await staleTab.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("draw-local");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      const transaction = db.transaction("workspaceLibrary", "readonly");
+      const records = await new Promise<any[]>((resolve, reject) => {
+        const request = transaction.objectStore("workspaceLibrary").getAll();
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      return records.flatMap((record) => Array.isArray(record) ? record : record.items ?? []);
+    } finally { db.close(); }
+  });
+  expect(storedLibrary).toContainEqual(expect.objectContaining({ id: "readonly-library-item", name: "Writer's new item" }));
+  await staleTab.close();
 });
 
 test("title edits flush to IndexedDB on pagehide and survive reload", async ({ page }) => {
@@ -2451,6 +2500,7 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
       "create_diagram", "update_elements", "delete_elements", "duplicate_elements", "set_selection",
       "group_elements", "ungroup_elements", "arrange_elements", "undo_operation", "redo_operation",
       "set_canvas_settings", "set_viewport", "open_document", "save_document", "export_image",
+      "list_workspace_library", "read_workspace_library_item", "add_selection_to_workspace_library", "rename_workspace_library_item", "delete_workspace_library_item", "insert_workspace_library_item",
     ]));
 
     const initial = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
@@ -2466,8 +2516,64 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
     expect(snapshot.documentId).toBeTruthy();
     expect(snapshot.elements.some((element: any) => element.id === created.nodes.first)).toBe(true);
 
-    const selectResponse = await mcp.call("set_selection", { documentId: snapshot.documentId, ids: [created.nodes.first, created.nodes.second] });
+    const selectResponse = await mcp.call("set_selection", { documentId: snapshot.documentId, expectedDocumentRevision: snapshot.documentRevision, idempotencyKey: "stdio-library-select", ids: [created.nodes.first, created.nodes.second] });
     expect(selectResponse.error).toBeUndefined();
+    const emptyLibrary = JSON.parse((await mcp.call("list_workspace_library", { documentId: snapshot.documentId })).result.content[0].text);
+    const addContext = { itemId: "stdio-workspace-item", elementIds: [created.nodes.first, created.nodes.second], name: "MCP reusable pair", documentId: snapshot.documentId, expectedDocumentRevision: snapshot.documentRevision, expectedLibraryRevision: emptyLibrary.libraryRevision, idempotencyKey: "stdio-library-add" };
+    const libraryAdded = await mcp.call("add_selection_to_workspace_library", addContext);
+    expect(libraryAdded.error).toBeUndefined();
+    const libraryAddResult = JSON.parse(libraryAdded.result.content[0].text);
+    const libraryAddRetry = await mcp.call("add_selection_to_workspace_library", addContext);
+    expect(JSON.parse(libraryAddRetry.result.content[0].text)).toEqual(libraryAddResult);
+    const changedAdd = await mcp.call("add_selection_to_workspace_library", { ...addContext, name: "Changed payload" });
+    expect(changedAdd.result?.isError ?? changedAdd.error !== undefined).toBeTruthy();
+    const libraryList = JSON.parse((await mcp.call("list_workspace_library", { documentId: snapshot.documentId })).result.content[0].text);
+    expect(libraryList.items).toEqual([expect.objectContaining({ id: "stdio-workspace-item", name: "MCP reusable pair", elementCount: 4 })]);
+    const unchangedAddRetry = await mcp.call("add_selection_to_workspace_library", { ...addContext, name: "Changed payload" });
+    expect(unchangedAddRetry.result?.isError ?? unchangedAddRetry.error !== undefined).toBeTruthy();
+    expect(JSON.parse((await mcp.call("list_workspace_library", { documentId: snapshot.documentId })).result.content[0].text).libraryRevision).toBe(libraryList.libraryRevision);
+    const libraryRead = JSON.parse((await mcp.call("read_workspace_library_item", { documentId: snapshot.documentId, itemId: "stdio-workspace-item" })).result.content[0].text);
+    expect(libraryRead.item.assets).toEqual({});
+    let libraryContext = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const renameContext = { itemId: "stdio-workspace-item", name: "MCP flow library item", documentId: libraryContext.documentId, expectedDocumentRevision: libraryContext.documentRevision, expectedLibraryRevision: libraryList.libraryRevision, idempotencyKey: "stdio-library-rename" };
+    const renamed = await mcp.call("rename_workspace_library_item", renameContext);
+    expect(renamed.error).toBeUndefined();
+    const renameResult = JSON.parse(renamed.result.content[0].text);
+    const renameRetry = await mcp.call("rename_workspace_library_item", renameContext);
+    expect(JSON.parse(renameRetry.result.content[0].text)).toEqual(renameResult);
+    const changedRename = await mcp.call("rename_workspace_library_item", { ...renameContext, name: "Changed name" });
+    expect(changedRename.result?.isError ?? changedRename.error !== undefined).toBeTruthy();
+    const currentLibrary = JSON.parse((await mcp.call("list_workspace_library", { documentId: libraryContext.documentId })).result.content[0].text);
+    const raceBase = { itemId: "stdio-workspace-item", documentId: libraryContext.documentId, expectedDocumentRevision: libraryContext.documentRevision, expectedLibraryRevision: currentLibrary.libraryRevision };
+    const renameRace = await Promise.all([
+      mcp.call("rename_workspace_library_item", { ...raceBase, name: "Concurrent A", idempotencyKey: "stdio-library-race-a" }),
+      mcp.call("rename_workspace_library_item", { ...raceBase, name: "Concurrent B", idempotencyKey: "stdio-library-race-b" }),
+    ]);
+    expect(renameRace.filter((response) => response.error || response.result?.isError)).toHaveLength(1);
+    libraryContext = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const insertedResponse = await mcp.call("insert_workspace_library_item", { itemId: "stdio-workspace-item", documentId: libraryContext.documentId, expectedDocumentRevision: libraryContext.documentRevision, idempotencyKey: "stdio-library-insert" });
+    expect(insertedResponse.error).toBeUndefined();
+    const insertedLibrary = JSON.parse(insertedResponse.result.content[0].text);
+    expect(insertedLibrary.addedElementIds).toHaveLength(4);
+    expect(new Set(insertedLibrary.addedElementIds).size).toBe(4);
+    libraryContext = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const libraryCopyEdit = await mcp.call("update_elements", { documentId: libraryContext.documentId, expectedDocumentRevision: libraryContext.documentRevision, updates: [{ id: insertedLibrary.addedElementIds.find((id: string) => libraryContext.elements.find((element: any) => element.id === id)?.type === "text"), patch: { text: "Edited library copy" } }] });
+    expect(libraryCopyEdit.error).toBeUndefined();
+    libraryContext = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    expect(libraryContext.elements.some((element: any) => element.originalText === "Edited library copy")).toBe(true);
+    const libraryBeforeDelete = JSON.parse((await mcp.call("list_workspace_library", { documentId: libraryContext.documentId })).result.content[0].text);
+    const deleteContext = { itemId: "stdio-workspace-item", documentId: libraryContext.documentId, expectedDocumentRevision: libraryContext.documentRevision, expectedLibraryRevision: libraryBeforeDelete.libraryRevision, idempotencyKey: "stdio-library-delete" };
+    const deleteChallenge = await mcp.call("delete_workspace_library_item", deleteContext);
+    const deletionApproval = JSON.parse(deleteChallenge.result.content[0].text);
+    expect(deletionApproval.status).toBe("NEEDS_CONFIRMATION");
+    await expect(page.getByRole("dialog", { name: "Delete a library item?" })).toBeVisible();
+    await page.getByRole("button", { name: "Approve deletion" }).click();
+    const libraryRemoved = await mcp.call("delete_workspace_library_item", { ...deleteContext, confirmationToken: deletionApproval.confirmationToken });
+    expect(libraryRemoved.error).toBeUndefined();
+    const deletedResult = JSON.parse(libraryRemoved.result.content[0].text);
+    const deleteRetry = await mcp.call("delete_workspace_library_item", { ...deleteContext, confirmationToken: deletionApproval.confirmationToken });
+    expect(JSON.parse(deleteRetry.result.content[0].text)).toEqual(deletedResult);
+    expect(JSON.parse((await mcp.call("list_workspace_library", { documentId: libraryContext.documentId })).result.content[0].text).items).toEqual([]);
     let live = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
     const group = await mcp.call("group_elements", { documentId: live.documentId, expectedDocumentRevision: live.documentRevision, ids: [created.nodes.first, created.nodes.second] });
     expect(group.error).toBeUndefined();
@@ -2659,6 +2765,10 @@ test("pending autosave is discarded safely when switching or deleting a canvas",
   const startY = box.y + box.height / 2 - 30;
   await page.mouse.move(startX, startY);
   await page.mouse.down(); await page.mouse.move(startX + 140, startY + 100, { steps: 2 }); await page.mouse.up();
+  // Confirm Excalidraw accepted the human drag and queued its debounced save
+  // before switching. This keeps a slow CI render from switching on mouseup
+  // before the editor has committed the newly drawn rectangle to React state.
+  await expect(page.locator(".save-indicator.saving")).toBeVisible();
   await canvasPicker.selectOption(firstCanvasId);
   await expect(page.getByText("Saved on this device")).toBeVisible();
   await expect(page.getByText(/reload the page to continue/i)).toHaveCount(0);
@@ -2923,4 +3033,193 @@ test("stdio MCP manages stable workspaces and canvases with durable replay, safe
     await mcp?.close();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("stdio MCP library follows the active workspace across A to B and back", async ({ page, baseURL }) => {
+  if (!baseURL) throw new Error("Playwright baseURL is required for the workspace-library integration test.");
+  const directory = await mkdtemp(join(tmpdir(), "draw-e2e-workspace-library-switch-"));
+  const mcp = await startStdioMcp(baseURL, directory);
+  try {
+    const result = async (response: any) => {
+      expect(response.error, JSON.stringify(response.error)).toBeUndefined();
+      expect(response.result?.isError, response.result?.content?.[0]?.text).not.toBe(true);
+      return JSON.parse(response.result.content[0].text);
+    };
+    const aCatalog = await result(await mcp.call("list_workspaces", {}));
+    const aDocument = await result(await mcp.call("get_current_canvas", {}));
+    const aDiagram = await result(await mcp.call("create_diagram", {
+      documentId: aDocument.documentId, expectedDocumentRevision: aDocument.documentRevision,
+      idempotencyKey: "workspace-a-library-node", nodes: [{ id: "node-a", label: "Project A item", x: 100, y: 100 }], edges: [],
+    }));
+    const aAfterCreate = await result(await mcp.call("get_current_canvas", {}));
+    const aLibrary = await result(await mcp.call("list_workspace_library", { documentId: aAfterCreate.documentId }));
+    await result(await mcp.call("add_selection_to_workspace_library", {
+      documentId: aAfterCreate.documentId, expectedDocumentRevision: aAfterCreate.documentRevision,
+      expectedLibraryRevision: aLibrary.libraryRevision, idempotencyKey: "workspace-a-library-add",
+      itemId: "workspace-a-item", elementIds: [aDiagram.nodes["node-a"]], name: "Project A library item",
+    }));
+
+    const b = await result(await mcp.call("create_workspace", {
+      expectedCatalogRevision: aCatalog.catalogRevision, idempotencyKey: "workspace-b-create", name: "Project B",
+    }));
+    const bDocument = await result(await mcp.call("get_current_canvas", {}));
+    const bEmpty = await result(await mcp.call("list_workspace_library", { documentId: bDocument.documentId }));
+    expect(bEmpty.workspaceId).toBe(b.activeWorkspaceId);
+    expect(bEmpty.items).toEqual([]);
+    await expect(page.getByRole("button", { name: "Manage library (0)" })).toBeVisible();
+
+    const bDiagram = await result(await mcp.call("create_diagram", {
+      documentId: bDocument.documentId, expectedDocumentRevision: bDocument.documentRevision,
+      idempotencyKey: "workspace-b-library-node", nodes: [{ id: "node-b", label: "Project B item", x: 120, y: 120 }], edges: [],
+    }));
+    const bAfterCreate = await result(await mcp.call("get_current_canvas", {}));
+    const bLibrary = await result(await mcp.call("list_workspace_library", { documentId: bAfterCreate.documentId }));
+    await result(await mcp.call("add_selection_to_workspace_library", {
+      documentId: bAfterCreate.documentId, expectedDocumentRevision: bAfterCreate.documentRevision,
+      expectedLibraryRevision: bLibrary.libraryRevision, idempotencyKey: "workspace-b-library-add",
+      itemId: "workspace-b-item", elementIds: [bDiagram.nodes["node-b"]], name: "Project B library item",
+    }));
+    expect((await result(await mcp.call("list_workspace_library", { documentId: bAfterCreate.documentId }))).items)
+      .toEqual([expect.objectContaining({ id: "workspace-b-item", name: "Project B library item" })]);
+
+    const beforeSelectA = await result(await mcp.call("list_workspaces", {}));
+    const restoredA = await result(await mcp.call("select_workspace", {
+      expectedCatalogRevision: beforeSelectA.catalogRevision, idempotencyKey: "workspace-a-select", workspaceId: aCatalog.activeWorkspaceId,
+    }));
+    const restoredDocument = await result(await mcp.call("get_current_canvas", {}));
+    expect(restoredDocument.documentId).toBe(restoredA.activeDocument.document.id);
+    const restoredLibrary = await result(await mcp.call("list_workspace_library", { documentId: restoredDocument.documentId }));
+    expect(restoredLibrary.workspaceId).toBe(aCatalog.activeWorkspaceId);
+    expect(restoredLibrary.items).toEqual([expect.objectContaining({ id: "workspace-a-item", name: "Project A library item" })]);
+    const wrongWorkspaceInsert = await mcp.call("insert_workspace_library_item", {
+      documentId: restoredDocument.documentId, expectedDocumentRevision: restoredDocument.documentRevision,
+      idempotencyKey: "wrong-project-insert", itemId: "workspace-b-item",
+    });
+    expect(wrongWorkspaceInsert.result?.isError ?? wrongWorkspaceInsert.error !== undefined).toBeTruthy();
+    const latestA = await result(await mcp.call("get_current_canvas", {}));
+    await result(await mcp.call("insert_workspace_library_item", {
+      documentId: latestA.documentId, expectedDocumentRevision: latestA.documentRevision,
+      idempotencyKey: "right-project-insert", itemId: "workspace-a-item",
+    }));
+    await expect(page.getByRole("button", { name: "Manage library (1)" })).toBeVisible();
+    await page.getByRole("button", { name: "Manage library (1)" }).click();
+    await expect(page.getByRole("dialog", { name: "Workspace library" })).toContainText("Project A library item");
+    await expect(page.getByRole("dialog", { name: "Workspace library" })).not.toContainText("Project B library item");
+  } finally {
+    await mcp.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("library conflicts show a library notice without changing the saved document status", async ({ page, baseURL }) => {
+  if (!baseURL) throw new Error("Playwright baseURL is required for the library conflict test.");
+  const directory = await mkdtemp(join(tmpdir(), "draw-e2e-library-conflict-status-"));
+  const mcp = await startStdioMcp(baseURL, directory);
+  try {
+    const result = async (response: any) => {
+      expect(response.error, JSON.stringify(response.error)).toBeUndefined();
+      expect(response.result?.isError, response.result?.content?.[0]?.text).not.toBe(true);
+      return JSON.parse(response.result.content[0].text);
+    };
+    let current = await result(await mcp.call("get_current_canvas", { offset: 0, limit: 250 }));
+    const created = await result(await mcp.call("create_diagram", {
+      documentId: current.documentId, expectedDocumentRevision: current.documentRevision,
+      idempotencyKey: "conflict-status-create", nodes: [{ id: "conflict-node", label: "Conflict test", x: 140, y: 120 }], edges: [],
+    }));
+    current = await result(await mcp.call("get_current_canvas", { offset: 0, limit: 250 }));
+    expect(Number.isSafeInteger(current.documentRevision), JSON.stringify(current)).toBe(true);
+    let library = await result(await mcp.call("list_workspace_library", { documentId: current.documentId }));
+    await result(await mcp.call("add_selection_to_workspace_library", {
+      documentId: current.documentId, expectedDocumentRevision: current.documentRevision,
+      expectedLibraryRevision: library.libraryRevision, idempotencyKey: "conflict-status-seed",
+      itemId: "conflict-status-seed", elementIds: [created.nodes["conflict-node"]], name: "Initial item",
+    }));
+    current = await result(await mcp.call("get_current_canvas", { offset: 0, limit: 250 }));
+    expect(Number.isSafeInteger(current.documentRevision), JSON.stringify(current)).toBe(true);
+    const catalog = await result(await mcp.call("list_workspaces", {}));
+    await page.evaluate(async ({ workspaceId }) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open("draw-local");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      try {
+        const tx = db.transaction("workspaceLibrary", "readwrite");
+        const store = tx.objectStore("workspaceLibrary");
+        const row = await new Promise<any>((resolve, reject) => {
+          const request = store.get(workspaceId);
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+        row.items.push({ id: "agent-added-item", created: Date.now(), name: "Agent item", elements: [{ id: "agent-shape", type: "rectangle" }], assets: {} });
+        row.revision += 1;
+        store.put(row, workspaceId);
+        await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); });
+      } finally { db.close(); }
+    }, { workspaceId: catalog.activeWorkspaceId });
+
+    const selected = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
+      operation: "set_selection", input: {
+        documentId: current.documentId, expectedDocumentRevision: current.documentRevision,
+        idempotencyKey: "conflict-status-selection", ids: [created.nodes["conflict-node"]],
+      },
+    } });
+    expect(selected.ok(), await selected.text()).toBeTruthy();
+    await page.getByRole("button", { name: "Add selection to library" }).click();
+    await expect(page.getByText(/Could not save the library item: The workspace library changed/i)).toBeVisible();
+    await expect(page.locator(".save-indicator")).toHaveText("Saved on this device");
+  } finally {
+    await mcp.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("workspace library items add with labels, persist, insert as editable elements, and can be renamed and removed", async ({ page }) => {
+  const createdResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
+    operation: "create_diagram",
+    input: { idempotencyKey: "e2e-library-create-flow", nodes: [{ id: "library-source", label: "Reusable step", x: 120, y: 120 }], edges: [] },
+  } });
+  expect(createdResponse.ok(), await createdResponse.text()).toBeTruthy();
+  const created = await createdResponse.json();
+  const sourceShapeId = created.result.nodes["library-source"];
+  const current = await freshBridgeDocument(page);
+  const selectedResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
+    operation: "set_selection",
+    input: { idempotencyKey: "e2e-library-select-source", documentId: current.document.id, expectedDocumentRevision: current.document.documentRevision, ids: [sourceShapeId] },
+  } });
+  expect(selectedResponse.ok(), await selectedResponse.text()).toBeTruthy();
+  await expect.poll(async () => (await freshBridgeDocument(page)).document.appState.selectedElementIds?.[sourceShapeId]).toBe(true);
+  await page.getByRole("button", { name: "Add selection to library" }).click();
+  const manager = page.getByRole("dialog", { name: "Workspace library" });
+  await expect(manager).toBeVisible();
+  await expect(manager.getByText("Reusable item 1")).toBeVisible();
+  await expect(manager.getByText("2 elements")).toBeVisible();
+  page.once("dialog", (dialog) => dialog.accept("Evaluation node"));
+  await manager.getByRole("button", { name: "Rename" }).click();
+  await expect(manager.getByText("Evaluation node")).toBeVisible();
+  await manager.getByRole("button", { name: "Close" }).click();
+  await page.reload();
+  await page.locator(".topbar").waitFor();
+  await page.getByRole("button", { name: "Manage library (1)" }).click();
+  const reloadedManager = page.getByRole("dialog", { name: "Workspace library" });
+  await expect(reloadedManager.getByText("Evaluation node")).toBeVisible();
+  await reloadedManager.getByRole("button", { name: "Close" }).click();
+
+  await page.getByRole("button", { name: "Manage library (1)" }).click();
+  const insertManager = page.getByRole("dialog", { name: "Workspace library" });
+  await insertManager.getByRole("button", { name: "Insert" }).click();
+  await expect(insertManager).toBeHidden();
+  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.filter((element: any) => element.type === "rectangle")).toHaveLength(2);
+  await page.reload();
+  await page.locator(".topbar").waitFor();
+  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.filter((element: any) => element.type === "rectangle")).toHaveLength(2);
+  const persistedInsert = await readLocalDocument(page);
+  const inserted = persistedInsert.document.elements.find((element: any) => element.type === "text" && element.originalText === "Reusable step" && element.id !== created.result.nodeLabels["library-source"]);
+  expect(inserted).toBeTruthy();
+  expect(persistedInsert.document.elements.some((element: any) => element.id === inserted.id && element.containerId !== created.result.nodes["library-source"])).toBe(true);
+
+  await page.getByRole("button", { name: "Manage library (1)" }).click();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("dialog", { name: "Workspace library" }).getByRole("button", { name: "Remove" }).click();
+  await expect(page.getByRole("button", { name: "Manage library (0)" })).toBeVisible();
 });

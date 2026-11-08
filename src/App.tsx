@@ -1,5 +1,5 @@
 import { CaptureUpdateAction, Excalidraw, FONT_FAMILY, MainMenu, convertToExcalidrawElements, exportToSvg } from "@excalidraw/excalidraw";
-import type { ExcalidrawImperativeAPI, ExcalidrawInitialDataState } from "@excalidraw/excalidraw/types";
+import type { ExcalidrawImperativeAPI, ExcalidrawInitialDataState, LibraryItems } from "@excalidraw/excalidraw/types";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   createEmptyDocument,
@@ -13,7 +13,8 @@ import {
 import { isSafeHttpsUrl } from "./document/attribution";
 import { composeBackgroundSvg, hasSelectedExportElements, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorForBackgroundPreset } from "./export/background-recolor";
-import { saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createCanvas, duplicateCanvas, deleteCanvas, deleteWorkspace, listCanvases, listWorkspaces, loadCanvasDocument, renameCanvas, renameWorkspace, setActiveCanvas, type DrawCanvas, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
+import { addWorkspaceLibraryItem, saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createCanvas, duplicateCanvas, deleteCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, listCanvases, listWorkspaces, loadCanvasDocument, loadWorkspaceLibrary, loadWorkspaceLibraryState, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, saveWorkspaceLibrary, setActiveCanvas, type DrawCanvas, type DrawLibraryItem, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
+import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, reloadLibraryAfterConflict, resolveLibraryWorkspaceFromCatalog, shouldPersistLibraryChange } from "./ui/draw-library";
 import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
 import { createDebouncedSaver } from "./ui/autosave";
@@ -33,7 +34,7 @@ type Status = "loading" | "ready" | "saving" | "saved" | "error";
 type BridgeCommand = { id: string; clientId: string; clientIdentity: string; operation: string; input: any; document?: DrawDocument };
 type BridgeFlush = { id: string; clientId: string; clientIdentity: string };
 type BridgeConfirmation = {
-  token: string; clientId: string; clientIdentity: string; action: "open_document" | "delete_canvas" | "delete_workspace";
+  token: string; clientId: string; clientIdentity: string; action: "open_document" | "delete_canvas" | "delete_workspace" | "delete_library_item";
   filename?: string; targetId?: string; targetName?: string; workspaceName?: string; canvasCount?: number; expectedCatalogRevision?: number; expiresAt: number;
 };
 type McpPairingRequest = { requestId: string; clientId: string; name: string; fingerprint: string; expiresAt: number; replacesName?: string };
@@ -137,6 +138,8 @@ export default function App() {
   const [canvases, setCanvases] = useState<DrawCanvas[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState("");
   const [activeCanvasId, setActiveCanvasId] = useState("");
+  const [libraryItems, setLibraryItems] = useState<DrawLibraryItem[]>([]);
+  const [libraryManagerOpen, setLibraryManagerOpen] = useState(false);
   const [status, setStatus] = useState<Status>("loading");
   const [message, setMessage] = useState("");
   const [confirmation, setConfirmation] = useState<BridgeConfirmation | null>(null);
@@ -169,6 +172,9 @@ export default function App() {
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
   const docRef = useRef<DrawDocument | null>(null);
   const activeDocumentIdRef = useRef<string | null>(null);
+  const activeWorkspaceIdRef = useRef("");
+  const libraryItemsRef = useRef<DrawLibraryItem[]>([]);
+  const libraryRevisionRef = useRef(0);
   const clientId = useRef(randomId());
   const revokedMcpCommandIds = useRef(new Set<string>());
   const completedMcpCommandIds = useRef(new Set<string>());
@@ -254,6 +260,167 @@ export default function App() {
       if (scene.files?.[fileId]) trustedAttributions[fileId] = { ...attribution, verification: "openverse-index" };
     }
     return fromExcalidrawScene(scene, { ...metadata, trustedAttributions });
+  };
+
+  const persistLibraryChanges = useCallback(async (items: LibraryItems) => {
+    const workspaceId = activeWorkspaceIdRef.current;
+    if (!workspaceId) return;
+    const currentFiles = apiRef.current?.getFiles() as Record<string, DrawDocument["document"]["assets"][string]> | undefined;
+    const previousItems = libraryItemsRef.current;
+    const nextItems = items.map((item) => {
+      const previous = previousItems.find((saved) => saved.id === item.id);
+      const elements = item.elements as unknown as DrawDocument["document"]["elements"];
+      const assets = collectReferencedLibraryAssets(elements, {
+        ...(previous?.assets ?? {}),
+        ...(currentFiles ?? {}),
+      });
+      return {
+        ...item,
+        ...(item.name ? { name: item.name } : previous?.name ? { name: previous.name } : {}),
+        elements,
+        assets,
+      } satisfies DrawLibraryItem;
+    });
+    if (!shouldPersistLibraryChange(writerOwned.current, previousItems, nextItems)) return;
+    try {
+      const saved = await saveWorkspaceLibrary(workspaceId, nextItems, libraryRevisionRef.current);
+      if (activeWorkspaceIdRef.current !== workspaceId) return;
+      libraryRevisionRef.current = saved.revision;
+      libraryItemsRef.current = saved.items;
+      setLibraryItems(saved.items);
+    } catch (error) {
+      if (activeWorkspaceIdRef.current !== workspaceId) return;
+      if (!(error instanceof Error)) throw error;
+      try {
+        const recovery = await reloadLibraryAfterConflict(error, () => loadWorkspaceLibraryState(workspaceId));
+        if (activeWorkspaceIdRef.current !== workspaceId) return;
+        if ("deleted" in recovery) {
+          libraryRevisionRef.current = 0;
+          libraryItemsRef.current = [];
+          setLibraryItems([]);
+          setLibraryManagerOpen(false);
+          setMessage("This workspace was deleted while its library was being edited. Choose an existing workspace to continue.");
+          return;
+        }
+        const latest = recovery.state;
+        libraryRevisionRef.current = latest.revision;
+        libraryItemsRef.current = latest.items;
+        setLibraryItems(latest.items);
+        if (apiRef.current) await apiRef.current.updateLibrary({ libraryItems: latest.items as unknown as LibraryItems, merge: false, prompt: false });
+        setMessage("The library changed in another tab or by an agent; your last library edit was not saved. The latest saved library is loaded; reapply your edit if needed.");
+      } catch (reloadError) {
+        if (activeWorkspaceIdRef.current !== workspaceId) return;
+        throw reloadError;
+      }
+    }
+  }, []);
+
+  const activateWorkspaceLibrary = async (workspaceId: string) => {
+    activeWorkspaceIdRef.current = workspaceId;
+    const { items, revision } = await loadWorkspaceLibraryState(workspaceId);
+    if (activeWorkspaceIdRef.current !== workspaceId) throw new Error("The active workspace changed while its library was loading. Retry the operation.");
+    libraryRevisionRef.current = revision;
+    libraryItemsRef.current = items;
+    setLibraryItems(items);
+    return items;
+  };
+
+  const replaceWorkspaceLibrary = async (items: DrawLibraryItem[], revision = libraryRevisionRef.current) => {
+    const changed = !libraryItemsEquivalentForPersistence(libraryItemsRef.current, items);
+    libraryRevisionRef.current = revision;
+    libraryItemsRef.current = items;
+    if (changed) setLibraryItems(items);
+    if (apiRef.current) {
+      await apiRef.current.updateLibrary({ libraryItems: items as unknown as LibraryItems, merge: false, prompt: false });
+    }
+  };
+
+  const createHumanLibraryContext = async (operation: string, payload: Record<string, unknown>) => {
+    const idempotencyKey = randomId();
+    const input = { ...payload, idempotencyKey };
+    return {
+      clientIdentity: `human-${clientId.current}`,
+      idempotencyKey,
+      payloadHash: await hashMcpOperation(operation, input),
+      expectedRevision: libraryRevisionRef.current,
+    };
+  };
+
+  const addSelectionToLibrary = async () => {
+    if (!doc || !apiRef.current || !activeWorkspaceIdRef.current) return;
+    const selectedElementIds = doc.document.appState.selectedElementIds as Record<string, boolean> | undefined;
+    const elements = collectLibrarySelection(doc.document.elements, selectedElementIds);
+    if (!elements.length) { setMessage("Select one or more objects before adding them to the library."); return; }
+    const item: DrawLibraryItem = {
+      id: randomId(),
+      status: "unpublished",
+      created: Date.now(),
+      name: `Reusable item ${libraryItemsRef.current.length + 1}`,
+      elements,
+      assets: collectReferencedLibraryAssets(elements, doc.document.assets),
+    };
+    try {
+      const workspaceId = activeWorkspaceIdRef.current;
+      if (!writerOwned.current) throw new Error("This Draw tab is read-only because another tab owns the autosave lock.");
+      const context = await createHumanLibraryContext("add_selection_to_workspace_library", { workspaceId, item });
+      const saved = await addWorkspaceLibraryItem(workspaceId, item, context);
+      await replaceWorkspaceLibrary(saved.items, saved.revision);
+      setLibraryManagerOpen(true);
+      setMessage(`Added ${elements.length} editable element${elements.length === 1 ? "" : "s"} to this workspace's library.`);
+    } catch (error) { setMessage(`Could not save the library item: ${error instanceof Error ? error.message : String(error)}`); }
+  };
+
+  const renameLibraryItem = async (item: DrawLibraryItem) => {
+    const name = window.prompt("Library item name", item.name ?? "Reusable item");
+    if (name === null) return;
+    try {
+      const workspaceId = activeWorkspaceIdRef.current;
+      const context = await createHumanLibraryContext("rename_workspace_library_item", { workspaceId, itemId: item.id, name });
+      const saved = await renameWorkspaceLibraryItem(workspaceId, item.id, name, context);
+      await replaceWorkspaceLibrary(saved.items, saved.revision);
+    } catch (error) { setMessage(`Could not rename the library item: ${error instanceof Error ? error.message : String(error)}`); }
+  };
+
+  const removeLibraryItem = async (item: DrawLibraryItem) => {
+    if (!window.confirm(`Remove “${item.name ?? "Untitled library item"}” from this workspace's library?`)) return;
+    try {
+      const workspaceId = activeWorkspaceIdRef.current;
+      const context = await createHumanLibraryContext("delete_workspace_library_item", { workspaceId, itemId: item.id });
+      const saved = await deleteWorkspaceLibraryItem(workspaceId, item.id, context);
+      await replaceWorkspaceLibrary(saved.items, saved.revision);
+    } catch (error) { setMessage(`Could not remove the library item: ${error instanceof Error ? error.message : String(error)}`); }
+  };
+
+  const insertLibraryItem = async (item: DrawLibraryItem) => {
+    const api = apiRef.current;
+    const current = docRef.current;
+    if (!api || !current || !canWrite || autosaveBlocked) return;
+    const files = Object.values(item.assets ?? {});
+    if (files.length) api.addFiles(files as any);
+    const copies = cloneLibraryElements(item.elements, randomId);
+    const elements = [...api.getSceneElementsIncludingDeleted(), ...copies] as any[];
+    const appState = { ...(api.getAppState() as any), selectedElementIds: Object.fromEntries(copies.map((element) => [element.id, true])) };
+    api.updateScene({ elements, appState, captureUpdate: CaptureUpdateAction.IMMEDIATELY });
+    const next = fromCurrentScene({ elements, appState, files: api.getFiles() as any }, {
+      id: current.document.id,
+      title: current.document.title,
+      documentRevision: current.document.documentRevision + 1,
+      viewRevision: current.document.viewRevision,
+      background: current.document.canvas.background,
+      viewport: current.document.canvas.viewport,
+    });
+    setDocument(next);
+    autosave.schedule(next);
+    bridgeAutosave.schedule(next);
+    try {
+      await Promise.all([autosave.flush(), bridgeAutosave.flush()]);
+    } catch (error) {
+      setStatus("error");
+      setMessage(`Inserted locally, but could not sync the change: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    setLibraryManagerOpen(false);
+    setMessage(`Inserted ${copies.length} editable element${copies.length === 1 ? "" : "s"} from the workspace library.`);
   };
 
   useEffect(() => {
@@ -350,6 +517,14 @@ export default function App() {
             }
           }
           if (!stored && lock.acquired) throw new Error("The active canvas document is unavailable.");
+          if (workspaceId) {
+            const savedLibrary = await loadWorkspaceLibraryState(workspaceId);
+            if (!live) return;
+            activeWorkspaceIdRef.current = workspaceId;
+            libraryRevisionRef.current = savedLibrary.revision;
+            libraryItemsRef.current = savedLibrary.items;
+            setLibraryItems(savedLibrary.items);
+          }
           setWorkspaces(workspaceItems);
           setCanvases(canvasItems);
           setActiveWorkspaceId(workspaceId);
@@ -406,6 +581,15 @@ export default function App() {
     if (!writerOwned.current) return;
     const current = docRef.current;
     if (!current) return;
+    const sceneFiles = { ...(files as Record<string, DrawDocument["document"]["assets"][string]>) };
+    const restoredFiles: DrawDocument["document"]["assets"][string][] = [];
+    for (const element of elements) {
+      const fileId = typeof element.fileId === "string" ? element.fileId : undefined;
+      if (!fileId || sceneFiles[fileId]) continue;
+      const asset = libraryItemsRef.current.find((item) => item.assets?.[fileId])?.assets[fileId];
+      if (asset) { sceneFiles[fileId] = structuredClone(asset); restoredFiles.push(structuredClone(asset)); }
+    }
+    if (restoredFiles.length) apiRef.current?.addFiles(restoredFiles as any);
     const state = appState as Record<string, unknown> & { scrollX?: number; scrollY?: number; zoom?: { value?: number } };
     const backgroundPreset = state.viewBackgroundColor === "transparent"
       ? "blackboard"
@@ -415,7 +599,7 @@ export default function App() {
     const background = backgroundPreset === "blackboard"
       ? { preset: "blackboard" as const, styleVersion: 1, color: DEFAULT_COLOR.blackboard, texture: "chalk-smudge-v1" }
       : { preset: "white" as const, styleVersion: 1, color: DEFAULT_COLOR.white };
-    const sceneChanged = hasSceneContentChanged(current, elements, files, background.preset);
+    const sceneChanged = hasSceneContentChanged(current, elements, sceneFiles, background.preset);
     if (sceneChanged) {
       // A human scene edit makes a delayed MCP undo/redo ineligible. The live
       // editor history is shared, so an agent must never consume newer work.
@@ -428,7 +612,7 @@ export default function App() {
       zoom: typeof state.zoom?.value === "number" ? state.zoom.value : current.document.canvas.viewport.zoom,
     };
     const viewChanged = JSON.stringify(current.document.canvas.viewport) !== JSON.stringify(viewport);
-    const next = fromCurrentScene({ elements, appState, files }, {
+    const next = fromCurrentScene({ elements, appState, files: sceneFiles }, {
       id: current.document.id,
       title: current.document.title,
       documentRevision: current.document.documentRevision + (sceneChanged ? 1 : 0),
@@ -656,6 +840,7 @@ export default function App() {
       const next = await loadCanvasDocument(canvasId);
       if (!next) throw new Error("The selected canvas has no saved document.");
       await setActiveCanvas(canvasId);
+      if (workspaceId !== activeWorkspaceIdRef.current) await activateWorkspaceLibrary(workspaceId);
       lastMcpOperation.current = null; lastUndoneOperation.current = null;
       setDocument(next); setEditorKey((key) => key + 1); setStatus("saved"); setMessage("");
       await refreshWorkspaceList(workspaceId, canvasId);
@@ -669,6 +854,7 @@ export default function App() {
     const next = await loadCanvasDocument(created.id);
     if (!next) throw new Error("The new canvas could not be loaded.");
     await setActiveCanvas(created.id);
+    if (workspaceId !== activeWorkspaceIdRef.current) await activateWorkspaceLibrary(workspaceId);
     setDocument(next); setEditorKey((key) => key + 1); setStatus("saved");
     await refreshWorkspaceList(workspaceId, created.id);
   };
@@ -764,6 +950,7 @@ export default function App() {
       await setActiveCanvas(nextCanvas.id);
       const next = await loadCanvasDocument(nextCanvas.id);
       if (!next) throw new Error("The replacement canvas could not be loaded.");
+      if (nextWorkspace.id !== activeWorkspaceIdRef.current) await activateWorkspaceLibrary(nextWorkspace.id);
       setDocument(next); setEditorKey((key) => key + 1);
       await refreshWorkspaceList(nextWorkspace.id, nextCanvas.id);
       setStatus("saved"); setMessage("");
@@ -998,6 +1185,7 @@ export default function App() {
         action: storageAction,
       });
       if (revokedMcpCommandIds.current.has(event.id)) throw new Error("MCP command was revoked after the workspace operation committed; read the catalog before retrying.");
+      await activateWorkspaceLibrary(committed.activeWorkspaceId);
       setWorkspaces(committed.workspaces);
       setActiveWorkspaceId(committed.activeWorkspaceId);
       setCanvases(committed.canvases.filter((canvas) => canvas.workspaceId === committed.activeWorkspaceId));
@@ -1035,7 +1223,9 @@ export default function App() {
       await handleMcpWorkspaceCommand(event);
       return;
     }
-    const durableMutation = ["create_diagram", "create_elements", "insert_image", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "set_canvas_settings", "set_viewport", "undo_operation", "redo_operation"].includes(event.operation);
+    const libraryMutations = ["add_selection_to_workspace_library", "rename_workspace_library_item", "delete_workspace_library_item"];
+    const isLibraryMutation = libraryMutations.includes(event.operation);
+    const durableMutation = ["create_diagram", "create_elements", "insert_image", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "set_canvas_settings", "set_viewport", "undo_operation", "redo_operation", "insert_workspace_library_item"].includes(event.operation);
     let operationHash: string | null = null;
     try {
       if (durableMutation) {
@@ -1154,8 +1344,55 @@ export default function App() {
         lastUndoneOperation.current = null;
         throw new Error("CONFLICT: The live editor has unsynchronized changes. Read the current canvas and retry with its latest revision.");
       }
-      if (typeof event.input.expectedDocumentRevision === "number" && event.input.expectedDocumentRevision !== current.document.documentRevision) {
+      if (!isLibraryMutation && typeof event.input.expectedDocumentRevision === "number" && event.input.expectedDocumentRevision !== current.document.documentRevision) {
         throw new Error("CONFLICT: The expected document revision is stale. Read the current canvas and retry.");
+      }
+      if (["list_workspace_library", "read_workspace_library_item", "add_selection_to_workspace_library", "rename_workspace_library_item", "delete_workspace_library_item"].includes(event.operation)) {
+        const libraryCatalog = await getMcpWorkspaceCatalog();
+        const workspaceId = resolveLibraryWorkspaceFromCatalog(libraryCatalog, event.input.documentId);
+        if (current.document.id !== event.input.documentId) throw new Error("CONFLICT: The editor has not loaded the active canvas. Reload the current workspace before retrying.");
+        await activateWorkspaceLibrary(workspaceId);
+        const verifiedCatalog = await getMcpWorkspaceCatalog();
+        resolveLibraryWorkspaceFromCatalog(verifiedCatalog, event.input.documentId);
+        if (activeWorkspaceIdRef.current !== workspaceId) throw new Error("CONFLICT: The active workspace changed. Read the workspace catalog and retry the library operation.");
+        const storedLibrary = await loadWorkspaceLibraryState(workspaceId);
+        const items = storedLibrary.items;
+        let libraryResult: Record<string, unknown>;
+        if (event.operation === "list_workspace_library") {
+          libraryResult = { items: items.map(({ id, name, created, elements: savedElements, assets }) => ({ id, name: name ?? "Untitled library item", created, elementCount: savedElements.length, assetCount: Object.keys(assets ?? {}).length })), workspaceId, libraryRevision: storedLibrary.revision };
+        } else if (event.operation === "read_workspace_library_item") {
+          const item = items.find((candidate) => candidate.id === event.input.itemId);
+          if (!item) throw new Error("LIBRARY_ITEM_NOT_FOUND: The requested item is not in the active workspace library.");
+          libraryResult = { item, workspaceId, libraryRevision: storedLibrary.revision };
+        } else if (event.operation === "add_selection_to_workspace_library") {
+          const payloadHash = await hashMcpOperation(event.operation, event.input);
+          const saved = await addWorkspaceLibraryItem(workspaceId, () => {
+            const selectedMap = event.input.elementIds
+              ? Object.fromEntries(event.input.elementIds.map((id: string) => [id, true]))
+              : (api.getAppState() as any).selectedElementIds;
+            const selected = collectLibrarySelection(current.document.elements, selectedMap);
+            if (!selected.length) throw new Error("Select one or more elements before adding an item to the library.");
+            return { id: event.input.itemId, status: "unpublished", created: Date.now(), name: event.input.name ?? `Reusable item ${items.length + 1}`, elements: selected, assets: collectReferencedLibraryAssets(selected, { ...current.document.assets, ...(api.getFiles() as any) }) } satisfies DrawLibraryItem;
+          }, { clientIdentity: event.clientIdentity, idempotencyKey: event.input.idempotencyKey, payloadHash, expectedRevision: event.input.expectedLibraryRevision });
+          await replaceWorkspaceLibrary(saved.items, saved.revision);
+          libraryResult = { ...saved.result, workspaceId };
+        } else if (event.operation === "rename_workspace_library_item") {
+          const payloadHash = await hashMcpOperation(event.operation, event.input);
+          const saved = await renameWorkspaceLibraryItem(workspaceId, event.input.itemId, event.input.name, { clientIdentity: event.clientIdentity, idempotencyKey: event.input.idempotencyKey, payloadHash, expectedRevision: event.input.expectedLibraryRevision });
+          await replaceWorkspaceLibrary(saved.items, saved.revision);
+          libraryResult = { ...saved.result, workspaceId };
+        } else {
+          const payloadHash = await hashMcpOperation(event.operation, event.input);
+          const saved = await deleteWorkspaceLibraryItem(workspaceId, event.input.itemId, { clientIdentity: event.clientIdentity, idempotencyKey: event.input.idempotencyKey, payloadHash, expectedRevision: event.input.expectedLibraryRevision });
+          await replaceWorkspaceLibrary(saved.items, saved.revision);
+          libraryResult = { ...saved.result, workspaceId };
+        }
+        const acknowledgement = await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
+          method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
+          body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, document: current, result: libraryResult }),
+        });
+        if (!acknowledgement.ok) throw new Error(`Draw MCP bridge rejected the library acknowledgement (HTTP ${acknowledgement.status}).`);
+        return;
       }
       let result: Record<string, unknown>;
       let nextDocument: DrawDocument | null = null;
@@ -1254,6 +1491,20 @@ export default function App() {
         const update = applyElementUpdates(elements, event.input.updates, measureTextWithExcalidraw);
         elements = update.elements;
         result = { updatedElementIds: update.updatedIds };
+      } else if (event.operation === "insert_workspace_library_item") {
+        const libraryCatalog = await getMcpWorkspaceCatalog();
+        const workspaceId = resolveLibraryWorkspaceFromCatalog(libraryCatalog, event.input.documentId);
+        if (current.document.id !== event.input.documentId) throw new Error("CONFLICT: The editor has not loaded the active canvas. Reload the current workspace before retrying.");
+        await activateWorkspaceLibrary(workspaceId);
+        const verifiedCatalog = await getMcpWorkspaceCatalog();
+        resolveLibraryWorkspaceFromCatalog(verifiedCatalog, event.input.documentId);
+        if (activeWorkspaceIdRef.current !== workspaceId) throw new Error("CONFLICT: The active workspace changed. Read the workspace catalog and retry the library operation.");
+        const item = (await loadWorkspaceLibraryState(workspaceId)).items.find((candidate) => candidate.id === event.input.itemId);
+        if (!item) throw new Error("LIBRARY_ITEM_NOT_FOUND: The requested item is not in the active workspace library.");
+        const copies = cloneLibraryElements(item.elements, randomId);
+        elements = [...elements, ...copies];
+        filesToRestore = Object.values(item.assets ?? {});
+        result = { inserted: true, itemId: item.id, addedElementIds: copies.map((element) => element.id), sourceElementIds: item.elements.map((element) => element.id) };
       } else if (["delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements"].includes(event.operation)) {
         const action = event.operation === "delete_elements" ? "delete"
           : event.operation === "duplicate_elements" ? "duplicate"
@@ -1415,7 +1666,7 @@ export default function App() {
         documentRevision: nextDocument.document.documentRevision,
         viewRevision: nextDocument.document.viewRevision,
       };
-      const undoEligible = ["create_diagram", "create_elements", "insert_image", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "redo_operation"].includes(event.operation);
+      const undoEligible = ["create_diagram", "create_elements", "insert_image", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "insert_workspace_library_item", "redo_operation"].includes(event.operation);
       let persistenceWarning: string | undefined;
       if (durableMutation) {
         const record: DurableMcpOperation = {
@@ -1603,7 +1854,7 @@ export default function App() {
 
   const handleBridgeConfirmation = useCallback((event: BridgeConfirmation) => {
     if (event.clientId !== clientId.current || !writerOwned.current || !editorSecret.current) return;
-    if (event.action === "open_document") { setConfirmation(event); return; }
+    if (event.action === "open_document" || event.action === "delete_library_item") { setConfirmation(event); return; }
     void (async () => {
       try {
         const catalog = await getMcpWorkspaceCatalog();
@@ -1661,7 +1912,7 @@ export default function App() {
       });
       if (!response.ok) throw new Error("This confirmation request expired or the active Draw tab changed.");
       setConfirmation(null);
-      if (!approved) setMessage(pending.action === "open_document" ? "Document open was denied. The active canvas was left unchanged." : "Deletion was denied. The workspace and canvases were left unchanged.");
+      if (!approved) setMessage(pending.action === "open_document" ? "Document open was denied. The active canvas was left unchanged." : pending.action === "delete_library_item" ? "Library item deletion was denied." : "Deletion was denied. The workspace and canvases were left unchanged.");
     } catch (error) {
       setConfirmation(null);
       setMessage(error instanceof Error ? error.message : "Could not answer the confirmation request.");
@@ -1726,6 +1977,7 @@ export default function App() {
     return {
       ...sceneData,
       appState: { ...sceneData.appState, collaborators: new Map() },
+      libraryItems: libraryItemsRef.current as unknown as LibraryItems,
     } as unknown as ExcalidrawInitialDataState;
   }, [doc?.document.id, editorKey]);
   if (!doc || status === "loading") return <main className="loading-screen"><div className="brand-mark">D</div><p>Preparing your canvas…</p></main>;
@@ -1749,8 +2001,8 @@ export default function App() {
         <span className={`save-indicator ${status}`}><i />{statusText}</span>
         <button className="button button-quiet" disabled={!canWrite} onClick={() => { setImageSearchError(""); setImagePickerOpen(true); }} title="Search openly licensed illustrations">Images</button>
         <button className="button button-quiet" disabled={!imageCredits.length} onClick={() => setCreditsOpen(true)} title="Inspect saved image attribution">Image credits</button>
-        {import.meta.env.DEV && <button className="button button-quiet" disabled={!canWrite} onClick={() => { setConnectError(""); setConnectOpen(true); }} title="Pair this editor with the local MCP bridge">{editorConnected ? "MCP connected" : "Connect MCP"}</button>}
-        {import.meta.env.DEV && <button className="button button-quiet" disabled={!canWrite} onClick={() => void openMcpManagement()} title="Pair or revoke local MCP clients">MCP clients</button>}
+        <button className="button button-quiet" disabled={!canWrite} onClick={() => { setConnectError(""); setConnectOpen(true); }} title="Pair this editor with the local MCP bridge">{editorConnected ? "MCP connected" : "Connect MCP"}</button>
+        <button className="button button-quiet" disabled={!canWrite} onClick={() => void openMcpManagement()} title="Pair or revoke local MCP clients">MCP clients</button>
         <button className="button button-quiet" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open an editable Draw document" : "Close the other Draw tab to open files here"}>Open .draw</button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
         <button className="button button-primary" onClick={saveFile} title="Save the complete editable Draw file"><span className="button-icon">↓</span>Save .draw</button>
@@ -1768,6 +2020,9 @@ export default function App() {
       <button className="button" disabled={!canWrite || !activeCanvasId} onClick={() => void duplicateActiveCanvas()}>Duplicate canvas</button>
       <button className="button" disabled={!canWrite || !activeCanvasId} onClick={() => void renameActiveCanvas()}>Rename canvas</button>
       <button className="button button-danger-quiet" disabled={!canWrite || !activeCanvasId} onClick={() => void removeActiveCanvas()}>Delete canvas</button>
+      <span className="project-divider" />
+      <button className="button" disabled={!canWrite || !selectionAvailable} title={selectionAvailable ? "Save selected objects and their labels to this workspace's library" : "Select objects to add them to the library"} onClick={() => void addSelectionToLibrary()}>Add selection to library</button>
+      <button className="button" disabled={!canWrite || !activeWorkspaceId} onClick={() => setLibraryManagerOpen(true)}>Manage library ({libraryItems.length})</button>
     </nav>
     {imagePickerOpen && <div className="draw-confirmation-backdrop" role="presentation">
       <section className="draw-image-picker" role="dialog" aria-modal="true" aria-labelledby="draw-image-picker-title">
@@ -1822,21 +2077,36 @@ export default function App() {
     </div>}
     <div className="workspace">
       <section className="canvas-area" aria-label="Drawing canvas">
-    <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onChange} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS}
+    <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onChange} onLibraryChange={persistLibraryChanges} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS}
       renderTopRightUI={renderCanvasToolbar}>{DRAW_MENU}</Excalidraw></div>
       </section>
     </div>
+    {libraryManagerOpen && <div className="draw-confirmation-backdrop" role="presentation">
+      <section className="draw-confirmation draw-library-manager" role="dialog" aria-modal="true" aria-labelledby="draw-library-title">
+        <h2 id="draw-library-title">Workspace library</h2>
+        <p>Saved items stay in <strong>{workspaces.find((item) => item.id === activeWorkspaceId)?.name ?? "this workspace"}</strong>. Insert a copy to add editable shapes and labels to the canvas.</p>
+        {!libraryItems.length ? <p className="draw-library-empty">No saved items yet. Select diagram elements and choose <strong>Add selection to library</strong>.</p> : <div className="draw-library-list">{libraryItems.map((item) => <article className="draw-library-row" key={item.id}>
+          <div><strong>{item.name ?? "Untitled library item"}</strong><small>{item.elements.length} elements{Object.keys(item.assets ?? {}).length ? ` · ${Object.keys(item.assets).length} image assets` : ""}</small></div>
+          <button className="button" onClick={() => insertLibraryItem(item)}>Insert</button>
+          <button className="button" onClick={() => void renameLibraryItem(item)}>Rename</button>
+          <button className="button button-danger-quiet" onClick={() => void removeLibraryItem(item)}>Remove</button>
+        </article>)}</div>}
+        <div className="draw-confirmation-actions"><button className="button button-quiet" onClick={() => setLibraryManagerOpen(false)}>Close</button></div>
+      </section>
+    </div>}
     {confirmation && <div className="draw-confirmation-backdrop" role="presentation">
       <section className="draw-confirmation" role="dialog" aria-modal="true" aria-labelledby="draw-confirmation-title" aria-describedby="draw-confirmation-copy">
-        <h2 id="draw-confirmation-title">{confirmation.action === "open_document" ? "Open a Draw document?" : confirmation.action === "delete_canvas" ? "Delete this canvas?" : "Delete this workspace?"}</h2>
+        <h2 id="draw-confirmation-title">{confirmation.action === "open_document" ? "Open a Draw document?" : confirmation.action === "delete_canvas" ? "Delete this canvas?" : confirmation.action === "delete_workspace" ? "Delete this workspace?" : "Delete a library item?"}</h2>
         <p id="draw-confirmation-copy">{confirmation.action === "open_document"
           ? <>An agent wants to open <strong>{confirmation.filename}</strong> and replace the current canvas. Save the current drawing first if you need to keep it.</>
           : confirmation.action === "delete_canvas"
             ? <>An agent wants to delete canvas <strong>{confirmation.targetName}</strong> from workspace <strong>{confirmation.workspaceName}</strong>. Its editable drawing and local history will be removed.</>
-            : <>An agent wants to delete workspace <strong>{confirmation.targetName}</strong> and its {confirmation.canvasCount ?? 0} canvas(es). Their editable drawings and local history will be removed.</>}</p>
+          : confirmation.action === "delete_workspace"
+            ? <>An agent wants to delete workspace <strong>{confirmation.targetName}</strong> and its {confirmation.canvasCount ?? 0} canvas(es). Their editable drawings and local history will be removed.</>
+            : <>An agent wants to remove library item <strong>{confirmation.filename}</strong> from this workspace.</>}</p>
         <p className="draw-confirmation-expiry">This one-time approval expires in two minutes.</p>
         <div className="draw-confirmation-actions">
-          <button className="button button-quiet" onClick={() => void respondToConfirmation(false)}>{confirmation.action === "open_document" ? "Keep current canvas" : "Keep drawings"}</button>
+          <button className="button button-quiet" onClick={() => void respondToConfirmation(false)}>{confirmation.action === "open_document" ? "Keep current canvas" : confirmation.action === "delete_library_item" ? "Keep item" : "Keep drawings"}</button>
           <button className="button button-primary" onClick={() => void respondToConfirmation(true)}>{confirmation.action === "open_document" ? "Approve opening" : "Approve deletion"}</button>
         </div>
       </section>

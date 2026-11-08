@@ -2,11 +2,19 @@ import { describe, expect, it } from "vitest";
 import { parseMcpToolInput as parseMcpToolInputImpl, summarizeCurrentCanvas } from "./mcp-contract";
 
 function parseMcpToolInput(name: string, input: any) {
-  const mutating = ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "undo_operation", "redo_operation", "set_canvas_settings"].includes(name);
+  const mutating = ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "undo_operation", "redo_operation", "set_canvas_settings", "add_selection_to_workspace_library", "rename_workspace_library_item", "delete_workspace_library_item", "insert_workspace_library_item"].includes(name);
   return parseMcpToolInputImpl(name, mutating && input && input.idempotencyKey === undefined ? { ...input, idempotencyKey: "test-idempotency-key" } : input);
 }
 
 describe("MCP tool input contract", () => {
+  it("validates workspace library queries and mutations with active document context", () => {
+    expect(parseMcpToolInput("list_workspace_library", { documentId: "doc-1" })).toEqual({ operation: "list_workspace_library", input: { documentId: "doc-1" } });
+    expect(parseMcpToolInput("read_workspace_library_item", { documentId: "doc-1", itemId: "item-1" })).toEqual({ operation: "read_workspace_library_item", input: { documentId: "doc-1", itemId: "item-1" } });
+    expect(parseMcpToolInput("insert_workspace_library_item", { documentId: "doc-1", expectedDocumentRevision: 2, idempotencyKey: "insert-1", itemId: "item-1" })).toMatchObject({ operation: "insert_workspace_library_item", input: { documentId: "doc-1", expectedDocumentRevision: 2, idempotencyKey: "insert-1", itemId: "item-1" } });
+    expect(() => parseMcpToolInputImpl("insert_workspace_library_item", { documentId: "doc-1", expectedDocumentRevision: 2, itemId: "item-1" })).toThrow(/idempotencyKey/i);
+    expect(parseMcpToolInput("rename_workspace_library_item", { documentId: "doc-1", expectedDocumentRevision: 2, expectedLibraryRevision: 4, itemId: "item-1", name: "New", idempotencyKey: "rename-1" })).toMatchObject({ input: { expectedLibraryRevision: 4, idempotencyKey: "rename-1" } });
+    expect(() => parseMcpToolInputImpl("delete_workspace_library_item", { documentId: "doc-1", expectedDocumentRevision: 2, itemId: "item-1", idempotencyKey: "delete-1" })).toThrow(/expectedLibraryRevision/i);
+  });
   it("summarizes active elements and keeps the newest IDs in large canvases", () => {
     const elements = [
       { id: "deleted", type: "rectangle", isDeleted: true },
