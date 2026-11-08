@@ -215,6 +215,8 @@ describe("local Draw autosave", () => {
     } finally { db.close(); }
   });
 
+  // This deliberately performs more than the receipt-retention cap's worth of
+  // real IndexedDB commits; allow slower CI runners time to finish the stress loop.
   it("removes workspace receipts that refer to deleted local drawings and bounds receipt retention", async () => {
     await saveCurrentDocument(createEmptyDocument("Root"));
     const initial = await getMcpWorkspaceCatalog();
@@ -250,7 +252,7 @@ describe("local Draw autosave", () => {
     expect(receipts.length).toBeLessThanOrEqual(MCP_WORKSPACE_RECEIPT_LIMIT);
     expect(receipts.some((receipt) => receipt.idempotencyKey === "bounded-0")).toBe(false);
     expect(receipts.some((receipt) => receipt.idempotencyKey === `bounded-${MCP_WORKSPACE_RECEIPT_LIMIT}`)).toBe(true);
-  });
+  }, 15_000);
 
   it("cleans up compact MCP receipt references for canvases and workspaces deleted in Draw", async () => {
     await saveCurrentDocument(createEmptyDocument("Root"));
