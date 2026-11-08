@@ -11,6 +11,7 @@ import { serializeDrawFile } from "../document/document";
 import { readConfiguredPairingSecret } from "./mcp-pairing-config";
 import { requestDrawIpc } from "../runtime/ipc-client";
 import { drawStartRequiredError } from "./mcp-transport-error";
+import { fetchOpenverseImage, getOpenverseImageMetadata, imageAttributionFromOpenverseResult, OPENVERSE_REQUEST_TIMEOUT_MS, searchOpenverseImages, type OpenverseAttribution } from "./openverse";
 
 const defaultBaseUrl = "http://127.0.0.1:5173";
 const requestTimeoutMs = 25_000;
@@ -213,6 +214,51 @@ function createServer() {
     async (input) => textResult(summarizeCurrentCanvas(await bridgeRequest("/__draw/api/document?flush=1"), input)),
   );
 
+  server.registerTool("search_openverse_images", {
+    description: "Search openly licensed illustrations in Openverse. Search text is sent to Openverse. Results are indexed claims, not a guarantee of rights; inspect each creator, source, and license before inserting.",
+    inputSchema: z.object({
+      documentId: z.string().min(1).max(200), expectedDocumentRevision: z.number().int().nonnegative(),
+      query: z.string().trim().min(1).max(200), page: z.number().int().min(1).max(20).optional(),
+      category: z.enum(["illustration", "photograph", "digitized_artwork"]).optional(),
+      license: z.enum(["cc0", "pdm", "by", "by-sa", "by-nd", "by-nc", "by-nc-sa", "by-nc-nd"]).optional(),
+    }).strict(),
+  }, async (input) => {
+    const document = await bridgeRequest("/__draw/api/document?flush=1");
+    assertDocumentContext(document, input.documentId, input.expectedDocumentRevision);
+    const results = await searchOpenverseImages(input.query, { ...(input.page ? { page: input.page } : {}), ...(input.category ? { category: input.category } : { category: "illustration" }), ...(input.license ? { license: input.license } : {}) });
+    return textResult({ results, count: results.length, page: input.page ?? 1, notice: "Verify the individual license and attribution before reuse; Openverse does not guarantee item-level licensing." });
+  });
+
+  server.registerTool("insert_openverse_image", {
+    description: "Download and insert an Openverse image as an editable, embedded Draw image. Accepts only an Openverse image ID, never a URL. The image and attribution are saved in .draw and remain available offline. Reuse idempotencyKey only for an exact retry.",
+    inputSchema: z.object({
+      documentId: z.string().min(1).max(200), expectedDocumentRevision: z.number().int().nonnegative(), idempotencyKey: idempotencyKeySchema,
+      imageId: z.string().uuid(), x: z.number().finite(), y: z.number().finite(),
+      width: z.number().finite().min(24).max(5000).optional(), height: z.number().finite().min(24).max(5000).optional(),
+    }).strict(),
+  }, async (input) => {
+    const document = await bridgeRequest("/__draw/api/document?flush=1");
+    assertDocumentIdentity(document, input.documentId);
+    const deadline = Date.now() + OPENVERSE_REQUEST_TIMEOUT_MS;
+    const metadata = await getOpenverseImageMetadata(input.imageId, fetch, deadline - Date.now());
+    if (!metadata.license) throw new Error("Openverse has no license information for this image. Draw will not insert it.");
+    const image = await fetchOpenverseImage(input.imageId, imageAttributionFromOpenverseResult(metadata), fetch, deadline - Date.now());
+    const command = parseMcpToolInput("insert_openverse_image", {
+      documentId: input.documentId, expectedDocumentRevision: input.expectedDocumentRevision, idempotencyKey: input.idempotencyKey,
+      x: input.x, y: input.y, ...(input.width ? { width: input.width } : {}), ...(input.height ? { height: input.height } : {}),
+      mimeType: image.mimeType, dataURL: image.dataURL, attribution: image.attribution,
+      idempotencyPayload: { imageId: input.imageId, x: input.x, y: input.y, ...(input.width ? { width: input.width } : {}), ...(input.height ? { height: input.height } : {}) },
+    });
+    const result = await bridgeRequest("/__draw/api/commands", { method: "POST", body: JSON.stringify({ ...command, operation: "insert_openverse_image" }) });
+    const storedResult = result.result as Record<string, any>;
+    const attribution = storedResult.attribution as OpenverseAttribution | undefined;
+    return textResult({
+      ...storedResult,
+      ...(attribution ? { title: attribution.title, license: attribution.license ?? null, licenseUrl: attribution.licenseUrl ?? null } : {}),
+      embedded: true,
+    });
+  });
+
   server.registerTool(
     "create_diagram",
     {
@@ -361,8 +407,12 @@ function createServer() {
 }
 
 function assertDocumentContext(document: any, documentId: string, expectedRevision: number): void {
-  if (document?.document?.id !== documentId) throw new Error("Document ID does not match the active Draw canvas.");
+  assertDocumentIdentity(document, documentId);
   if ((document?.document?.documentRevision ?? 0) !== expectedRevision) throw new Error("Document revision conflict. Read the latest canvas and retry with its current revision.");
+}
+
+function assertDocumentIdentity(document: any, documentId: string): void {
+  if (document?.document?.id !== documentId) throw new Error("Document ID does not match the active Draw canvas.");
 }
 
 try {

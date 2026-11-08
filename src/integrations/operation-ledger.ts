@@ -52,8 +52,11 @@ function canonicalJson(value: unknown): string {
 
 export async function hashMcpOperation(operation: string, input: Record<string, unknown>): Promise<string> {
   if (!globalThis.crypto?.subtle) throw new Error("Secure operation hashing is unavailable in this browser.");
-  const { idempotencyKey: _idempotencyKey, ...payload } = input;
-  const bytes = new TextEncoder().encode(canonicalJson({ operation, input: payload }));
+  const { idempotencyKey: _idempotencyKey, idempotencyPayload, ...payload } = input;
+  const stablePayload = operation === "insert_image" && idempotencyPayload && typeof idempotencyPayload === "object" && !Array.isArray(idempotencyPayload)
+    ? idempotencyPayload
+    : payload;
+  const bytes = new TextEncoder().encode(canonicalJson({ operation, input: stablePayload }));
   const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
   return `sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }

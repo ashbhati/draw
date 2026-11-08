@@ -1,6 +1,6 @@
 import { CaptureUpdateAction, Excalidraw, FONT_FAMILY, MainMenu, convertToExcalidrawElements, exportToSvg } from "@excalidraw/excalidraw";
 import type { ExcalidrawImperativeAPI, ExcalidrawInitialDataState } from "@excalidraw/excalidraw/types";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   createEmptyDocument,
   fromExcalidrawScene,
@@ -10,6 +10,7 @@ import {
   type DrawBackgroundPreset,
   type DrawDocument,
 } from "./document/document";
+import { isSafeHttpsUrl } from "./document/attribution";
 import { composeBackgroundSvg, hasSelectedExportElements, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorForBackgroundPreset } from "./export/background-recolor";
 import { saveCurrentDocument, loadCurrentDocument, commitMcpOperation, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createCanvas, duplicateCanvas, deleteCanvas, deleteWorkspace, listCanvases, listWorkspaces, loadCanvasDocument, renameCanvas, renameWorkspace, setActiveCanvas, type DrawCanvas, type DrawWorkspace } from "./ui/storage";
@@ -26,6 +27,7 @@ import { hasSceneContentChanged, sceneElementsChanged } from "./integrations/sce
 import { rebaseOpenedDocument, shouldRequireOpenConfirmation } from "./document/open-safety";
 import { canRestoreCancelledMcpCommand } from "./integrations/mcp-cancellation";
 import { canRedoMcpOperation, canUndoMcpOperation, hashMcpOperation, resolveOperationReplay, type DurableMcpOperation } from "./integrations/operation-ledger";
+import { fetchOpenverseImage, imageAttributionFromOpenverseResult, searchOpenverseImages, validateEmbeddedImage, type OpenverseAttribution, type OpenverseImageResult } from "./integrations/openverse";
 
 type Status = "loading" | "ready" | "saving" | "saved" | "error";
 type BridgeCommand = { id: string; clientId: string; clientIdentity: string; operation: string; input: any; document?: DrawDocument };
@@ -150,6 +152,17 @@ export default function App() {
   const [canWrite, setCanWrite] = useState(false);
   const [editorKey, setEditorKey] = useState(0);
   const [exportScope, setExportScope] = useState<"canvas" | "selection">("canvas");
+  const [imagePickerOpen, setImagePickerOpen] = useState(false);
+  const [imageQuery, setImageQuery] = useState("");
+  const [imageLicense, setImageLicense] = useState("");
+  const [imageCategory, setImageCategory] = useState<"illustration" | "photograph" | "digitized_artwork" | "all">("illustration");
+  const [imageResults, setImageResults] = useState<OpenverseImageResult[]>([]);
+  const [imagePage, setImagePage] = useState(1);
+  const [imageSearchError, setImageSearchError] = useState("");
+  const [imageSearchBusy, setImageSearchBusy] = useState(false);
+  const [imageInsertBusy, setImageInsertBusy] = useState<string | null>(null);
+  const [creditsOpen, setCreditsOpen] = useState(false);
+  const fetchedOpenverseAttributions = useRef(new Map<string, OpenverseAttribution>());
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
   const docRef = useRef<DrawDocument | null>(null);
   const activeDocumentIdRef = useRef<string | null>(null);
@@ -220,6 +233,25 @@ export default function App() {
     activeDocumentIdRef.current = next.document.id;
     setDoc(next);
   }, []);
+
+  const fromCurrentScene = (
+    scene: Parameters<typeof fromExcalidrawScene>[0],
+    metadata: Parameters<typeof fromExcalidrawScene>[1] = {},
+  ) => {
+    const current = docRef.current;
+    const trustedAttributions: Record<string, OpenverseAttribution & { verification: "openverse-index" }> = {};
+    for (const [fileId, asset] of Object.entries(current?.document.assets ?? {})) {
+      const attribution = (asset as { attribution?: OpenverseAttribution }).attribution;
+      const sceneFile = scene.files?.[fileId] as { dataURL?: unknown } | undefined;
+      if (attribution?.verification === "openverse-index" && sceneFile?.dataURL === asset.dataURL) {
+        trustedAttributions[fileId] = { ...attribution, verification: "openverse-index" };
+      }
+    }
+    for (const [fileId, attribution] of fetchedOpenverseAttributions.current) {
+      if (scene.files?.[fileId]) trustedAttributions[fileId] = { ...attribution, verification: "openverse-index" };
+    }
+    return fromExcalidrawScene(scene, { ...metadata, trustedAttributions });
+  };
 
   useEffect(() => {
     if (!doc || !activeCanvasId) return;
@@ -393,7 +425,7 @@ export default function App() {
       zoom: typeof state.zoom?.value === "number" ? state.zoom.value : current.document.canvas.viewport.zoom,
     };
     const viewChanged = JSON.stringify(current.document.canvas.viewport) !== JSON.stringify(viewport);
-    const next = fromExcalidrawScene({ elements, appState, files }, {
+    const next = fromCurrentScene({ elements, appState, files }, {
       id: current.document.id,
       title: current.document.title,
       documentRevision: current.document.documentRevision + (sceneChanged ? 1 : 0),
@@ -741,6 +773,66 @@ export default function App() {
     setMessage("Editable Draw file saved.");
   };
 
+  const searchImages = async (event?: FormEvent, page = 1, append = false) => {
+    event?.preventDefault();
+    setImageSearchBusy(true);
+    setImageSearchError("");
+    try {
+      const results = await searchOpenverseImages(imageQuery, { page, ...(imageCategory !== "all" ? { category: imageCategory } : {}), ...(imageLicense ? { license: imageLicense } : {}) });
+      setImageResults((current) => append ? [...current, ...results] : results);
+      setImagePage(page);
+    } catch (error) {
+      setImageSearchError(error instanceof Error ? error.message : "Could not search Openverse.");
+    } finally { setImageSearchBusy(false); }
+  };
+
+  const addEmbeddedImage = async (image: { dataURL: string; mimeType: "image/png" | "image/jpeg"; width: number; height: number; attribution: OpenverseAttribution }, position?: { x: number; y: number }, requestedSize?: { width?: number; height?: number }) => {
+    const api = apiRef.current;
+    if (!api || !canWrite) throw new Error("The canvas is read-only in this tab.");
+    const id = randomId();
+    fetchedOpenverseAttributions.current.set(id, image.attribution);
+    const scale = Math.min(1, 500 / Math.max(image.width, image.height));
+    const defaultWidth = Math.max(24, Math.round(image.width * scale));
+    const defaultHeight = Math.max(24, Math.round(image.height * scale));
+    const width = requestedSize?.width ?? (requestedSize?.height ? Math.max(24, Math.round(requestedSize.height * image.width / image.height)) : defaultWidth);
+    const height = requestedSize?.height ?? (requestedSize?.width ? Math.max(24, Math.round(requestedSize.width * image.height / image.width)) : defaultHeight);
+    api.addFiles([{ id, dataURL: image.dataURL, mimeType: image.mimeType, created: Date.now(), lastRetrieved: Date.now(), attribution: image.attribution } as any]);
+    const skeleton = {
+      type: "image", id: randomId(), fileId: id,
+      x: position?.x ?? 100, y: position?.y ?? 100, width, height,
+      customData: { drawAttribution: image.attribution },
+    };
+    const [element] = convertToExcalidrawElements([skeleton] as any[], { regenerateIds: false }) as any[];
+    if (!element) throw new Error("Could not create the image element.");
+    return element;
+  };
+
+  const insertOpenverseImage = async (result: OpenverseImageResult) => {
+    setImageInsertBusy(result.id);
+    setImageSearchError("");
+    try {
+      const image = await fetchOpenverseImage(result.id, imageAttributionFromOpenverseResult(result));
+      const element = await addEmbeddedImage(image);
+      const api = apiRef.current;
+      if (!api) throw new Error("The Draw canvas is not ready.");
+      api.updateScene({ elements: [...api.getSceneElements(), element], captureUpdate: CaptureUpdateAction.IMMEDIATELY });
+      setImagePickerOpen(false);
+      setMessage(`Added “${result.title}” with Openverse attribution saved in the drawing.`);
+    } catch (error) {
+      setImageSearchError(error instanceof Error ? error.message : "Could not add this image.");
+    } finally { setImageInsertBusy(null); }
+  };
+
+  const imageCredits = useMemo(() => {
+    const elements = doc?.document.elements ?? [];
+    const assets = doc?.document.assets ?? {};
+    const elementCredits = elements.flatMap((element: any) => {
+      const attribution = element.customData?.drawAttribution;
+      return element.type === "image" && attribution?.provider === "Openverse" ? [{ id: element.id, attribution: attribution as OpenverseAttribution }] : [];
+    });
+    return elementCredits.length ? elementCredits : Object.values(assets).flatMap((asset: any) => asset.attribution?.provider === "Openverse" ? [{ id: asset.id, attribution: asset.attribution as OpenverseAttribution }] : []);
+  }, [doc]);
+
   const exportImage = async (mime: "image/png" | "image/jpeg") => {
     if (!apiRef.current || !doc) return;
     try {
@@ -824,7 +916,7 @@ export default function App() {
     const api = apiRef.current;
     let current = docRef.current;
     if (!api || !current || !editorSecret.current || event.clientId !== clientId.current) return;
-    const durableMutation = ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "set_canvas_settings", "set_viewport", "undo_operation", "redo_operation"].includes(event.operation);
+    const durableMutation = ["create_diagram", "create_elements", "insert_image", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "set_canvas_settings", "set_viewport", "undo_operation", "redo_operation"].includes(event.operation);
     let operationHash: string | null = null;
     try {
       if (durableMutation) {
@@ -1012,6 +1104,33 @@ export default function App() {
           labelElementIds,
           elements: relationships,
         };
+      } else if (event.operation === "insert_image") {
+        const input = event.input as { dataURL: string; mimeType: "image/png" | "image/jpeg"; attribution: OpenverseAttribution; x: number; y: number; width?: number; height?: number };
+        const encoded = input.dataURL.split(",", 2)[1];
+        if (!encoded) throw new Error("Image data is malformed.");
+        const binary = atob(encoded);
+        const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+        const validated = await validateEmbeddedImage(bytes, input.mimeType);
+        const fileId = randomId();
+        const file = { id: fileId, dataURL: validated.dataURL, mimeType: validated.mimeType, created: Date.now(), lastRetrieved: Date.now() };
+        const scale = Math.min(1, 500 / Math.max(validated.width, validated.height));
+        const defaultWidth = Math.max(24, Math.round(validated.width * scale));
+        const defaultHeight = Math.max(24, Math.round(validated.height * scale));
+        const width = input.width ?? (input.height ? Math.max(24, Math.round(input.height * validated.width / validated.height)) : defaultWidth);
+        const height = input.height ?? (input.width ? Math.max(24, Math.round(input.width * validated.height / validated.width)) : defaultHeight);
+        const [imageElement] = convertToExcalidrawElements([{
+          id: randomId(), type: "image", fileId, x: input.x, y: input.y, width, height,
+          customData: { drawAttribution: input.attribution },
+        }] as any[], { regenerateIds: false }) as any[];
+        if (!imageElement) throw new Error("Could not create the image element.");
+        filesToRestore = [file];
+        elements = [...elements, imageElement];
+        nextDocument = fromCurrentScene({ elements, appState: api.getAppState() as any, files: { ...api.getFiles(), [fileId]: file } }, {
+          id: current.document.id, title: current.document.title,
+          documentRevision: current.document.documentRevision + 1, viewRevision: current.document.viewRevision,
+          background: current.document.canvas.background, viewport: current.document.canvas.viewport,
+        });
+        result = { addedElementIds: [imageElement.id], assetId: fileId, attribution: input.attribution };
       } else if (event.operation === "update_elements") {
         const update = applyElementUpdates(elements, event.input.updates, measureTextWithExcalidraw);
         elements = update.elements;
@@ -1038,7 +1157,7 @@ export default function App() {
           ? { preset: "blackboard" as const, styleVersion: 1, color, texture: "chalk-smudge-v1" }
           : { preset: "white" as const, styleVersion: 1, color };
         const appState = { ...(api.getAppState() as any), viewBackgroundColor: preset === "blackboard" ? "transparent" : color, currentItemStrokeColor: preset === "blackboard" ? "#f6f2e9" : "#1e1e1e" };
-        nextDocument = fromExcalidrawScene({ elements, appState, files: api.getFiles() }, {
+        nextDocument = fromCurrentScene({ elements, appState, files: api.getFiles() }, {
           id: current.document.id,
           title: event.input.title ?? current.document.title,
           documentRevision: current.document.documentRevision + 1,
@@ -1085,7 +1204,7 @@ export default function App() {
             scrollY: liveAppState.scrollY,
             zoom: liveAppState.zoom,
           };
-          nextDocument = fromExcalidrawScene({ elements, appState: commandAppState, files: afterScene.files }, {
+          nextDocument = fromCurrentScene({ elements, appState: commandAppState, files: afterScene.files }, {
             id: current.document.id,
             title: redoState.operation.afterDocument.document.title,
             documentRevision: current.document.documentRevision + 1,
@@ -1112,7 +1231,7 @@ export default function App() {
           scrollY: liveAppState.scrollY,
           zoom: liveAppState.zoom,
         };
-        nextDocument = fromExcalidrawScene({ elements, appState: commandAppState, files: beforeScene.files }, {
+        nextDocument = fromCurrentScene({ elements, appState: commandAppState, files: beforeScene.files }, {
           id: current.document.id,
           title: current.document.title,
           documentRevision: current.document.documentRevision + 1,
@@ -1153,7 +1272,7 @@ export default function App() {
       if (!nextDocument && !mutationWithoutDocument) {
         const sceneMutation = event.operation !== "set_viewport";
         const viewMutation = event.operation === "set_viewport";
-        nextDocument = fromExcalidrawScene({ elements, appState: api.getAppState() as any, files: api.getFiles() }, {
+        nextDocument = fromCurrentScene({ elements, appState: api.getAppState() as any, files: api.getFiles() }, {
           id: current.document.id,
           title: current.document.title,
           documentRevision: current.document.documentRevision + (sceneMutation ? 1 : 0),
@@ -1177,7 +1296,7 @@ export default function App() {
         documentRevision: nextDocument.document.documentRevision,
         viewRevision: nextDocument.document.viewRevision,
       };
-      const undoEligible = ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "redo_operation"].includes(event.operation);
+      const undoEligible = ["create_diagram", "create_elements", "insert_image", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "redo_operation"].includes(event.operation);
       let persistenceWarning: string | undefined;
       if (durableMutation) {
         const record: DurableMcpOperation = {
@@ -1322,25 +1441,29 @@ export default function App() {
         y: typeof state.scrollY === "number" ? state.scrollY : current.document.canvas.viewport.y,
         zoom: typeof state.zoom?.value === "number" ? state.zoom.value : current.document.canvas.viewport.zoom,
       };
-      const sceneChanged = JSON.stringify(current.document.elements) !== JSON.stringify(elements)
-        || JSON.stringify(current.document.assets) !== JSON.stringify(files);
+      const candidate = fromCurrentScene({ elements, appState: state, files }, {
+        id: current.document.id,
+        title: current.document.title,
+        documentRevision: current.document.documentRevision,
+        viewRevision: current.document.viewRevision,
+        background: current.document.canvas.background,
+        viewport,
+      });
+      const sceneChanged = JSON.stringify(current.document.elements) !== JSON.stringify(candidate.document.elements)
+        || JSON.stringify(current.document.assets) !== JSON.stringify(candidate.document.assets);
       if (sceneChanged) {
         lastMcpOperation.current = null;
         lastUndoneOperation.current = null;
       }
       const viewChanged = JSON.stringify(current.document.canvas.viewport) !== JSON.stringify(viewport);
-      const next = fromExcalidrawScene({
-        elements,
-        appState: state,
-        files,
-      }, {
-        id: current.document.id,
-        title: current.document.title,
-        documentRevision: current.document.documentRevision + (sceneChanged ? 1 : 0),
-        viewRevision: current.document.viewRevision + (viewChanged ? 1 : 0),
-        background: current.document.canvas.background,
-        viewport,
-      });
+      const next = {
+        ...candidate,
+        document: {
+          ...candidate.document,
+          documentRevision: current.document.documentRevision + (sceneChanged ? 1 : 0),
+          viewRevision: current.document.viewRevision + (viewChanged ? 1 : 0),
+        },
+      };
       setDocument(next);
       if (!autosaveBlocked) {
         autosave.schedule(next);
@@ -1482,8 +1605,10 @@ export default function App() {
       }} /></span></div>
       <div className="toolbar-actions">
         <span className={`save-indicator ${status}`}><i />{statusText}</span>
-        <button className="button button-quiet" disabled={!canWrite} onClick={() => { setConnectError(""); setConnectOpen(true); }} title="Pair this editor with the local MCP bridge">{editorConnected ? "MCP connected" : "Connect MCP"}</button>
-        <button className="button button-quiet" disabled={!canWrite} onClick={() => void openMcpManagement()} title="Pair or revoke local MCP clients">MCP clients</button>
+        <button className="button button-quiet" disabled={!canWrite} onClick={() => { setImageSearchError(""); setImagePickerOpen(true); }} title="Search openly licensed illustrations">Images</button>
+        <button className="button button-quiet" disabled={!imageCredits.length} onClick={() => setCreditsOpen(true)} title="Inspect saved image attribution">Image credits</button>
+        {import.meta.env.DEV && <button className="button button-quiet" disabled={!canWrite} onClick={() => { setConnectError(""); setConnectOpen(true); }} title="Pair this editor with the local MCP bridge">{editorConnected ? "MCP connected" : "Connect MCP"}</button>}
+        {import.meta.env.DEV && <button className="button button-quiet" disabled={!canWrite} onClick={() => void openMcpManagement()} title="Pair or revoke local MCP clients">MCP clients</button>}
         <button className="button button-quiet" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open an editable Draw document" : "Close the other Draw tab to open files here"}>Open .draw</button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
         <button className="button button-primary" onClick={saveFile} title="Save the complete editable Draw file"><span className="button-icon">↓</span>Save .draw</button>
@@ -1502,6 +1627,57 @@ export default function App() {
       <button className="button" disabled={!canWrite || !activeCanvasId} onClick={() => void renameActiveCanvas()}>Rename canvas</button>
       <button className="button button-danger-quiet" disabled={!canWrite || !activeCanvasId} onClick={() => void removeActiveCanvas()}>Delete canvas</button>
     </nav>
+    {imagePickerOpen && <div className="draw-confirmation-backdrop" role="presentation">
+      <section className="draw-image-picker" role="dialog" aria-modal="true" aria-labelledby="draw-image-picker-title">
+        <div className="draw-dialog-heading"><div><h2 id="draw-image-picker-title">Find an illustration</h2><p>Search Openverse for openly licensed images. Check each item's source and license before reuse.</p></div><button className="button button-quiet" onClick={() => setImagePickerOpen(false)} aria-label="Close image search">×</button></div>
+        <form className="draw-image-search" onSubmit={(event) => void searchImages(event)}>
+          <label htmlFor="draw-image-query">Search images</label>
+          <input id="draw-image-query" value={imageQuery} onChange={(event) => setImageQuery(event.target.value)} maxLength={200} placeholder="e.g. chalk robot illustration" />
+          <label htmlFor="draw-image-license">License filter</label>
+          <select id="draw-image-license" value={imageLicense} onChange={(event) => setImageLicense(event.target.value)}>
+            <option value="">All supported licenses</option><option value="cc0">CC0</option><option value="pdm">Public domain</option><option value="by">CC BY</option><option value="by-sa">CC BY-SA</option><option value="by-nd">CC BY-ND</option><option value="by-nc">CC BY-NC</option><option value="by-nc-sa">CC BY-NC-SA</option><option value="by-nc-nd">CC BY-NC-ND</option>
+          </select>
+          <label htmlFor="draw-image-category">Image type</label>
+          <select id="draw-image-category" value={imageCategory} onChange={(event) => setImageCategory(event.target.value as typeof imageCategory)}>
+            <option value="illustration">Illustrations</option><option value="digitized_artwork">Digitized artwork</option><option value="photograph">Photographs</option><option value="all">All image types</option>
+          </select>
+          <button className="button button-primary" disabled={imageSearchBusy || !imageQuery.trim()} type="submit">{imageSearchBusy ? "Searching…" : "Search"}</button>
+        </form>
+        {imageSearchError && <p role="alert" className="draw-image-error">{imageSearchError}</p>}
+        <div className="draw-image-results" aria-live="polite">
+          {imageResults.map((result) => <article className="draw-image-card" key={result.id}>
+            <img src={result.thumbnailUrl} alt="" loading="lazy" referrerPolicy="no-referrer" />
+            <div className="draw-image-card-copy"><strong>{result.title}</strong>
+              <span>{result.creator ?? "Creator not listed"}</span>
+              <span>License: {result.license ? `${result.license.toUpperCase()}${result.licenseVersion ? ` ${result.licenseVersion}` : ""}` : "Not listed; verify before reuse"}</span>
+              <div className="draw-image-links">{result.sourceUrl && <a href={result.sourceUrl} target="_blank" rel="noreferrer">Source</a>}{result.creatorUrl && <a href={result.creatorUrl} target="_blank" rel="noreferrer">Creator</a>}{result.licenseUrl && <a href={result.licenseUrl} target="_blank" rel="noreferrer">License</a>}</div>
+              <button className="button button-quiet" disabled={imageInsertBusy !== null || !result.license} title={!result.license ? "This result has no license metadata and cannot be inserted by default." : "Embed this image and its attribution in the drawing"} onClick={() => void insertOpenverseImage(result)}>{imageInsertBusy === result.id ? "Adding…" : "Add to drawing"}</button>
+            </div>
+          </article>)}
+          {!imageSearchBusy && imageQuery && !imageResults.length && !imageSearchError && <p>No matching images found. Try a broader search.</p>}
+        </div>
+        {imageResults.length >= 12 && imagePage < 20 && <button className="button button-quiet" disabled={imageSearchBusy} onClick={() => void searchImages(undefined, imagePage + 1, true)}>{imageSearchBusy ? "Loading…" : "Load more"}</button>}
+        <p className="draw-image-disclaimer">Search provided by <a href="https://openverse.org/" target="_blank" rel="noreferrer">Openverse</a>; Draw is not endorsed or certified by Openverse. Images are embedded for offline editing. Openverse indexes third-party license claims; verify each item's rights and attribution requirements before reuse. See <a href="https://docs.openverse.org/terms_of_service/" target="_blank" rel="noreferrer">Openverse's terms</a>.</p>
+      </section>
+    </div>}
+    {creditsOpen && <div className="draw-confirmation-backdrop" role="presentation">
+      <section className="draw-confirmation" role="dialog" aria-modal="true" aria-labelledby="draw-image-credits-title">
+        <h2 id="draw-image-credits-title">Image credits</h2>
+        {!imageCredits.length && <p>No Openverse images are in this drawing.</p>}
+        <div className="draw-image-credit-list">{imageCredits.map(({ id, attribution }) => <article key={id}>
+          <strong>{attribution.title}</strong><span>{attribution.creator ?? "Creator not listed"}</span>
+          <span>{attribution.license ? `${attribution.license.toUpperCase()}${attribution.licenseVersion ? ` ${attribution.licenseVersion}` : ""}` : "License not listed"}</span>
+          <small>{attribution.verification === "unverified" ? "File supplied claim (unverified). Verify it with a trusted source." : "Openverse listing metadata; licensing claims are not independently verified."}</small>
+          <div className="draw-image-links">{isSafeHttpsUrl(attribution.sourceUrl) && <a href={attribution.sourceUrl} target="_blank" rel="noreferrer">Source</a>}{isSafeHttpsUrl(attribution.creatorUrl) && <a href={attribution.creatorUrl} target="_blank" rel="noreferrer">Creator</a>}{isSafeHttpsUrl(attribution.licenseUrl) && <a href={attribution.licenseUrl} target="_blank" rel="noreferrer">License</a>}</div>
+        </article>)}</div>
+        {imageCredits.length > 0 && <button className="button button-quiet" onClick={() => {
+          const report = imageCredits.map(({ attribution }) => `${attribution.title}\nAttribution status: ${attribution.verification === "unverified" ? "File supplied claim (unverified)" : "Openverse listing metadata; not independently verified"}\nCreator: ${attribution.creator ?? "Not listed"}${isSafeHttpsUrl(attribution.creatorUrl) ? ` (${attribution.creatorUrl})` : ""}\nSource: ${isSafeHttpsUrl(attribution.sourceUrl) ? attribution.sourceUrl : "Not listed"}\nLicense: ${attribution.license ? `${attribution.license.toUpperCase()} ${attribution.licenseVersion ?? ""}`.trim() : "Not listed"}${isSafeHttpsUrl(attribution.licenseUrl) ? ` (${attribution.licenseUrl})` : ""}\n${attribution.attribution ?? ""}`).join("\n\n");
+          download(new Blob([report], { type: "text/plain;charset=utf-8" }), filename(doc.document.title, "credits.txt"));
+        }}>Download credits report</button>}
+        <p className="draw-confirmation-expiry">Verify each item's license and any requirements for sharing adaptations or commercial use.</p>
+        <div className="draw-confirmation-actions"><button className="button button-quiet" onClick={() => setCreditsOpen(false)}>Close</button></div>
+      </section>
+    </div>}
     <div className="workspace">
       <section className="canvas-area" aria-label="Drawing canvas">
     <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onChange} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS}

@@ -1,4 +1,5 @@
 import type { DrawDocument } from "../document/document";
+import { normalizeImageAttribution } from "../document/attribution";
 
 export type DiagramNodeInput = {
   id: string;
@@ -87,6 +88,32 @@ export type ExportImageInput = {
   path?: string; documentId: string; format: "png" | "jpeg"; scope: "canvas" | "selection";
   background?: "blackboard" | "white" | "transparent";
 };
+export type InsertImageInput = {
+  documentId: string;
+  expectedDocumentRevision: number;
+  idempotencyKey: string;
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+  mimeType: "image/png" | "image/jpeg";
+  dataURL: string;
+  attribution: {
+    provider: "Openverse";
+    providerId: string;
+    title: string;
+    creator?: string;
+    creatorUrl?: string;
+    sourceUrl?: string;
+    license?: string;
+    licenseVersion?: string;
+    licenseUrl?: string;
+    attribution?: string;
+    source?: string;
+    capturedAt: string;
+  };
+  idempotencyPayload?: { imageId: string; x: number; y: number; width?: number; height?: number };
+};
 
 export type McpCommand =
   | { operation: "create_diagram"; input: CreateDiagramInput }
@@ -103,7 +130,8 @@ export type McpCommand =
   | { operation: "set_viewport"; input: ViewportInput }
   | { operation: "open_document"; input: OpenDocumentInput; document?: DrawDocument }
   | { operation: "save_document"; input: SaveDocumentInput }
-  | { operation: "export_image"; input: ExportImageInput };
+  | { operation: "export_image"; input: ExportImageInput }
+  | { operation: "insert_image"; input: InsertImageInput };
 
 export class McpValidationError extends Error {
   constructor(message: string) {
@@ -567,6 +595,51 @@ function parseSceneTool(name: string, value: unknown): McpCommand | null {
   return null;
 }
 
+function parseEmbeddedImage(value: unknown): McpCommand {
+  const input = requireRecord(value, "insert_image input");
+  const allowedFields = new Set(["documentId", "expectedDocumentRevision", "idempotencyKey", "x", "y", "width", "height", "mimeType", "dataURL", "attribution", "idempotencyPayload"]);
+  for (const field of Object.keys(input)) if (!allowedFields.has(field)) throw new McpValidationError(`insert_image has unsupported field "${field}"; remote image URLs are not accepted.`);
+  if (!Number.isSafeInteger(input.expectedDocumentRevision) || (input.expectedDocumentRevision as number) < 0) {
+    throw new McpValidationError("insert_image.expectedDocumentRevision must be a non-negative integer.");
+  }
+  const mimeType = input.mimeType;
+  if (mimeType !== "image/png" && mimeType !== "image/jpeg") throw new McpValidationError("insert_image.mimeType must be image/png or image/jpeg.");
+  const dataURL = input.dataURL;
+  const maximumLength = Math.ceil((2 * 1024 * 1024) * 4 / 3) + 64;
+  if (typeof dataURL !== "string" || dataURL.length > maximumLength || !new RegExp(`^data:${mimeType.replace("/", "\\/")};base64,[A-Za-z0-9+/]+=*$`).test(dataURL)) {
+    throw new McpValidationError("insert_image.dataURL must be a base64 PNG or JPEG no larger than 2 MiB.");
+  }
+  const raw = requireRecord(input.attribution, "insert_image.attribution");
+  const attributionFields = new Set(["provider", "providerId", "title", "creator", "creatorUrl", "sourceUrl", "license", "licenseVersion", "licenseUrl", "attribution", "source", "capturedAt", "verification"]);
+  for (const field of Object.keys(raw)) if (!attributionFields.has(field)) throw new McpValidationError(`insert_image.attribution has unsupported field "${field}".`);
+  const normalizedAttribution = normalizeImageAttribution(raw, "unverified", true);
+  if (!normalizedAttribution) throw new McpValidationError("insert_image.attribution must contain a valid Openverse ID, title, supported license, capture date, and safe optional metadata.");
+  let idempotencyPayload: InsertImageInput["idempotencyPayload"];
+  if (input.idempotencyPayload !== undefined) {
+    const stable = requireRecord(input.idempotencyPayload, "insert_image.idempotencyPayload");
+    for (const field of Object.keys(stable)) if (!["imageId", "x", "y", "width", "height"].includes(field)) throw new McpValidationError(`insert_image.idempotencyPayload has unsupported field "${field}".`);
+    if (typeof stable.imageId !== "string" || !/^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i.test(stable.imageId)) throw new McpValidationError("insert_image.idempotencyPayload.imageId must be a valid provider ID.");
+    idempotencyPayload = {
+      imageId: stable.imageId, x: requireFiniteCoordinate(stable.x, "insert_image.idempotencyPayload.x"), y: requireFiniteCoordinate(stable.y, "insert_image.idempotencyPayload.y"),
+      ...(stable.width !== undefined ? { width: optionalDimension(stable.width, "insert_image.idempotencyPayload.width") } : {}),
+      ...(stable.height !== undefined ? { height: optionalDimension(stable.height, "insert_image.idempotencyPayload.height") } : {}),
+    };
+  }
+  return { operation: "insert_image", input: {
+    documentId: requireString(input.documentId, "insert_image.documentId", 200),
+    expectedDocumentRevision: input.expectedDocumentRevision as number,
+    idempotencyKey: requireIdempotencyKey(input, "insert_image"),
+    x: requireFiniteCoordinate(input.x, "insert_image.x"),
+    y: requireFiniteCoordinate(input.y, "insert_image.y"),
+    ...(input.width !== undefined ? { width: optionalDimension(input.width, "insert_image.width") } : {}),
+    ...(input.height !== undefined ? { height: optionalDimension(input.height, "insert_image.height") } : {}),
+    mimeType,
+    dataURL,
+    attribution: normalizedAttribution,
+    ...(idempotencyPayload ? { idempotencyPayload } : {}),
+  } };
+}
+
 export function parseMcpToolInput(
   name: string,
   input: unknown,
@@ -577,6 +650,7 @@ export function parseMcpToolInput(
   if (name === "create_elements") {
     return { operation: "create_elements", input: parseCreateElements(input) };
   }
+  if (name === "insert_image" || name === "insert_openverse_image") return parseEmbeddedImage(input);
   if (name === "update_elements") {
     return { operation: "update_elements", input: parseUpdateElements(input) };
   }
