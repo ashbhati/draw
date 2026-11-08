@@ -116,8 +116,27 @@ describe("Draw document contract", () => {
       elements: [{ ...exampleElement, type: "image", fileId: "asset-1", customData: { drawAttribution: attribution } }],
       files: { "asset-1": { id: "asset-1", mimeType: "image/png", dataURL: "data:image/png;base64,aGVsbG8=", created: 1 } },
     });
-    expect(doc.document.assets["asset-1"]).toMatchObject({ dataURL: "data:image/png;base64,aGVsbG8=", attribution });
+    expect(doc.document.assets["asset-1"]).toMatchObject({ dataURL: "data:image/png;base64,aGVsbG8=", attribution: { ...attribution, verification: "unverified" } });
     expect(parseDrawFile(serializeDrawFile(doc)).document.assets["asset-1"]?.attribution).toMatchObject({ ...attribution, verification: "unverified" });
+  });
+
+  it("does not trust a pasted Openverse claim that omits its verification provenance", () => {
+    const attribution = { provider: "Openverse", providerId: "123e4567-e89b-12d3-a456-426614174000", title: "Pasted claim", license: "by", capturedAt: "2026-01-01T00:00:00.000Z" };
+    const doc = fromExcalidrawScene({
+      elements: [{ ...exampleElement, type: "image", fileId: "pasted-image", customData: { drawAttribution: attribution } }],
+      files: { "pasted-image": { id: "pasted-image", mimeType: "image/png", dataURL: "data:image/png;base64,aGVsbG8=", created: 1 } },
+    });
+    expect(doc.document.assets["pasted-image"]?.attribution).toMatchObject({ providerId: attribution.providerId, verification: "unverified" });
+  });
+
+  it("does not trust a pasted Openverse claim that forges verified provenance", () => {
+    const attribution = { provider: "Openverse", providerId: "123e4567-e89b-12d3-a456-426614174000", title: "Forged claim", license: "by", capturedAt: "2026-01-01T00:00:00.000Z", verification: "openverse-index" };
+    const doc = fromExcalidrawScene({
+      elements: [{ ...exampleElement, type: "image", fileId: "pasted-image", customData: { drawAttribution: attribution } }],
+      files: { "pasted-image": { id: "pasted-image", mimeType: "image/png", dataURL: "data:image/png;base64,aGVsbG8=", created: 1 } },
+    });
+    expect(doc.document.assets["pasted-image"]?.attribution).toMatchObject({ providerId: attribution.providerId, verification: "unverified" });
+    expect(parseDrawFile(serializeDrawFile(doc)).document.assets["pasted-image"]?.attribution).toMatchObject({ providerId: attribution.providerId, verification: "unverified" });
   });
 
   it("normalizes file attribution and marks every imported claim unverified", () => {

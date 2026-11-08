@@ -236,7 +236,7 @@ describe("MCP tool input contract", () => {
       dataURL: `data:image/png;base64,${"A".repeat(64)}`, mimeType: "image/png", width: 320, height: 180,
       attribution: { ...attribution, verification: "unverified" },
       idempotencyPayload: { imageId: attribution.providerId, x: 10, y: 20, width: 320, height: 180 },
-    })).toMatchObject({ operation: "insert_image", input: { attribution: { providerId: attribution.providerId, verification: "openverse-index" } } });
+    })).toMatchObject({ operation: "insert_image", input: { attribution: { providerId: attribution.providerId, verification: "unverified" } } });
     expect(() => parseMcpToolInputImpl("insert_image", {
       documentId: "doc-1", expectedDocumentRevision: 2, idempotencyKey: "image-2", x: 10, y: 20,
       url: "https://evil.example/image.png", mimeType: "image/png", dataURL: "data:image/png;base64,AA==", attribution,

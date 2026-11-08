@@ -1266,7 +1266,12 @@ test("MCP creates rendered editable primitives with relationships that stay edit
   }).toBe(true);
 
   const canvas = page.locator(".excalidraw canvas").last();
-  const bounds = await canvas.boundingBox();
+  await expect(canvas).toBeVisible();
+  let bounds: Awaited<ReturnType<typeof canvas.boundingBox>> = null;
+  await expect.poll(async () => {
+    bounds = await canvas.boundingBox();
+    return bounds !== null;
+  }).toBe(true);
   if (!bounds) throw new Error("Could not locate the drawing canvas.");
   const view = current.document.appState;
   const zoom = typeof view.zoom?.value === "number" ? view.zoom.value : 1;
@@ -1703,12 +1708,12 @@ test("Openverse picker previews license metadata and embeds an offline-editable 
 
 });
 
-test("paired MCP insert_image cannot mark caller supplied attribution as Openverse verified", async ({ page }) => {
+test("paired MCP Openverse image claims remain unverified after save and reload", async ({ page }) => {
   const current = await freshBridgeDocument(page);
   const id = "123e4567-e89b-12d3-a456-426614174000";
   const png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jJ5sAAAAASUVORK5CYII=";
   const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
-    operation: "insert_image",
+    operation: "insert_openverse_image",
     input: {
       documentId: current.document.id, expectedDocumentRevision: current.document.documentRevision, idempotencyKey: "forged-openverse-attribution",
       x: 100, y: 100, width: 24, height: 24, mimeType: "image/png", dataURL: png,
@@ -1717,6 +1722,13 @@ test("paired MCP insert_image cannot mark caller supplied attribution as Openver
     },
   } });
   expect(response.ok(), await response.text()).toBeTruthy();
+  await expect.poll(async () => {
+    const document = await freshBridgeDocument(page);
+    const image = document.document.elements.find((element: any) => element.type === "image");
+    return image && document.document.assets[image.fileId]?.attribution?.verification;
+  }).toBe("unverified");
+  await page.reload();
+  await waitForBridge(page);
   await expect.poll(async () => {
     const document = await freshBridgeDocument(page);
     const image = document.document.elements.find((element: any) => element.type === "image");
@@ -1760,7 +1772,7 @@ test("stdio MCP searches Openverse, inserts by provider ID, and saves a reopenab
     expect(changed.document.elements.filter((element: any) => element.type === "image")).toHaveLength(1);
     const imageElement = changed.document.elements.find((element: any) => element.type === "image");
     expect(imageElement).toBeTruthy();
-    expect(changed.document.assets[imageElement.fileId]).toMatchObject({ attribution: { providerId: searchResult.results[0].id, license: "by", sourceUrl: "https://source.example/chalk-arrow", verification: "openverse-index" }, dataURL: expect.stringMatching(/^data:image\/png;base64,/) });
+    expect(changed.document.assets[imageElement.fileId]).toMatchObject({ attribution: { providerId: searchResult.results[0].id, license: "by", sourceUrl: "https://source.example/chalk-arrow", verification: "unverified" }, dataURL: expect.stringMatching(/^data:image\/png;base64,/) });
 
     const latestCanvas = await mcp.call("get_current_canvas", {});
     expect(latestCanvas.error).toBeUndefined();
@@ -2630,11 +2642,16 @@ test("pending autosave is discarded safely when switching or deleting a canvas",
   const canvasPicker = page.locator('nav select[aria-label="Canvas"]');
   const firstCanvasId = await canvasPicker.inputValue();
   await page.getByRole("button", { name: "New canvas" }).click();
+  await expect.poll(() => canvasPicker.inputValue()).not.toBe(firstCanvasId);
+  await expect(canvasPicker.locator("option")).toHaveCount(2);
   await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
   const canvas = page.locator(".excalidraw canvas").last();
   await expect(canvas).toBeVisible();
-  await expect.poll(() => canvas.boundingBox()).not.toBeNull();
-  const box = await canvas.boundingBox();
+  let box: Awaited<ReturnType<typeof canvas.boundingBox>> = null;
+  await expect.poll(async () => {
+    box = await canvas.boundingBox();
+    return box !== null;
+  }).toBe(true);
   if (!box) throw new Error("The drawing canvas is unavailable.");
   await page.locator('.excalidraw label[title^="Rectangle"]').click();
   const startX = box.x + box.width / 2 - 70;

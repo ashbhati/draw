@@ -1,7 +1,7 @@
 /** Portable, self-contained Draw document format. Version 1 stores editor
  * elements and app state verbatim so opening a file restores editable content. */
 
-import { normalizeDrawImageAttributions } from "./attribution";
+import { normalizeDrawImageAttributions, normalizeImageAttribution, type DrawImageAttribution } from "./attribution";
 
 export type DrawBackgroundPreset = "blackboard" | "white";
 
@@ -69,6 +69,8 @@ export interface DrawDocumentMetadata {
   viewRevision?: number;
   background?: DrawBackground;
   viewport?: DrawViewport;
+  /** Trust labels attached only by a verified app-side Openverse fetch or trusted local document. */
+  trustedAttributions?: Record<string, DrawImageAttribution>;
 }
 
 export class DrawDocumentError extends Error {
@@ -332,7 +334,19 @@ export function fromExcalidrawScene(
       assets: normalizeSceneFilesWithAttribution(scene.files ?? {}, scene.elements),
     },
   };
-  normalizeDrawImageAttributions(doc, "openverse-index");
+  normalizeDrawImageAttributions(doc, "unverified");
+  for (const [fileId, claimedAttribution] of Object.entries(metadata.trustedAttributions ?? {})) {
+    const asset = doc.document.assets[fileId];
+    if (!asset) continue;
+    const attribution = normalizeImageAttribution(claimedAttribution, "openverse-index");
+    if (!attribution) continue;
+    for (const element of doc.document.elements) {
+      if (element.type === "image" && element.fileId === fileId) {
+        element.customData = { ...((element.customData as Record<string, unknown> | undefined) ?? {}), drawAttribution: attribution };
+      }
+    }
+    asset.attribution = attribution;
+  }
   validateDrawDocument(doc);
   return doc;
 }

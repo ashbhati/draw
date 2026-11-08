@@ -162,6 +162,7 @@ export default function App() {
   const [imageSearchBusy, setImageSearchBusy] = useState(false);
   const [imageInsertBusy, setImageInsertBusy] = useState<string | null>(null);
   const [creditsOpen, setCreditsOpen] = useState(false);
+  const fetchedOpenverseAttributions = useRef(new Map<string, OpenverseAttribution>());
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
   const docRef = useRef<DrawDocument | null>(null);
   const activeDocumentIdRef = useRef<string | null>(null);
@@ -232,6 +233,25 @@ export default function App() {
     activeDocumentIdRef.current = next.document.id;
     setDoc(next);
   }, []);
+
+  const fromCurrentScene = (
+    scene: Parameters<typeof fromExcalidrawScene>[0],
+    metadata: Parameters<typeof fromExcalidrawScene>[1] = {},
+  ) => {
+    const current = docRef.current;
+    const trustedAttributions: Record<string, OpenverseAttribution & { verification: "openverse-index" }> = {};
+    for (const [fileId, asset] of Object.entries(current?.document.assets ?? {})) {
+      const attribution = (asset as { attribution?: OpenverseAttribution }).attribution;
+      const sceneFile = scene.files?.[fileId] as { dataURL?: unknown } | undefined;
+      if (attribution?.verification === "openverse-index" && sceneFile?.dataURL === asset.dataURL) {
+        trustedAttributions[fileId] = { ...attribution, verification: "openverse-index" };
+      }
+    }
+    for (const [fileId, attribution] of fetchedOpenverseAttributions.current) {
+      if (scene.files?.[fileId]) trustedAttributions[fileId] = { ...attribution, verification: "openverse-index" };
+    }
+    return fromExcalidrawScene(scene, { ...metadata, trustedAttributions });
+  };
 
   useEffect(() => {
     if (!doc || !activeCanvasId) return;
@@ -405,7 +425,7 @@ export default function App() {
       zoom: typeof state.zoom?.value === "number" ? state.zoom.value : current.document.canvas.viewport.zoom,
     };
     const viewChanged = JSON.stringify(current.document.canvas.viewport) !== JSON.stringify(viewport);
-    const next = fromExcalidrawScene({ elements, appState, files }, {
+    const next = fromCurrentScene({ elements, appState, files }, {
       id: current.document.id,
       title: current.document.title,
       documentRevision: current.document.documentRevision + (sceneChanged ? 1 : 0),
@@ -770,6 +790,7 @@ export default function App() {
     const api = apiRef.current;
     if (!api || !canWrite) throw new Error("The canvas is read-only in this tab.");
     const id = randomId();
+    fetchedOpenverseAttributions.current.set(id, image.attribution);
     const scale = Math.min(1, 500 / Math.max(image.width, image.height));
     const defaultWidth = Math.max(24, Math.round(image.width * scale));
     const defaultHeight = Math.max(24, Math.round(image.height * scale));
@@ -1104,7 +1125,7 @@ export default function App() {
         if (!imageElement) throw new Error("Could not create the image element.");
         filesToRestore = [file];
         elements = [...elements, imageElement];
-        nextDocument = fromExcalidrawScene({ elements, appState: api.getAppState() as any, files: { ...api.getFiles(), [fileId]: file } }, {
+        nextDocument = fromCurrentScene({ elements, appState: api.getAppState() as any, files: { ...api.getFiles(), [fileId]: file } }, {
           id: current.document.id, title: current.document.title,
           documentRevision: current.document.documentRevision + 1, viewRevision: current.document.viewRevision,
           background: current.document.canvas.background, viewport: current.document.canvas.viewport,
@@ -1136,7 +1157,7 @@ export default function App() {
           ? { preset: "blackboard" as const, styleVersion: 1, color, texture: "chalk-smudge-v1" }
           : { preset: "white" as const, styleVersion: 1, color };
         const appState = { ...(api.getAppState() as any), viewBackgroundColor: preset === "blackboard" ? "transparent" : color, currentItemStrokeColor: preset === "blackboard" ? "#f6f2e9" : "#1e1e1e" };
-        nextDocument = fromExcalidrawScene({ elements, appState, files: api.getFiles() }, {
+        nextDocument = fromCurrentScene({ elements, appState, files: api.getFiles() }, {
           id: current.document.id,
           title: event.input.title ?? current.document.title,
           documentRevision: current.document.documentRevision + 1,
@@ -1183,7 +1204,7 @@ export default function App() {
             scrollY: liveAppState.scrollY,
             zoom: liveAppState.zoom,
           };
-          nextDocument = fromExcalidrawScene({ elements, appState: commandAppState, files: afterScene.files }, {
+          nextDocument = fromCurrentScene({ elements, appState: commandAppState, files: afterScene.files }, {
             id: current.document.id,
             title: redoState.operation.afterDocument.document.title,
             documentRevision: current.document.documentRevision + 1,
@@ -1210,7 +1231,7 @@ export default function App() {
           scrollY: liveAppState.scrollY,
           zoom: liveAppState.zoom,
         };
-        nextDocument = fromExcalidrawScene({ elements, appState: commandAppState, files: beforeScene.files }, {
+        nextDocument = fromCurrentScene({ elements, appState: commandAppState, files: beforeScene.files }, {
           id: current.document.id,
           title: current.document.title,
           documentRevision: current.document.documentRevision + 1,
@@ -1251,7 +1272,7 @@ export default function App() {
       if (!nextDocument && !mutationWithoutDocument) {
         const sceneMutation = event.operation !== "set_viewport";
         const viewMutation = event.operation === "set_viewport";
-        nextDocument = fromExcalidrawScene({ elements, appState: api.getAppState() as any, files: api.getFiles() }, {
+        nextDocument = fromCurrentScene({ elements, appState: api.getAppState() as any, files: api.getFiles() }, {
           id: current.document.id,
           title: current.document.title,
           documentRevision: current.document.documentRevision + (sceneMutation ? 1 : 0),
@@ -1420,7 +1441,7 @@ export default function App() {
         y: typeof state.scrollY === "number" ? state.scrollY : current.document.canvas.viewport.y,
         zoom: typeof state.zoom?.value === "number" ? state.zoom.value : current.document.canvas.viewport.zoom,
       };
-      const candidate = fromExcalidrawScene({ elements, appState: state, files }, {
+      const candidate = fromCurrentScene({ elements, appState: state, files }, {
         id: current.document.id,
         title: current.document.title,
         documentRevision: current.document.documentRevision,

@@ -243,16 +243,12 @@ function createServer() {
     const metadata = await getOpenverseImageMetadata(input.imageId, fetch, deadline - Date.now());
     if (!metadata.license) throw new Error("Openverse has no license information for this image. Draw will not insert it.");
     const image = await fetchOpenverseImage(input.imageId, imageAttributionFromOpenverseResult(metadata), fetch, deadline - Date.now());
-    // This internal command name is only used after this server has fetched
-    // both the Openverse metadata and the image by provider ID.
     const command = parseMcpToolInput("insert_openverse_image", {
       documentId: input.documentId, expectedDocumentRevision: input.expectedDocumentRevision, idempotencyKey: input.idempotencyKey,
       x: input.x, y: input.y, ...(input.width ? { width: input.width } : {}), ...(input.height ? { height: input.height } : {}),
       mimeType: image.mimeType, dataURL: image.dataURL, attribution: image.attribution,
       idempotencyPayload: { imageId: input.imageId, x: input.x, y: input.y, ...(input.width ? { width: input.width } : {}), ...(input.height ? { height: input.height } : {}) },
     });
-    // Preserve the internal provenance marker across the bridge boundary so
-    // it can distinguish this fetched image from raw client-supplied bytes.
     const result = await bridgeRequest("/__draw/api/commands", { method: "POST", body: JSON.stringify({ ...command, operation: "insert_openverse_image" }) });
     const storedResult = result.result as Record<string, any>;
     const attribution = storedResult.attribution as OpenverseAttribution | undefined;
