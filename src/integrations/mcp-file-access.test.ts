@@ -54,4 +54,21 @@ describe("MCP document file access", () => {
     await expect(writeNewArtifact(root, "same.draw", new TextEncoder().encode("replace"), "draw")).rejects.toThrow(/already exists/i);
     expect(await readFile(join(root, "same.draw"), "utf8")).toBe("keep this");
   });
+
+  it("lets only one concurrent no-replace writer create a target", async () => {
+    const root = await makeRoot();
+    const candidates = [
+      new TextEncoder().encode("first approved bytes"),
+      new TextEncoder().encode("second approved bytes"),
+    ];
+    const outcomes = await Promise.allSettled(candidates.map((bytes) =>
+      writeNewArtifact(root, "raced.png", bytes, "png"),
+    ));
+
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    const rejection = outcomes.find((outcome) => outcome.status === "rejected") as PromiseRejectedResult;
+    expect(rejection.reason).toMatchObject({ message: expect.stringMatching(/PATH_EXISTS/) });
+    const stored = await readFile(join(root, "raced.png"));
+    expect(candidates.some((candidate) => Buffer.from(candidate).equals(stored))).toBe(true);
+  });
 });
