@@ -73,7 +73,7 @@ async function startStdioMcp(baseURL: string, documentDir: string, pairingSecret
   return {
     request,
     call: async (name: string, args: Record<string, unknown>) => {
-      const durableMutation = ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "undo_operation", "redo_operation", "set_canvas_settings", "set_viewport"].includes(name);
+      const durableMutation = ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "undo_operation", "redo_operation", "set_canvas_settings", "set_viewport", "insert_workspace_library_item"].includes(name);
       const argumentsWithKey = durableMutation && typeof args.idempotencyKey !== "string" ? { ...args, idempotencyKey: `e2e-${crypto.randomUUID()}` } : args;
       try { return await request("tools/call", { name, arguments: argumentsWithKey }); }
       catch (error) { throw new Error(`MCP tool ${name} failed: ${error instanceof Error ? error.message : String(error)}`); }
@@ -2451,6 +2451,7 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
       "create_diagram", "update_elements", "delete_elements", "duplicate_elements", "set_selection",
       "group_elements", "ungroup_elements", "arrange_elements", "undo_operation", "redo_operation",
       "set_canvas_settings", "set_viewport", "open_document", "save_document", "export_image",
+      "list_workspace_library", "read_workspace_library_item", "add_selection_to_workspace_library", "rename_workspace_library_item", "delete_workspace_library_item", "insert_workspace_library_item",
     ]));
 
     const initial = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
@@ -2468,6 +2469,35 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
 
     const selectResponse = await mcp.call("set_selection", { documentId: snapshot.documentId, ids: [created.nodes.first, created.nodes.second] });
     expect(selectResponse.error).toBeUndefined();
+    const libraryAdded = await mcp.call("add_selection_to_workspace_library", { itemId: "stdio-workspace-item", elementIds: [created.nodes.first, created.nodes.second], name: "MCP reusable pair", documentId: snapshot.documentId, expectedDocumentRevision: snapshot.documentRevision, idempotencyKey: "stdio-library-add" });
+    expect(libraryAdded.error).toBeUndefined();
+    const libraryList = JSON.parse((await mcp.call("list_workspace_library", { documentId: snapshot.documentId })).result.content[0].text);
+    expect(libraryList.items).toEqual([expect.objectContaining({ id: "stdio-workspace-item", name: "MCP reusable pair", elementCount: 4 })]);
+    const libraryRead = JSON.parse((await mcp.call("read_workspace_library_item", { documentId: snapshot.documentId, itemId: "stdio-workspace-item" })).result.content[0].text);
+    expect(libraryRead.item.assets).toEqual({});
+    let libraryContext = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const renamed = await mcp.call("rename_workspace_library_item", { itemId: "stdio-workspace-item", name: "MCP flow library item", documentId: libraryContext.documentId, expectedDocumentRevision: libraryContext.documentRevision, idempotencyKey: "stdio-library-rename" });
+    expect(renamed.error).toBeUndefined();
+    libraryContext = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const insertedResponse = await mcp.call("insert_workspace_library_item", { itemId: "stdio-workspace-item", documentId: libraryContext.documentId, expectedDocumentRevision: libraryContext.documentRevision, idempotencyKey: "stdio-library-insert" });
+    expect(insertedResponse.error).toBeUndefined();
+    const insertedLibrary = JSON.parse(insertedResponse.result.content[0].text);
+    expect(insertedLibrary.addedElementIds).toHaveLength(4);
+    expect(new Set(insertedLibrary.addedElementIds).size).toBe(4);
+    libraryContext = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    const libraryCopyEdit = await mcp.call("update_elements", { documentId: libraryContext.documentId, expectedDocumentRevision: libraryContext.documentRevision, updates: [{ id: insertedLibrary.addedElementIds.find((id: string) => libraryContext.elements.find((element: any) => element.id === id)?.type === "text"), patch: { text: "Edited library copy" } }] });
+    expect(libraryCopyEdit.error).toBeUndefined();
+    libraryContext = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
+    expect(libraryContext.elements.some((element: any) => element.originalText === "Edited library copy")).toBe(true);
+    const deleteContext = { itemId: "stdio-workspace-item", documentId: libraryContext.documentId, expectedDocumentRevision: libraryContext.documentRevision, idempotencyKey: "stdio-library-delete" };
+    const deleteChallenge = await mcp.call("delete_workspace_library_item", deleteContext);
+    const deletionApproval = JSON.parse(deleteChallenge.result.content[0].text);
+    expect(deletionApproval.status).toBe("NEEDS_CONFIRMATION");
+    await expect(page.getByRole("dialog", { name: "Delete a library item?" })).toBeVisible();
+    await page.getByRole("button", { name: "Approve deletion" }).click();
+    const libraryRemoved = await mcp.call("delete_workspace_library_item", { ...deleteContext, confirmationToken: deletionApproval.confirmationToken });
+    expect(libraryRemoved.error).toBeUndefined();
+    expect(JSON.parse((await mcp.call("list_workspace_library", { documentId: libraryContext.documentId })).result.content[0].text).items).toEqual([]);
     let live = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
     const group = await mcp.call("group_elements", { documentId: live.documentId, expectedDocumentRevision: live.documentRevision, ids: [created.nodes.first, created.nodes.second] });
     expect(group.error).toBeUndefined();
@@ -2923,4 +2953,54 @@ test("stdio MCP manages stable workspaces and canvases with durable replay, safe
     await mcp?.close();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("workspace library items add with labels, persist, insert as editable elements, and can be renamed and removed", async ({ page }) => {
+  const createdResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
+    operation: "create_diagram",
+    input: { idempotencyKey: "e2e-library-create-flow", nodes: [{ id: "library-source", label: "Reusable step", x: 120, y: 120 }], edges: [] },
+  } });
+  expect(createdResponse.ok(), await createdResponse.text()).toBeTruthy();
+  const created = await createdResponse.json();
+  const sourceShapeId = created.result.nodes["library-source"];
+  const current = await freshBridgeDocument(page);
+  const selectedResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
+    operation: "set_selection",
+    input: { idempotencyKey: "e2e-library-select-source", documentId: current.document.id, expectedDocumentRevision: current.document.documentRevision, ids: [sourceShapeId] },
+  } });
+  expect(selectedResponse.ok(), await selectedResponse.text()).toBeTruthy();
+  await expect.poll(async () => (await freshBridgeDocument(page)).document.appState.selectedElementIds?.[sourceShapeId]).toBe(true);
+  await page.getByRole("button", { name: "Add selection to library" }).click();
+  const manager = page.getByRole("dialog", { name: "Workspace library" });
+  await expect(manager).toBeVisible();
+  await expect(manager.getByText("Reusable item 1")).toBeVisible();
+  await expect(manager.getByText("2 elements")).toBeVisible();
+  page.once("dialog", (dialog) => dialog.accept("Evaluation node"));
+  await manager.getByRole("button", { name: "Rename" }).click();
+  await expect(manager.getByText("Evaluation node")).toBeVisible();
+  await manager.getByRole("button", { name: "Close" }).click();
+  await page.reload();
+  await page.locator(".topbar").waitFor();
+  await page.getByRole("button", { name: "Manage library (1)" }).click();
+  const reloadedManager = page.getByRole("dialog", { name: "Workspace library" });
+  await expect(reloadedManager.getByText("Evaluation node")).toBeVisible();
+  await reloadedManager.getByRole("button", { name: "Close" }).click();
+
+  await page.getByRole("button", { name: "Manage library (1)" }).click();
+  const insertManager = page.getByRole("dialog", { name: "Workspace library" });
+  await insertManager.getByRole("button", { name: "Insert" }).click();
+  await expect(insertManager).toBeHidden();
+  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.filter((element: any) => element.type === "rectangle")).toHaveLength(2);
+  await page.reload();
+  await page.locator(".topbar").waitFor();
+  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.filter((element: any) => element.type === "rectangle")).toHaveLength(2);
+  const persistedInsert = await readLocalDocument(page);
+  const inserted = persistedInsert.document.elements.find((element: any) => element.type === "text" && element.originalText === "Reusable step" && element.id !== created.result.nodeLabels["library-source"]);
+  expect(inserted).toBeTruthy();
+  expect(persistedInsert.document.elements.some((element: any) => element.id === inserted.id && element.containerId !== created.result.nodes["library-source"])).toBe(true);
+
+  await page.getByRole("button", { name: "Manage library (1)" }).click();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("dialog", { name: "Workspace library" }).getByRole("button", { name: "Remove" }).click();
+  await expect(page.getByRole("button", { name: "Manage library (0)" })).toBeVisible();
 });

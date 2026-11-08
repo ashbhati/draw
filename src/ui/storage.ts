@@ -3,7 +3,7 @@ import { normalizeDrawImageAttributions } from "../document/attribution";
 import { compactOperationLedger, operationLedgerKey, OPERATION_SNAPSHOT_RETENTION_MS, OPERATION_TOMBSTONE_RETENTION_MS, sameSceneSnapshot, type DurableMcpOperation, type DurableMcpOperationResult, type DurableMcpRedo, type DurableMcpTombstone, type OperationLedgerEntry } from "../integrations/operation-ledger";
 
 const DATABASE_NAME = "draw-local";
-const DATABASE_VERSION = 8;
+const DATABASE_VERSION = 9;
 const DOCUMENTS_STORE = "documents";
 const MCP_OPERATIONS_STORE = "mcpOperations";
 const MCP_WORKSPACE_OPERATIONS_STORE = "mcpWorkspaceOperations";
@@ -14,6 +14,7 @@ const WORKSPACES_STORE = "workspaces";
 const CANVASES_STORE = "canvases";
 const WORKSPACE_META_STORE = "workspaceMeta";
 const WORKSPACE_CATALOG_REVISION_KEY = "workspace-catalog-revision";
+const WORKSPACE_LIBRARY_STORE = "workspaceLibrary";
 const MIGRATION_MARKER_KEY = "migration-v6-complete";
 const LEGACY_RECOVERY_KEY = "legacy-recovery";
 const CURRENT_DOCUMENT_KEY = "current";
@@ -31,6 +32,14 @@ type AutosaveOrder = { sessionId: string; sequence: number };
 
 export interface DrawWorkspace { id: string; name: string; createdAt: number; updatedAt: number }
 export interface DrawCanvas { id: string; workspaceId: string; name: string; documentId: string; createdAt: number; updatedAt: number }
+export interface DrawLibraryItem {
+  id: string;
+  status?: "published" | "unpublished";
+  created: number;
+  name?: string;
+  elements: DrawDocument["document"]["elements"];
+  assets: Record<string, DrawDocument["document"]["assets"][string]>;
+}
 interface ActiveCanvasPointer { workspaceId: string; canvasId: string }
 
 export type McpWorkspaceAction =
@@ -126,6 +135,7 @@ function openDatabase(): Promise<IDBDatabase> {
       if (!canvases.indexNames.contains("byWorkspaceId")) canvases.createIndex("byWorkspaceId", "workspaceId", { unique: false });
       if (!canvases.indexNames.contains("byDocumentId")) canvases.createIndex("byDocumentId", "documentId", { unique: true });
       if (!database.objectStoreNames.contains(WORKSPACE_META_STORE)) database.createObjectStore(WORKSPACE_META_STORE);
+      if (!database.objectStoreNames.contains(WORKSPACE_LIBRARY_STORE)) database.createObjectStore(WORKSPACE_LIBRARY_STORE);
       const meta = request.transaction!.objectStore(WORKSPACE_META_STORE);
       const documents = request.transaction!.objectStore(DOCUMENTS_STORE);
       if (event.oldVersion < 5) {
@@ -840,6 +850,86 @@ export async function commitMcpWorkspaceOperation(request: McpWorkspaceOperation
   });
 }
 
+/** Load the reusable element library scoped to one project workspace. */
+export async function loadWorkspaceLibrary(workspaceId: string): Promise<DrawLibraryItem[]> {
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction([WORKSPACES_STORE, WORKSPACE_LIBRARY_STORE], "readonly");
+    const workspaceRequest = tx.objectStore(WORKSPACES_STORE).get(workspaceId);
+    const itemsRequest = tx.objectStore(WORKSPACE_LIBRARY_STORE).get(workspaceId);
+    const [workspace, items] = await Promise.all([
+      requestValue<DrawWorkspace | undefined>(workspaceRequest),
+      requestValue<DrawLibraryItem[] | undefined>(itemsRequest),
+      waitForTransaction(tx),
+    ]);
+    if (!workspace) throw new Error("Workspace does not exist.");
+    return structuredClone(items ?? []);
+  } finally { db.close(); }
+}
+
+/** Replace the workspace library snapshot after the editor library changes. */
+export async function saveWorkspaceLibrary(workspaceId: string, items: readonly DrawLibraryItem[]): Promise<void> {
+  const normalized = items.map((item) => {
+    if (!item || typeof item.id !== "string" || !item.id || !Array.isArray(item.elements) || !Number.isFinite(item.created)) {
+      throw new Error("The Draw library item is invalid.");
+    }
+    return structuredClone({ ...item, assets: item.assets ?? {} });
+  });
+  const ids = new Set<string>();
+  for (const item of normalized) {
+    if (ids.has(item.id)) throw new Error("Draw library item IDs must be unique within a workspace.");
+    ids.add(item.id);
+  }
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction([WORKSPACES_STORE, WORKSPACE_LIBRARY_STORE], "readwrite");
+    const workspaceRequest = tx.objectStore(WORKSPACES_STORE).get(workspaceId);
+    let failure: Error | undefined;
+    workspaceRequest.onsuccess = () => {
+      if (!workspaceRequest.result) { failure = new Error("Workspace does not exist."); tx.abort(); return; }
+      tx.objectStore(WORKSPACE_LIBRARY_STORE).put(normalized, workspaceId);
+    };
+    try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
+  } finally { db.close(); }
+}
+
+export async function renameWorkspaceLibraryItem(workspaceId: string, itemId: string, name: string): Promise<void> {
+  await mutateWorkspaceLibrary(workspaceId, (items) => {
+    const index = items.findIndex((item) => item.id === itemId);
+    if (index < 0) throw new Error("Library item does not exist.");
+    items[index] = { ...items[index], name: name.trim() || "Untitled library item" };
+    return items;
+  });
+}
+
+export async function deleteWorkspaceLibraryItem(workspaceId: string, itemId: string): Promise<void> {
+  await mutateWorkspaceLibrary(workspaceId, (items) => items.filter((item) => item.id !== itemId));
+}
+
+async function mutateWorkspaceLibrary(workspaceId: string, mutate: (items: DrawLibraryItem[]) => DrawLibraryItem[]): Promise<void> {
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction([WORKSPACES_STORE, WORKSPACE_LIBRARY_STORE], "readwrite");
+    const workspaceRequest = tx.objectStore(WORKSPACES_STORE).get(workspaceId);
+    const libraryRequest = tx.objectStore(WORKSPACE_LIBRARY_STORE).get(workspaceId);
+    let reads = 2;
+    let failure: Error | undefined;
+    let workspaceExists = false;
+    let items: DrawLibraryItem[] = [];
+    const finish = () => {
+      reads -= 1;
+      if (reads) return;
+      if (!workspaceExists) { failure = new Error("Workspace does not exist."); tx.abort(); return; }
+      try { tx.objectStore(WORKSPACE_LIBRARY_STORE).put(mutate(structuredClone(items)), workspaceId); }
+      catch (error) { failure = error instanceof Error ? error : new Error(String(error)); tx.abort(); }
+    };
+    workspaceRequest.onsuccess = () => { workspaceExists = Boolean(workspaceRequest.result); finish(); };
+    libraryRequest.onsuccess = () => { items = (libraryRequest.result as DrawLibraryItem[] | undefined) ?? []; finish(); };
+    workspaceRequest.onerror = libraryRequest.onerror = () => { failure = new Error("Could not read the workspace library."); tx.abort(); };
+    try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
+  } finally { db.close(); }
+}
+
 async function readAll<T>(storeName: string): Promise<T[]> {
   const db = await openDatabase();
   try { const tx = db.transaction(storeName, "readonly"); const req = tx.objectStore(storeName).getAll(); const [items] = await Promise.all([requestValue<T[]>(req), waitForTransaction(tx)]); return items.sort((a: any, b: any) => a.createdAt - b.createdAt); }
@@ -1019,7 +1109,7 @@ export async function duplicateCanvas(canvasId: string, name?: string): Promise<
 export async function deleteWorkspace(workspaceId: string): Promise<void> {
   const db = await openDatabase();
   try {
-    const tx = db.transaction([WORKSPACES_STORE, CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE, MCP_WORKSPACE_OPERATIONS_STORE], "readwrite");
+    const tx = db.transaction([WORKSPACES_STORE, CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE, WORKSPACE_LIBRARY_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE, MCP_WORKSPACE_OPERATIONS_STORE], "readwrite");
     const workspaces = tx.objectStore(WORKSPACES_STORE);
     const canvases = tx.objectStore(CANVASES_STORE);
     const documents = tx.objectStore(DOCUMENTS_STORE);
@@ -1054,6 +1144,7 @@ export async function deleteWorkspace(workspaceId: string): Promise<void> {
       const removedCanvasIds = new Set(removed.map((canvas) => canvas.id));
       workspaces.delete(workspaceId);
       incrementWorkspaceCatalogRevision(meta);
+      tx.objectStore(WORKSPACE_LIBRARY_STORE).delete(workspaceId);
       for (const canvas of removed) {
         canvases.delete(canvas.id);
         documents.delete(documentKey(canvas.documentId));

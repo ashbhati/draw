@@ -388,6 +388,28 @@ function createServer() {
   commandTool(server, "set_canvas_settings", "Set the active document title and/or its Blackboard/Whiteboard background.", {
     ...revisionContext, title: z.string().min(1).max(200).optional(), background: z.enum(["blackboard", "white"]).optional(),
   });
+  commandTool(server, "list_workspace_library", "List reusable items saved in the active workspace library. Use stable item IDs returned here for read, rename, delete, and insert operations.", { documentId: z.string().min(1).max(200) });
+  commandTool(server, "read_workspace_library_item", "Read one reusable item, including editable elements and embedded image assets, from the active workspace library.", { documentId: z.string().min(1).max(200), itemId: z.string().min(1).max(200) });
+  commandTool(server, "add_selection_to_workspace_library", "Save the currently selected objects or explicitly listed element IDs, their bound labels, and referenced images into the active workspace library. Supply a stable itemId so retrying does not create another item.", { ...revisionContext, itemId: z.string().min(1).max(200), elementIds: z.array(z.string().min(1).max(200)).min(1).max(100).optional(), name: z.string().min(1).max(160).optional() });
+  commandTool(server, "rename_workspace_library_item", "Rename an item in the active workspace library.", { ...revisionContext, itemId: z.string().min(1).max(200), name: z.string().min(1).max(160) });
+  server.registerTool("delete_workspace_library_item", {
+    description: "Remove an item from the active workspace library. Draw requires an explicit one-use approval in the app; retry with the returned confirmationToken after approving it.",
+    inputSchema: { ...revisionContext, itemId: z.string().min(1).max(200), confirmationToken: z.string().min(1).max(200).optional() },
+  }, async (input: Record<string, unknown>) => {
+    const command = parseMcpToolInput("delete_workspace_library_item", input);
+    if (command.operation !== "delete_workspace_library_item") throw new Error("Invalid delete_workspace_library_item command.");
+    const fingerprint = createHash("sha256").update(`${command.input.documentId}:${command.input.expectedDocumentRevision}:${command.input.itemId}`).digest("hex");
+    if (!input.confirmationToken) {
+      const confirmation = await bridgeRequest("/__draw/api/confirmations", { method: "POST", body: JSON.stringify({
+        action: "delete_library_item", documentId: command.input.documentId, expectedDocumentRevision: command.input.expectedDocumentRevision,
+        filename: command.input.itemId, fingerprint,
+      }) });
+      return textResult({ status: "NEEDS_CONFIRMATION", confirmationToken: confirmation.confirmationToken, expiresAt: confirmation.expiresAt, action: "delete_library_item", itemId: command.input.itemId });
+    }
+    const result = await bridgeRequest("/__draw/api/commands", { method: "POST", body: JSON.stringify({ ...command, input: { ...command.input, confirmationToken: input.confirmationToken } }) });
+    return textResult(result.warning ? { ...result.result, warning: result.warning } : result.result ?? result);
+  });
+  commandTool(server, "insert_workspace_library_item", "Insert an editable copy of a workspace library item into the active canvas. The copy gets new stable element IDs and preserves labels, bindings, and images. Use expectedDocumentRevision and idempotencyKey to safely retry.", { ...revisionContext, itemId: z.string().min(1).max(200) });
   commandTool(server, "set_viewport", "Set canvas pan/zoom or fit the current document contents into view. This changes the view revision, not element coordinates. Reuse the same idempotencyKey only when retrying this exact request; use a new key for a new viewport intent.", {
     documentId: z.string().min(1).max(200), expectedViewRevision: z.number().int().nonnegative(),
     idempotencyKey: idempotencyKeySchema,

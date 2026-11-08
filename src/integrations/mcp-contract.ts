@@ -130,6 +130,8 @@ export type McpWorkspaceAction =
   | ({ action: "import_draw_file_as_canvas"; workspaceId: string; path: string; name?: string } & WorkspaceMutationContext);
 
 export type WorkspaceMutationContext = { expectedCatalogRevision: number; idempotencyKey: string };
+export type WorkspaceLibraryContext = { documentId: string };
+export type WorkspaceLibraryMutation = WorkspaceLibraryContext & { expectedDocumentRevision: number; idempotencyKey: string };
 
 export type McpCommand =
   | { operation: "create_diagram"; input: CreateDiagramInput }
@@ -148,7 +150,13 @@ export type McpCommand =
   | { operation: "save_document"; input: SaveDocumentInput }
   | { operation: "export_image"; input: ExportImageInput }
   | { operation: "insert_image"; input: InsertImageInput }
-  | WorkspaceActionCommand;
+  | WorkspaceActionCommand
+  | { operation: "list_workspace_library" | "read_workspace_library_item"; input: WorkspaceLibraryContext & { itemId?: string } }
+  | { operation: "add_selection_to_workspace_library"; input: WorkspaceLibraryMutation & { itemId: string; elementIds?: string[]; name?: string } }
+  | { operation: "rename_workspace_library_item"; input: WorkspaceLibraryMutation & { itemId: string; name: string } }
+  | { operation: "delete_workspace_library_item"; input: WorkspaceLibraryMutation & { itemId: string; confirmationToken?: string } }
+  | { operation: "insert_workspace_library_item"; input: WorkspaceLibraryMutation & { itemId: string } };
+
 // Workspace operations are delivered to the active authenticated editor, which owns local IndexedDB.
 export type WorkspaceActionCommand = { operation: "workspace_action"; input: McpWorkspaceAction; document?: DrawDocument };
 
@@ -661,22 +669,40 @@ function parseEmbeddedImage(value: unknown): McpCommand {
 
 export function parseMcpToolInput(
   name: string,
-  input: unknown,
+  value: unknown,
 ): McpCommand {
+  if (["list_workspace_library", "read_workspace_library_item"].includes(name)) {
+    const input = requireRecord(value, `${name} input`);
+    return { operation: name as "list_workspace_library" | "read_workspace_library_item", input: {
+      documentId: requireString(input.documentId, `${name}.documentId`, 200),
+      ...(name === "read_workspace_library_item" ? { itemId: requireString(input.itemId, `${name}.itemId`, 200) } : {}),
+    } };
+  }
+  if (["add_selection_to_workspace_library", "rename_workspace_library_item", "delete_workspace_library_item", "insert_workspace_library_item"].includes(name)) {
+    const input = requireRecord(value, `${name} input`);
+    if (!Number.isSafeInteger(input.expectedDocumentRevision) || (input.expectedDocumentRevision as number) < 0) throw new McpValidationError(`${name}.expectedDocumentRevision must be a non-negative integer.`);
+    const common = { documentId: requireString(input.documentId, `${name}.documentId`, 200), expectedDocumentRevision: input.expectedDocumentRevision as number, idempotencyKey: requireIdempotencyKey(input, name), itemId: requireString(input.itemId, `${name}.itemId`, 200) };
+    if (name === "add_selection_to_workspace_library") {
+      if (input.elementIds !== undefined && (!Array.isArray(input.elementIds) || input.elementIds.length < 1 || input.elementIds.length > 100 || input.elementIds.some((id) => typeof id !== "string" || !id.trim() || id.length > 200))) throw new McpValidationError(`${name}.elementIds must contain between 1 and 100 stable element IDs.`);
+      return { operation: name, input: { ...common, ...(Array.isArray(input.elementIds) ? { elementIds: input.elementIds as string[] } : {}), ...(input.name !== undefined ? { name: requireString(input.name, `${name}.name`, 160) } : {}) } };
+    }
+    if (name === "rename_workspace_library_item") return { operation: name, input: { ...common, name: requireString(input.name, `${name}.name`, 160) } };
+    return { operation: name as "delete_workspace_library_item" | "insert_workspace_library_item", input: { ...common, ...(name === "delete_workspace_library_item" && input.confirmationToken !== undefined ? { confirmationToken: requireString(input.confirmationToken, `${name}.confirmationToken`, 200) } : {}) } };
+  }
   if (name === "create_diagram") {
-    return { operation: "create_diagram", input: parseCreateDiagram(input) };
+    return { operation: "create_diagram", input: parseCreateDiagram(value) };
   }
   if (name === "create_elements") {
-    return { operation: "create_elements", input: parseCreateElements(input) };
+    return { operation: "create_elements", input: parseCreateElements(value) };
   }
-  if (name === "insert_image" || name === "insert_openverse_image") return parseEmbeddedImage(input);
+  if (name === "insert_image" || name === "insert_openverse_image") return parseEmbeddedImage(value);
   if (name === "update_elements") {
-    return { operation: "update_elements", input: parseUpdateElements(input) };
+    return { operation: "update_elements", input: parseUpdateElements(value) };
   }
   if (name === "workspace_action") {
-    return parseWorkspaceAction(input);
+    return parseWorkspaceAction(value);
   }
-  const sceneTool = parseSceneTool(name, input);
+  const sceneTool = parseSceneTool(name, value);
   if (sceneTool) return sceneTool;
   throw new McpValidationError(`Unknown Draw MCP tool "${name}".`);
 }

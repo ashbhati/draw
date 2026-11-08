@@ -47,7 +47,7 @@ type PendingConfirmation = {
   clientIdentity: string;
   documentId: string;
   expectedDocumentRevision: number;
-  action: "open_document" | "delete_canvas" | "delete_workspace";
+  action: "open_document" | "delete_canvas" | "delete_workspace" | "delete_library_item";
   filename?: string;
   targetId?: string;
   expectedCatalogRevision?: number;
@@ -164,6 +164,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
   const revokedCommands = new Map<string, { clientIdentity: string; expiresAt: number }>();
   const pendingFlushes = new Map<string, PendingFlush>();
   const confirmations = new Map<string, PendingConfirmation>();
+  const consumedLibraryDeleteConfirmations = new Map<string, PendingConfirmation>();
   const pendingMcpPairings = new Map<string, { clientId: string; resolve: (value: { clientIdentity: string; capability: string; expiresAt: number } | null) => void; timer: ReturnType<typeof setTimeout> }>();
       const eventTickets = new Map<string, { clientId: string; expiresAt: number }>();
   let document: DrawDocumentBridgeValue | null = null;
@@ -280,6 +281,9 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
           if (confirmation.clientIdentity !== clientIdentity) continue;
           confirmations.delete(token);
           server.ws.send("draw:confirmation-revoked", { token, clientId: confirmation.clientId, clientIdentity });
+        }
+        for (const [token, confirmation] of consumedLibraryDeleteConfirmations) {
+          if (confirmation.clientIdentity === clientIdentity) consumedLibraryDeleteConfirmations.delete(token);
         }
       };
       const cancelEditorPairings = async (clientId: string) => {
@@ -436,6 +440,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
                 pendingFlushes.delete(id);
               }
               confirmations.clear();
+              consumedLibraryDeleteConfirmations.clear();
               server.ws.send("draw:editor-lease-revoked", { clientId: activeClientId });
             }
             activeClientId = clientId;
@@ -571,7 +576,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
             const authenticated = await authenticatedMcpClient(request);
             if (!authenticated) { sendJson(response, 401, { error: "MCP authentication is required." }); return; }
             const body = await readJsonBody(request, maxBodyBytes);
-            if (!isRecord(body) || !["open_document", "delete_canvas", "delete_workspace"].includes(body.action as string)
+            if (!isRecord(body) || !["open_document", "delete_canvas", "delete_workspace", "delete_library_item"].includes(body.action as string)
               || typeof body.documentId !== "string" || !Number.isSafeInteger(body.expectedDocumentRevision) || typeof body.fingerprint !== "string" || !/^[a-f\d]{64}$/i.test(body.fingerprint)) {
               sendJson(response, 400, { error: "Confirmation request is invalid." });
               return;
@@ -585,6 +590,10 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               if (typeof body.filename !== "string" || body.filename.length > 160 || body.filename.includes("/") || body.filename.includes("\\")) {
                 sendJson(response, 400, { error: "Confirmation filename must be a basename." }); return;
               }
+            } else if (action === "delete_library_item") {
+              if (typeof body.filename !== "string" || body.filename.length > 200) {
+                sendJson(response, 400, { error: "Confirmation target is invalid." }); return;
+              }
             } else if (typeof body.targetId !== "string" || body.targetId.length > 200
               || !Number.isSafeInteger(body.expectedCatalogRevision) || (body.expectedCatalogRevision as number) < 0
               || typeof body.idempotencyKey !== "string" || body.idempotencyKey.length < 1 || body.idempotencyKey.length > 200) {
@@ -595,7 +604,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
             confirmations.set(token, {
               token, clientId: activeClientId, clientIdentity: authenticated.clientIdentity, documentId: document.document.id,
               expectedDocumentRevision: document.document.documentRevision, action,
-              ...(action === "open_document" ? { filename: body.filename as string } : {
+              ...(action === "open_document" || action === "delete_library_item" ? { filename: body.filename as string } : {
                 targetId: body.targetId as string,
                 expectedCatalogRevision: body.expectedCatalogRevision as number, idempotencyKey: body.idempotencyKey as string,
               }),
@@ -603,7 +612,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
             });
             server.ws.send("draw:confirmation-required", {
               token, clientId: activeClientId, clientIdentity: authenticated.clientIdentity, action, expiresAt,
-              ...(action === "open_document" ? { filename: body.filename as string } : {
+              ...(action === "open_document" || action === "delete_library_item" ? { filename: body.filename as string } : {
                 targetId: body.targetId as string, expectedCatalogRevision: body.expectedCatalogRevision as number,
               }),
             });
@@ -658,15 +667,18 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               return;
             }
             const workspaceConfirmation = confirmation.action === "delete_canvas" || confirmation.action === "delete_workspace";
+            const libraryDeleteConfirmation = confirmation.action === "delete_library_item";
             const matchesWorkspace = workspaceConfirmation && isRecord(body)
               && body.action === confirmation.action && body.targetId === confirmation.targetId
               && body.expectedCatalogRevision === confirmation.expectedCatalogRevision && body.idempotencyKey === confirmation.idempotencyKey;
             const matchesOpen = confirmation.action === "open_document" && isRecord(body)
               && body.action === "open_document" && body.filename === confirmation.filename && body.fingerprint === confirmation.fingerprint;
+            const matchesLibraryDelete = libraryDeleteConfirmation && isRecord(body)
+              && body.action === "delete_library_item" && body.filename === confirmation.filename && body.fingerprint === confirmation.fingerprint;
             if (!isRecord(body) || confirmation.clientId !== activeClientId || authenticatedEditor && authenticatedEditor.clientId !== confirmation.clientId
               || body.clientId !== undefined && body.clientId !== confirmation.clientId
               || body.documentId !== confirmation.documentId || body.expectedDocumentRevision !== confirmation.expectedDocumentRevision
-              || !(matchesWorkspace || matchesOpen) || !document || document.document.id !== confirmation.documentId || document.document.documentRevision !== confirmation.expectedDocumentRevision) {
+              || !(matchesWorkspace || matchesOpen || matchesLibraryDelete) || !document || document.document.id !== confirmation.documentId || document.document.documentRevision !== confirmation.expectedDocumentRevision) {
               confirmations.delete(token);
               sendJson(response, 200, { status: "STALE" });
               return;
@@ -680,7 +692,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               sendJson(response, 200, { status: "DENIED" });
               return;
             }
-            if (workspaceConfirmation) {
+            if (workspaceConfirmation || libraryDeleteConfirmation) {
               const idempotencyKey = body.idempotencyKey as string;
               if (confirmation.consumedForIdempotencyKey && confirmation.consumedForIdempotencyKey !== idempotencyKey) {
                 sendJson(response, 200, { status: "STALE" }); return;
@@ -781,6 +793,22 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
             }
 
             const commandInput = command.input as Record<string, unknown>;
+            if (command.operation === "delete_workspace_library_item") {
+              const token = typeof commandInput.confirmationToken === "string" ? commandInput.confirmationToken : "";
+              for (const [usedToken, used] of consumedLibraryDeleteConfirmations) if (used.expiresAt <= Date.now()) consumedLibraryDeleteConfirmations.delete(usedToken);
+              const wasConsumed = consumedLibraryDeleteConfirmations.has(token);
+              const confirmation = confirmations.get(token) ?? consumedLibraryDeleteConfirmations.get(token);
+              const expectedFingerprint = createHash("sha256").update(`${commandInput.documentId}:${commandInput.expectedDocumentRevision}:${commandInput.expectedLibraryRevision}:${commandInput.idempotencyKey}:${commandInput.itemId}`).digest("hex");
+              if (!confirmation || confirmation.expiresAt <= Date.now() || confirmation.decision !== "approved" || confirmation.action !== "delete_library_item" || confirmation.clientIdentity !== authenticated.clientIdentity || confirmation.clientId !== activeClientId || confirmation.documentId !== document.document.id || (!wasConsumed && confirmation.expectedDocumentRevision !== document.document.documentRevision) || confirmation.filename !== commandInput.itemId || confirmation.fingerprint !== expectedFingerprint) {
+                if (confirmation && confirmation.expiresAt <= Date.now()) confirmations.delete(token);
+                sendJson(response, 403, { error: "Deleting a workspace library item requires a current one-use approval in Draw." });
+                return;
+              }
+              if (confirmations.has(token)) {
+                confirmations.delete(token);
+                consumedLibraryDeleteConfirmations.set(token, confirmation);
+              }
+            }
             if (typeof commandInput.documentId === "string" && command.operation !== "open_document" && commandInput.documentId !== document.document.id) {
               sendJson(response, 409, { error: "Document ID does not match the active Draw canvas." });
               return;

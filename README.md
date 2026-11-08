@@ -32,6 +32,8 @@ Open <http://127.0.0.1:5173>. Draw organizes work into **Workspaces** (project c
 
 Use **Save .draw** to download the active editable document. **Open .draw** imports that file as a new canvas in the current workspace, so the current canvas stays intact. PNG and JPEG exports are flattened images for sharing and cannot be edited as Draw objects.
 
+The reusable library is scoped to the current workspace. Select diagram elements and choose **Add selection to library** to save them with their bound labels and referenced image assets. Choose **Manage library** to insert a fresh editable copy, rename an item, or remove it. Library contents persist in this browser on this device and do not sync between devices.
+
 ## Connect an MCP client
 
 1. Start Draw with `draw start` and keep that terminal open. The terminal shows a random, one-use editor launch code. Type it into Draw's **Connect MCP** dialog. The code expires after one minute and is never returned over HTTP or included in a URL.
@@ -118,6 +120,7 @@ Available tools:
 - `import_draw_file_as_canvas`: validate a `.draw` file from `DRAW_MCP_DOCUMENT_DIR` and create a new canvas with an independent document ID. The existing active canvas and source file remain intact.
 - `delete_canvas` and `delete_workspace`: first call returns `NEEDS_CONFIRMATION`; approve or deny in Draw, then retry with the same key and returned `confirmationToken`. A denial, stale request, or expired token leaves saved drawings intact.
 - `pair_mcp_client`: pair the local MCP host after the human copies Draw's one-time secret into protected host configuration. The tool accepts no pairing code and does not return the capability to the model.
+- `list_workspace_library`, `read_workspace_library_item`, `add_selection_to_workspace_library`, `insert_workspace_library_item`, `rename_workspace_library_item`, and `delete_workspace_library_item`: manage library items in the active workspace. Add accepts the current editor selection or stable `elementIds`. Insertion returns new editable IDs and is revision-guarded/idempotent. Deletion requires one-use owner approval in Draw.
 
 Every scene mutation should include `documentId` and the latest `expectedDocumentRevision` from `get_current_canvas`. Viewport commands use `expectedViewRevision`. This detects stale agent context before changing the active document.
 

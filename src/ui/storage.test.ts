@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import "fake-indexeddb/auto";
 import { createEmptyDocument, parseDrawFile, serializeDrawFile } from "../document/document";
-import { commitMcpOperation, commitMcpWorkspaceOperation, createCanvas, createWorkspace, deleteCanvas, deleteWorkspace, duplicateCanvas, DrawStorageRecoveryError, getMcpWorkspaceCatalog, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadMcpOperation, loadMcpWorkspaceOperationReceipt, MCP_WORKSPACE_RECEIPT_LIMIT, renameCanvas, renameWorkspace, restoreMcpCommandSnapshot, saveCurrentDocument, setActiveCanvas } from "./storage";
+import { addWorkspaceLibraryItem, commitMcpOperation, commitMcpWorkspaceOperation, createCanvas, createWorkspace, deleteCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, duplicateCanvas, DrawStorageRecoveryError, getMcpWorkspaceCatalog, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadMcpOperation, loadMcpWorkspaceOperationReceipt, loadWorkspaceLibrary, MCP_WORKSPACE_RECEIPT_LIMIT, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, restoreMcpCommandSnapshot, saveCurrentDocument, saveWorkspaceLibrary, setActiveCanvas, WorkspaceLibraryConflictError } from "./storage";
 import { canRedoMcpOperation, canUndoMcpOperation, OPERATION_RESULT_RETENTION_MS, OPERATION_SNAPSHOT_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "../integrations/operation-ledger";
 
 describe("local Draw autosave", () => {
@@ -399,6 +399,46 @@ describe("local Draw autosave", () => {
     await setActiveCanvas(secondCanvas.id);
     expect(await readLegacyCurrentDocument()).toEqual(second);
     expect(await loadCurrentDocument()).toEqual(second);
+  });
+
+  it("persists selected library elements and referenced assets per workspace across reloads", async () => {
+    const first = await createWorkspace("First project");
+    const second = await createWorkspace("Second project");
+    const item = {
+      id: "library-flow-1",
+      status: "unpublished" as const,
+      created: 123,
+      name: "Reusable flow",
+      elements: [{ id: "node", type: "image", fileId: "asset-1", x: 12, y: 24, width: 80, height: 50 }],
+      assets: { "asset-1": { id: "asset-1", dataURL: "data:image/png;base64,AA==", mimeType: "image/png" } },
+    };
+    await saveWorkspaceLibrary(first.id, [item]);
+    expect(await loadWorkspaceLibrary(first.id)).toEqual([item]);
+    expect(await loadWorkspaceLibrary(second.id)).toEqual([]);
+    await renameWorkspaceLibraryItem(first.id, item.id, "Named flow");
+    expect(await loadWorkspaceLibrary(first.id)).toMatchObject([{ id: item.id, name: "Named flow" }]);
+    await deleteWorkspaceLibraryItem(first.id, item.id);
+    expect(await loadWorkspaceLibrary(first.id)).toEqual([]);
+  });
+
+  it("removes workspace library data atomically when deleting its workspace", async () => {
+    const workspace = await createWorkspace("Temporary project");
+    await saveWorkspaceLibrary(workspace.id, [{ id: "temporary-item", created: 1, elements: [{ id: "temporary-shape", type: "rectangle" }], assets: {} } as any]);
+    await deleteWorkspace(workspace.id);
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("draw-local");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      const transaction = db.transaction("workspaceLibrary", "readonly");
+      const saved = await new Promise<unknown>((resolve, reject) => {
+        const request = transaction.objectStore("workspaceLibrary").get(workspace.id);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      expect(saved).toBeUndefined();
+    } finally { db.close(); }
   });
 
   it("commits workspace/canvas creation atomically and keeps V1 .draw import as a new document", async () => {
