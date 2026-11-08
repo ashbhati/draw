@@ -2,22 +2,70 @@
 
 Draw is a local-first, Excalidraw-based infinite canvas for editable diagrams. The `.draw` file is the editable source; PNG and JPEG exports are flattened images.
 
-## Run locally
+## Install and launch
 
-Requires Node.js 20.19+ or 22.12+.
+The planned end-user distribution is the public npm package `@ashbhati/draw`. It supports macOS and Linux with Node.js 20.19+ or 22.12+.
+
+Once the package is published:
+
+```sh
+npm install --global @ashbhati/draw
+draw start
+```
+
+`draw start` serves the production app on `http://127.0.0.1:4173` and opens the local browser when started from an interactive terminal. Use `draw start --no-open` to open the URL yourself, or `draw start --port 4300` to choose a different port. Keep the terminal process running while you use Draw. Draw autosaves in the current browser on this device. Use **Save .draw** to download the editable source, **Open** to restore it, and **Export** to create a flattened PNG or JPEG for sharing.
+
+The `.draw` file preserves editable elements, canvas settings, and embedded images. PNG and JPEG files do not preserve editable data. Save `.draw` files in a folder you back up; the browser autosave is local to that browser profile and device.
+
+Public npm publication is pending the owner's choice of a root project license. No license has been selected or added by this implementation. Install commands above are ready for that release and do not work until the package is published.
+
+## Run from source
+
+For contributors, clone the repository and use the Vite development server:
 
 ```sh
 npm install
 npm run dev
 ```
 
-Open <http://127.0.0.1:5173>. The current canvas autosaves in this browser on this device. Use **Save .draw** to download a portable editable document, and **Open** to restore one later. The Blackboard and Whiteboard presets are saved in the document. Image exports are for sharing and cannot be edited as Draw objects.
+Open <http://127.0.0.1:5173>. The Blackboard and Whiteboard presets are saved in the document.
 
-For MCP use, start `npm run dev` yourself in a trusted terminal that you control. Do not start the Vite server from an agent or automation PTY. Keep that terminal open: it prints a random one-use editor code, valid for 60 seconds. Manually type the code into Draw's **Connect MCP** dialog. The code is never returned over HTTP or included in a URL. After a browser reload, connect again with the newly printed code; if the code expired or was missed, use **Request fresh code** in the dialog and then type the code shown in the terminal.
+## Connect an MCP client
 
-After connecting the editor, open **MCP clients** in Draw and copy the one-time pairing secret into the MCP host's protected secret configuration as `DRAW_MCP_PAIRING_SECRET`. Secret issuance is throttled to once every five seconds. Configure the host to run `npm run mcp`, then call the `pair_mcp_client` tool (it takes no secret argument). Draw shows the client name and fingerprint and waits for your approval. Re-pairing the same fingerprint revokes the old identity, and Draw warns you before approval. On approval, the MCP process stores its capability in `~/.config/draw/mcp-client-credential.json` with mode `0600`; set `DRAW_MCP_CLIENT_CREDENTIAL_PATH` to another absolute, user-owned path whose parent directory is private (on POSIX it must not be group/world writable), and `DRAW_MCP_CLIENT_NAME` to label the host. The credential file must be owned by the current user and mode `0600` on POSIX. The pairing secret is consumed once. Remove it from host configuration after pairing. Revoking a host in Draw immediately blocks its requests and cancels its pending bridge work; other hosts and the editor remain connected. A command revoked while its acknowledgement is pending is rolled back in place only when the saved canvas content and live viewport/selection still match the command's expected state; edits, pans, or selection changes made afterward are preserved. The rollback keeps Excalidraw mounted so existing undo history and selection remain; one Undo may be a no-op for the canceled MCP action before earlier history is reachable.
+1. Start Draw with `draw start` and keep that terminal open. The terminal shows a random, one-use editor launch code. Type it into Draw's **Connect MCP** dialog. The code expires after one minute and is never returned over HTTP or included in a URL.
+2. In Draw, open **MCP clients** and copy the one-time pairing secret into your MCP client's protected environment configuration as `DRAW_MCP_PAIRING_SECRET`.
+3. Configure the MCP client to run Draw's packaged MCP host:
 
-The bridge requires the paired capability on document reads, confirmations, and commands, and separately requires the active editor-tab secret for editor sync and acknowledgements. In the development bridge, an unpaired local loopback process can invalidate a pending pairing secret or trigger the temporary pairing lockout by submitting wrong secrets; it cannot gain access to the canvas or revoke the editor lease. The Vite bridge is not a sandbox against a fully compromised process running as the same OS user, which may be able to inspect that user's memory or credential files. Use only trusted local MCP hosts. The installed runtime in issue #28 will use authenticated local IPC to prevent unpaired loopback requests from consuming pairing attempts.
+```json
+{
+  "mcpServers": {
+    "draw": {
+      "command": "draw",
+      "args": ["mcp"],
+      "env": {
+        "DRAW_MCP_DOCUMENT_DIR": "/absolute/path/to/a/dedicated/draw-documents-folder",
+        "DRAW_MCP_PAIRING_SECRET": "paste-the-one-time-secret-here"
+      }
+    }
+  }
+}
+```
+
+4. Ask the agent to call `pair_mcp_client`. Draw displays the host name and fingerprint and waits for your approval. The tool takes no secret argument. After approval, remove `DRAW_MCP_PAIRING_SECRET` from the host configuration. The MCP host stores its capability in `~/.config/draw/mcp-client-credential.json` with mode `0600`; set `DRAW_MCP_CLIENT_CREDENTIAL_PATH` to another absolute, user-owned path if desired. Set `DRAW_MCP_CLIENT_NAME` to label the host.
+
+The app and MCP host communicate through a Unix domain socket in a per-user directory (mode `0700`; socket mode `0600`). On macOS it is under `~/Library/Application Support/Draw/run`; on Linux it is under `$XDG_RUNTIME_DIR/draw` or `~/.local/run/draw`. The MCP API is not exposed over loopback HTTP. This protects against other OS accounts and unauthenticated loopback clients. Processes running as the same OS user are inside Draw's trust boundary; do not run untrusted MCP hosts as your account. Keep Draw running with the document open while the agent works. Agent edits target the active document in the authenticated editor tab, so you can immediately inspect and continue editing them.
+
+Pairing secrets expire and are consumed once. Secret issuance is throttled to once every five seconds. Revoking a host in Draw blocks its future requests and cancels its pending bridge work. The MCP client's stored capability is separate from the editor launch code and pairing secret.
+
+To upgrade, run `npm install --global @ashbhati/draw@latest`. To uninstall, run `npm uninstall --global @ashbhati/draw`. Your `.draw` files and local browser autosave are not removed by uninstalling the package.
+
+For contributors using the Vite bridge, see [Development MCP setup](#development-mcp-setup).
+
+### Development MCP setup
+
+When running from source, start `npm run dev` yourself in a trusted terminal. Type its one-minute launch code into Draw's **Connect MCP** dialog. Configure the client with `npm run mcp` and `cwd` set to the repository; the development bridge uses loopback HTTP and requires the Draw tab to remain open. Its localhost pairing surface is intended only for trusted local development, not as the production MCP transport.
+
+The bridge requires the paired capability on document reads, confirmations, and commands, and separately requires the active editor-tab secret for editor sync and acknowledgements. In the Vite development bridge, unpaired loopback traffic can invalidate a pending pairing secret or trigger a temporary pairing lockout. Use only trusted local MCP hosts while running the development server. The packaged runtime restricts MCP routes to its private Unix socket; same-OS-user processes remain trusted.
 
 ## Verify
 
@@ -30,9 +78,9 @@ npm run test:e2e
 
 The e2e suite runs the app locally in Chromium and selects an available loopback port for each run. To pin a run to a specific port, set `DRAW_E2E_BASE_URL`, for example `DRAW_E2E_BASE_URL=http://127.0.0.1:5197 npm run test:e2e`. It starts its own strict-port server and does not reuse an existing server by default. Set `DRAW_E2E_REUSE_SERVER=1` only when intentionally reusing the server at that URL. Playwright downloads its browser separately; on managed systems where its default browser cache is unavailable, set `PLAYWRIGHT_BROWSERS_PATH` to a writable directory when installing and running the suite.
 
-## Connect an MCP client
+## Configure a development MCP client
 
-The local MCP server communicates with the active development canvas. First start Draw yourself from a trusted terminal and manually connect the tab using the printed code. Then configure your MCP client to launch `npm run mcp` from this project directory. For clients using JSON MCP configuration, the server entry is:
+From a source checkout, configure your MCP client to launch `npm run mcp` from this project directory. For clients using JSON MCP configuration, the server entry is:
 
 ```json
 {
@@ -67,7 +115,7 @@ Every scene mutation should include `documentId` and the latest `expectedDocumen
 
 `create_diagram` returns `nodes`, mapping each caller-provided node ID to its Draw element ID; `nodeLabels` maps those node IDs to their bound text IDs. `edges` contains each created arrow's `elementId`, optional `labelElementId`, and input index. The result also includes `addedElementIds` and, when supplied, `titleElementId`. Use these returned IDs with `update_elements`.
 
-The MCP bridge is provided by the Vite development server, bound to loopback only. Keep the Draw tab open while using its MCP tools. The MCP tools are intentionally unavailable in a production build in this first version.
+The MCP tool schemas and behavior are described above. The source development bridge runs through Vite; the packaged MCP runtime uses authenticated local IPC.
 
 ## Document and licensing notes
 

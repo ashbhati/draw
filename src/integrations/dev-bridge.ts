@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -68,6 +68,19 @@ const API_ROOT = "/__draw/api";
 const DEFAULT_COMMAND_TIMEOUT_MS = 20_000;
 const DEFAULT_LATE_ACK_RETENTION_MS = 60_000;
 const DEFAULT_MAX_BODY_BYTES = 100 * 1024 * 1024;
+
+export function isMcpOnlyRoute(method: string | undefined, path: string): boolean {
+  return (method === "GET" && path === `${API_ROOT}/document`)
+    || (method === "POST" && [ `${API_ROOT}/mcp/pair`, `${API_ROOT}/commands`, `${API_ROOT}/confirmations` ].includes(path))
+    || (method === "POST" && /^\/__draw\/api\/confirmations\/[^/]+\/consume$/.test(path));
+}
+
+function isMcpRoute(method: string | undefined, path: string): boolean {
+  return isMcpOnlyRoute(method, path)
+    || (method === "GET" && path === `${API_ROOT}/mcp/clients`)
+    || (method === "POST" && path === `${API_ROOT}/mcp/pairing-secret`)
+    || (method === "PUT" && /^\/__draw\/api\/mcp\/clients\/[^/]+$/.test(path));
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -143,6 +156,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
   const pendingFlushes = new Map<string, PendingFlush>();
   const confirmations = new Map<string, PendingConfirmation>();
   const pendingMcpPairings = new Map<string, { clientId: string; resolve: (value: { clientIdentity: string; capability: string; expiresAt: number } | null) => void; timer: ReturnType<typeof setTimeout> }>();
+      const eventTickets = new Map<string, { clientId: string; expiresAt: number }>();
   let document: DrawDocumentBridgeValue | null = null;
   let activeClientId: string | null = null;
   let editorAuth: Promise<EditorAuthManager> | null = null;
@@ -244,7 +258,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
           for (const [revokedId, tombstone] of revokedCommands) if (tombstone.expiresAt <= Date.now()) revokedCommands.delete(revokedId);
           revokedCommands.set(id, { clientIdentity, expiresAt: Date.now() + lateAckRetentionMs });
           while (revokedCommands.size > 1_000) revokedCommands.delete(revokedCommands.keys().next().value!);
-          server.ws.send("draw:mcp-command-revoked", { id, clientId: waiting.clientId, clientIdentity });
+        server.ws.send("draw:mcp-command-revoked", { id, clientId: waiting.clientId, clientIdentity });
           waiting.resolve({ id, clientId: waiting.clientId, clientIdentity, revoked: true, error: "This MCP client was revoked while its request was in flight." });
         }
         for (const [id, waiting] of pendingFlushes) {
@@ -279,7 +293,12 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
         const path = requestPath(request);
         if (!path.startsWith(API_ROOT)) return next();
 
-        if (!isLoopbackAddress(request.socket.remoteAddress)) {
+        const trustedIpc = (request.socket as typeof request.socket & { drawTrustedIpc?: boolean }).drawTrustedIpc === true;
+        if (server.config.isProduction && (trustedIpc ? !isMcpRoute(request.method, path) : isMcpOnlyRoute(request.method, path))) {
+          sendJson(response, 403, { error: "This Draw API route is not available over this transport." });
+          return;
+        }
+        if (!trustedIpc && !isLoopbackAddress(request.socket.remoteAddress)) {
           sendJson(response, 403, { error: "Draw MCP bridge accepts loopback requests only." });
           return;
         }
@@ -291,11 +310,11 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
           `localhost:${server.config.server.port}`,
           `[::1]:${server.config.server.port}`,
         ]);
-        if (typeof host !== "string" || !allowedHosts.has(host.toLowerCase())) {
+        if (!trustedIpc && (typeof host !== "string" || !allowedHosts.has(host.toLowerCase()))) {
           sendJson(response, 403, { error: "Draw MCP bridge accepts only its configured loopback host." });
           return;
         }
-        if (typeof origin === "string" && (!host || origin !== `http://${host}`)) {
+        if (!trustedIpc && typeof origin === "string" && (!host || origin !== `http://${host}`)) {
           sendJson(response, 403, { error: "Draw MCP bridge accepts same-origin browser requests only." });
           return;
         }
@@ -311,6 +330,39 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
           const authManager = await getAuth();
           if (request.method === "GET" && path === `${API_ROOT}/health`) {
             sendJson(response, 200, { ok: true });
+            return;
+          }
+
+          if (server.config.isProduction && request.method === "POST" && path === `${API_ROOT}/events/ticket`) {
+            const authenticated = await authorizedEditor(request);
+            if (!authenticated || origin !== `http://${host}` || authenticated.clientId !== activeClientId) {
+              sendJson(response, 401, { error: "Draw events require the active editor session." });
+              return;
+            }
+            const ticket = randomBytes(32).toString("hex");
+            eventTickets.set(ticket, { clientId: authenticated.clientId, expiresAt: Date.now() + 30_000 });
+            for (const [expired, value] of eventTickets) if (value.expiresAt <= Date.now()) eventTickets.delete(expired);
+            sendJson(response, 200, { ticket });
+            return;
+          }
+
+          if (server.config.isProduction && request.method === "GET" && path === `${API_ROOT}/events`) {
+            const ticket = new URL(request.url ?? "/", `http://${host}`).searchParams.get("ticket") ?? "";
+            const grant = eventTickets.get(ticket);
+            eventTickets.delete(ticket);
+            if (!grant || grant.expiresAt <= Date.now() || grant.clientId !== activeClientId || (typeof origin === "string" && origin !== `http://${host}`)) {
+              sendJson(response, 401, { error: "The Draw event ticket is missing, expired, or already used." });
+              return;
+            }
+            (response as ServerResponse & { drawClientId?: string }).drawClientId = grant.clientId;
+            response.statusCode = 200;
+            response.setHeader("content-type", "text/event-stream; charset=utf-8");
+            response.setHeader("cache-control", "no-store");
+            response.setHeader("connection", "keep-alive");
+            response.write(": connected\n\n");
+            const heartbeat = setInterval(() => response.write(": ping\n\n"), 15_000);
+            heartbeat.unref();
+            response.once("close", () => clearInterval(heartbeat));
             return;
           }
 

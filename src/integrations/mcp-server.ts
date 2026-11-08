@@ -9,6 +9,8 @@ import { assertInlineArtifactSize } from "./mcp-result-limits";
 import { shouldRequireOpenConfirmation } from "../document/open-safety";
 import { serializeDrawFile } from "../document/document";
 import { readConfiguredPairingSecret } from "./mcp-pairing-config";
+import { requestDrawIpc } from "../runtime/ipc-client";
+import { drawStartRequiredError } from "./mcp-transport-error";
 
 const defaultBaseUrl = "http://127.0.0.1:5173";
 const requestTimeoutMs = 25_000;
@@ -122,6 +124,7 @@ function resolveLoopbackBaseUrl(): URL {
 }
 
 const baseUrl = resolveLoopbackBaseUrl();
+const ipcSocketPath = process.env.DRAW_MCP_SOCKET_PATH;
 
 async function bridgeRequest(path: string, init?: RequestInit, options: { pairing?: boolean; timeoutMs?: number } = {}): Promise<any> {
   const pairing = options.pairing ?? false;
@@ -132,18 +135,29 @@ async function bridgeRequest(path: string, init?: RequestInit, options: { pairin
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? requestTimeoutMs);
   try {
-    const response = await fetch(new URL(path, baseUrl), {
-      ...init,
-      signal: controller.signal,
-      headers: {
-        "content-type": "application/json",
-        ...(!pairing && credential ? { "x-draw-client-identity": credential.clientIdentity!, authorization: `Bearer ${credential.capability!}` } : {}),
-        ...(init?.headers ?? {}),
-      },
-    });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      const message = typeof body?.error === "string" ? body.error : `Draw bridge returned HTTP ${response.status}.`;
+    const headers = {
+      "content-type": "application/json",
+      ...(!pairing && credential ? { "x-draw-client-identity": credential.clientIdentity!, authorization: `Bearer ${credential.capability!}` } : {}),
+      ...(init?.headers ?? {}),
+    };
+    let status: number;
+    let body: any;
+    if (ipcSocketPath) {
+      const response = await requestDrawIpc(ipcSocketPath, path, {
+        method: init?.method,
+        headers: Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, String(value)])),
+        body: typeof init?.body === "string" ? init.body : undefined,
+      }, options.timeoutMs ?? requestTimeoutMs);
+      status = response.status;
+      body = response.body;
+    } else {
+      const response = await fetch(new URL(path, baseUrl), { ...init, signal: controller.signal, headers });
+      status = response.status;
+      body = await response.json().catch(() => ({}));
+    }
+    const ok = status >= 200 && status < 300;
+    if (!ok) {
+      const message = typeof body?.error === "string" ? body.error : `Draw bridge returned HTTP ${status}.`;
       throw new Error(message);
     }
     return body;
@@ -151,8 +165,12 @@ async function bridgeRequest(path: string, init?: RequestInit, options: { pairin
     if (error instanceof Error && error.name === "AbortError") {
       throw new Error("Timed out waiting for the Draw canvas. Keep the local Draw app open and try again.");
     }
+    const unavailable = drawStartRequiredError(error, Boolean(ipcSocketPath), ipcSocketPath ? undefined : baseUrl.origin);
+    if (unavailable) throw unavailable;
     if (error instanceof TypeError) {
-      throw new Error(`Cannot reach Draw at ${baseUrl.origin}. Start the local Draw app, then retry.`);
+      throw new Error(ipcSocketPath
+        ? "Cannot reach the Draw runtime over local IPC. Start Draw, then retry."
+        : `Cannot reach Draw at ${baseUrl.origin}. Start the local Draw app, then retry.`);
     }
     throw error;
   } finally {
