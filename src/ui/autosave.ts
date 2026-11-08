@@ -37,9 +37,16 @@ export function createDebouncedSaver<T>(
     }, delayMs);
   };
 
+  const cancelPending = (): void => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    pending = NO_PENDING_VALUE;
+  };
+
   return {
     schedule,
     flush,
+    cancelPending,
     isBusy: () => timer !== null || inFlight !== null || pending !== NO_PENDING_VALUE,
   };
 }

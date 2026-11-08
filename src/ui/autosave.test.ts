@@ -30,6 +30,17 @@ describe("debounced autosave", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("discards a pending value when its owning canvas is abandoned", async () => {
+    vi.useFakeTimers();
+    const save = vi.fn(async (_value: string) => undefined);
+    const autosave = createDebouncedSaver(save, 350);
+    autosave.schedule("deleted canvas scene");
+    autosave.cancelPending();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(save).not.toHaveBeenCalled();
+    expect(autosave.isBusy()).toBe(false);
+  });
+
   it("does not overlap saves and flushes changes queued during a save", async () => {
     vi.useFakeTimers();
     let releaseFirst!: () => void;

@@ -104,7 +104,6 @@ The MCP bridge currently requires the Vite development server and an open Draw t
 Keep these out of the first build, then prioritize them based on actual use:
 
 - Cloud sync, user accounts, collaboration, view/edit permissions, and comments.
-- Cloud sync, user accounts, collaboration, view/edit permissions, and comments.
 - Excalidraw file import/export or compatibility, if it becomes useful.
 - Broader Excalidraw feature coverage after a focused feature audit.
 - Add selected elements to the reusable library (tracked in [issue #11](https://github.com/ashbhati/draw/issues/11)); library browsing works, saving new items is deferred.

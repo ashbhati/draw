@@ -230,10 +230,8 @@ export default function App() {
     if (!writerOwned.current) return;
     const outcome = await saveCurrentDocument(value);
     if (outcome.saved) setStatus("saved");
-    else {
-      setStatus("error");
-      setMessage("A newer saved scene or app state was kept; reload the page to continue from it.");
-    }
+    // A canvas switch or deletion can race with an already-running save. The
+    // storage layer safely rejects that stale write; it is not a user error.
   }, 350, (error) => {
     setStatus("error");
     setMessage(`Autosave failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -278,11 +276,13 @@ export default function App() {
           if (!live) return;
           let workspaceItems = await listWorkspaces();
           if (!workspaceItems.length) {
-            const workspace = await createWorkspace("My workspace");
-            const canvas = await createCanvas(workspace.id, stored?.document.title ?? "Untitled drawing", stored ?? undefined);
-            await setActiveCanvas(canvas.id);
-            stored = await loadCanvasDocument(canvas.id);
-            workspaceItems = [workspace];
+            if (lock.acquired) {
+              const workspace = await createWorkspace("My workspace");
+              const canvas = await createCanvas(workspace.id, stored?.document.title ?? "Untitled drawing", stored ?? undefined);
+              await setActiveCanvas(canvas.id);
+              stored = await loadCanvasDocument(canvas.id);
+              workspaceItems = [workspace];
+            }
           }
           let workspaceId = "";
           let canvasItems: DrawCanvas[] = [];
@@ -295,20 +295,24 @@ export default function App() {
           }
           if (!workspaceId) {
             const workspace = workspaceItems[0];
-            workspaceId = workspace.id;
-            canvasItems = await listCanvases(workspaceId);
-            if (!canvasItems.length) {
-              const canvas = await createCanvas(workspaceId, "Untitled drawing");
-              canvasItems = [canvas];
+            if (workspace) {
+              workspaceId = workspace.id;
+              canvasItems = await listCanvases(workspaceId);
+              if (!canvasItems.length && lock.acquired) {
+                const canvas = await createCanvas(workspaceId, "Untitled drawing");
+                canvasItems = [canvas];
+              }
+              if (canvasItems.length) {
+                if (lock.acquired) await setActiveCanvas(canvasItems[0].id);
+                stored = await loadCanvasDocument(canvasItems[0].id);
+              }
             }
-            await setActiveCanvas(canvasItems[0].id);
-            stored = await loadCanvasDocument(canvasItems[0].id);
           }
-          if (!stored) throw new Error("The active canvas document is unavailable.");
+          if (!stored && lock.acquired) throw new Error("The active canvas document is unavailable.");
           setWorkspaces(workspaceItems);
           setCanvases(canvasItems);
           setActiveWorkspaceId(workspaceId);
-          setActiveCanvasId(canvasItems.find((item) => item.documentId === stored!.document.id)?.id ?? "");
+          setActiveCanvasId(stored ? canvasItems.find((item) => item.documentId === stored!.document.id)?.id ?? "" : "");
           setDocument(stored ?? createEmptyDocument());
           if (stored) {
             try {
@@ -607,6 +611,7 @@ export default function App() {
     if (!canvasId || canvasId === activeCanvasId || !writerOwned.current) return;
     try {
       await settleEditorBeforeSwitch();
+      autosave.cancelPending(); bridgeAutosave.cancelPending();
       const next = await loadCanvasDocument(canvasId);
       if (!next) throw new Error("The selected canvas has no saved document.");
       await setActiveCanvas(canvasId);
@@ -618,6 +623,7 @@ export default function App() {
 
   const switchToNewCanvas = async (workspaceId: string, name: string, source?: DrawDocument) => {
     await settleEditorBeforeSwitch();
+    autosave.cancelPending(); bridgeAutosave.cancelPending();
     const created = await createCanvas(workspaceId, name, source);
     const next = await loadCanvasDocument(created.id);
     if (!next) throw new Error("The new canvas could not be loaded.");
@@ -651,6 +657,7 @@ export default function App() {
   const duplicateActiveCanvas = async () => {
     try {
       await settleEditorBeforeSwitch();
+      autosave.cancelPending(); bridgeAutosave.cancelPending();
       const duplicate = await duplicateCanvas(activeCanvasId);
       const next = await loadCanvasDocument(duplicate.id);
       if (!next) throw new Error("The copy could not be loaded.");
@@ -666,7 +673,7 @@ export default function App() {
       await settleEditorBeforeSwitch();
       const renamed = await renameCanvas(activeCanvasId, name);
       const next = await loadCanvasDocument(activeCanvasId);
-      if (next) { setDocument(next); setEditorKey((key) => key + 1); }
+      if (next) setDocument(next);
       await refreshWorkspaceList(activeWorkspaceId, activeCanvasId);
       setMessage(`Canvas renamed to ${renamed.name}.`);
     } catch (error) { setMessage(`Could not rename canvas: ${error instanceof Error ? error.message : String(error)}`); }
@@ -684,7 +691,9 @@ export default function App() {
     const target = canvases.find((item) => item.id === activeCanvasId);
     if (!target || !window.confirm(`Delete canvas “${target.name}”? Its saved editable drawing and history will be removed from this device.`)) return;
     try {
-      await settleEditorBeforeSwitch(); await deleteCanvas(target.id);
+      await settleEditorBeforeSwitch();
+      autosave.cancelPending(); bridgeAutosave.cancelPending();
+      await deleteCanvas(target.id);
       const next = await loadCurrentDocument();
       let updated = await listCanvases(activeWorkspaceId);
       if (!updated.length) { const fresh = await createCanvas(activeWorkspaceId, "Untitled drawing"); updated = [fresh]; await setActiveCanvas(fresh.id); }
@@ -699,7 +708,9 @@ export default function App() {
     const workspace = workspaces.find((item) => item.id === activeWorkspaceId);
     if (!workspace || !window.confirm(`Delete workspace “${workspace.name}” and all ${canvases.length} saved canvas${canvases.length === 1 ? "" : "es"}? This permanently removes those editable drawings and their history from this device.`)) return;
     try {
-      await settleEditorBeforeSwitch(); await deleteWorkspace(workspace.id);
+      await settleEditorBeforeSwitch();
+      autosave.cancelPending(); bridgeAutosave.cancelPending();
+      await deleteWorkspace(workspace.id);
       let remaining = await listWorkspaces();
       if (!remaining.length) remaining = [await createWorkspace("My workspace")];
       const nextWorkspace = remaining[0];

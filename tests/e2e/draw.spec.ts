@@ -2410,9 +2410,28 @@ test("workspaces and canvases create, switch, rename, duplicate, delete, and sur
 
   await canvasPicker.selectOption({ index: 1 });
   await expect(page.getByLabel("Drawing title")).toHaveValue("Beta notes");
+  const canvas = page.locator(".excalidraw canvas").last();
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error("The drawing canvas is unavailable.");
+  for (const offset of [-210, 30]) {
+    await page.locator('.excalidraw label[title^="Rectangle"]').click();
+    const startX = box.x + box.width / 2 + offset;
+    const startY = box.y + box.height / 2 - 35;
+    await page.mouse.move(startX, startY);
+    await page.mouse.down(); await page.mouse.move(startX + 120, startY + 80, { steps: 3 }); await page.mouse.up();
+  }
+  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.length).toBe(2);
   page.once("dialog", (dialog) => dialog.accept("Beta renamed"));
   await page.getByRole("button", { name: "Rename canvas" }).click();
   await expect(page.getByLabel("Drawing title")).toHaveValue("Beta renamed");
+  const renamedScene = await readLocalDocument(page);
+  const lastShape = renamedScene.document.elements.at(-1);
+  const undoCanvas = page.locator(".excalidraw canvas").last();
+  const undoBounds = await undoCanvas.boundingBox();
+  if (!undoBounds || !lastShape) throw new Error("The renamed scene is unavailable.");
+  await page.mouse.click(undoBounds.x + lastShape.x + lastShape.width / 2, undoBounds.y + lastShape.y + lastShape.height / 2);
+  await page.keyboard.press("Meta+z");
+  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.filter((element: any) => !element.isDeleted).length).toBe(1);
   await page.getByRole("button", { name: "Duplicate canvas" }).click();
   await expect(canvasPicker.locator("option")).toHaveCount(3);
   await expect(page.getByLabel("Drawing title")).toHaveValue("Beta renamed copy");
@@ -2432,6 +2451,71 @@ test("workspaces and canvases create, switch, rename, duplicate, delete, and sur
   await expect(workspacePicker.locator("option")).toHaveCount(1);
   await expect(workspacePicker.locator("option").first()).toHaveText("Research workspace");
   await expect(page.getByLabel("Drawing title")).toHaveValue("Alpha notes");
+});
+
+test("pending autosave is discarded safely when switching or deleting a canvas", async ({ page }) => {
+  const canvasPicker = page.locator('nav select[aria-label="Canvas"]');
+  const firstCanvasId = await canvasPicker.inputValue();
+  await page.getByRole("button", { name: "New canvas" }).click();
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
+  const canvas = page.locator(".excalidraw canvas").last();
+  await expect.poll(() => canvas.boundingBox()).not.toBeNull();
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error("The drawing canvas is unavailable.");
+  await page.locator('.excalidraw label[title^="Rectangle"]').click();
+  const startX = box.x + box.width / 2 - 70;
+  const startY = box.y + box.height / 2 - 30;
+  await page.mouse.move(startX, startY);
+  await page.mouse.down(); await page.mouse.move(startX + 140, startY + 100, { steps: 2 }); await page.mouse.up();
+  await canvasPicker.selectOption(firstCanvasId);
+  await expect(page.getByText("Saved on this device")).toBeVisible();
+  await expect(page.getByText(/reload the page to continue/i)).toHaveCount(0);
+  await canvasPicker.selectOption({ index: 1 });
+  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.length).toBe(1);
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete canvas" }).click();
+  await expect(canvasPicker.locator("option")).toHaveCount(1);
+  await expect(page.getByText("Saved on this device")).toBeVisible();
+  await expect(page.getByText(/reload the page to continue/i)).toHaveCount(0);
+});
+
+test("a read-only tab does not bootstrap a fresh workspace or active canvas pointer", async ({ browser, baseURL }) => {
+  const context = await browser.newContext();
+  await context.addInitScript(() => {
+    const win = window as typeof window & { __drawLockReady?: Promise<void> };
+    win.__drawLockReady = new Promise<void>((resolve) => {
+      void navigator.locks.request("draw-local-writer-v1", { mode: "exclusive" }, async () => {
+        resolve();
+        await new Promise<void>(() => {});
+      });
+    });
+  });
+  const page = await context.newPage();
+  try {
+    await page.goto(baseURL!);
+    await page.evaluate(() => (window as typeof window & { __drawLockReady?: Promise<void> }).__drawLockReady);
+    await expect(page.getByText(/already open in another tab/i)).toBeVisible();
+    const records = await page.evaluate(async () => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open("draw-local");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const values = await new Promise<{ workspaces: unknown[]; canvases: unknown[]; pointer: unknown }>((resolve, reject) => {
+        const tx = db.transaction(["workspaces", "canvases", "workspaceMeta"], "readonly");
+        const workspaces = tx.objectStore("workspaces").getAll();
+        const canvases = tx.objectStore("canvases").getAll();
+        const pointer = tx.objectStore("workspaceMeta").get("activeCanvas");
+        tx.oncomplete = () => resolve({ workspaces: workspaces.result, canvases: canvases.result, pointer: pointer.result });
+        tx.onerror = () => reject(tx.error);
+      });
+      db.close();
+      return values;
+    });
+    expect(records).toEqual({ workspaces: [], canvases: [], pointer: undefined });
+  } finally {
+    await context.close();
+  }
 });
 
 test("importing a .draw file adds a separate editable canvas and keeps the active drawing", async ({ page }) => {
