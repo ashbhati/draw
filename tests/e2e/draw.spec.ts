@@ -2765,6 +2765,10 @@ test("pending autosave is discarded safely when switching or deleting a canvas",
   const startY = box.y + box.height / 2 - 30;
   await page.mouse.move(startX, startY);
   await page.mouse.down(); await page.mouse.move(startX + 140, startY + 100, { steps: 2 }); await page.mouse.up();
+  // Confirm Excalidraw accepted the human drag and queued its debounced save
+  // before switching. This keeps a slow CI render from switching on mouseup
+  // before the editor has committed the newly drawn rectangle to React state.
+  await expect(page.locator(".save-indicator.saving")).toBeVisible();
   await canvasPicker.selectOption(firstCanvasId);
   await expect(page.getByText("Saved on this device")).toBeVisible();
   await expect(page.getByText(/reload the page to continue/i)).toHaveCount(0);
