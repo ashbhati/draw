@@ -1,5 +1,17 @@
 import type { DrawAsset, DrawElement } from "../document/document";
 
+export function resolveLibraryWorkspaceFromCatalog(
+  catalog: { activeWorkspaceId?: unknown; activeDocument?: { document?: { id?: unknown } } },
+  requestedDocumentId: unknown,
+): string {
+  const activeDocumentId = catalog.activeDocument?.document?.id;
+  if (typeof catalog.activeWorkspaceId !== "string" || !catalog.activeWorkspaceId || typeof activeDocumentId !== "string" || !activeDocumentId) {
+    throw new Error("The active Draw workspace is not available.");
+  }
+  if (requestedDocumentId !== activeDocumentId) throw new Error("CONFLICT: The active canvas changed. Read the workspace catalog and retry the library operation with the active document ID.");
+  return catalog.activeWorkspaceId;
+}
+
 /** Include Excalidraw-bound text and group members with selected elements. */
 export function collectLibrarySelection(
   elements: readonly DrawElement[],

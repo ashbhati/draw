@@ -14,7 +14,7 @@ import { isSafeHttpsUrl } from "./document/attribution";
 import { composeBackgroundSvg, hasSelectedExportElements, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorForBackgroundPreset } from "./export/background-recolor";
 import { addWorkspaceLibraryItem, saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createCanvas, duplicateCanvas, deleteCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, listCanvases, listWorkspaces, loadCanvasDocument, loadWorkspaceLibrary, loadWorkspaceLibraryState, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, saveWorkspaceLibrary, setActiveCanvas, type DrawCanvas, type DrawLibraryItem, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
-import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, reloadLibraryAfterConflict, shouldPersistLibraryChange } from "./ui/draw-library";
+import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, reloadLibraryAfterConflict, resolveLibraryWorkspaceFromCatalog, shouldPersistLibraryChange } from "./ui/draw-library";
 import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
 import { createDebouncedSaver } from "./ui/autosave";
@@ -299,7 +299,6 @@ export default function App() {
           libraryItemsRef.current = [];
           setLibraryItems([]);
           setLibraryManagerOpen(false);
-          setStatus("error");
           setMessage("This workspace was deleted while its library was being edited. Choose an existing workspace to continue.");
           return;
         }
@@ -308,7 +307,6 @@ export default function App() {
         libraryItemsRef.current = latest.items;
         setLibraryItems(latest.items);
         if (apiRef.current) await apiRef.current.updateLibrary({ libraryItems: latest.items as unknown as LibraryItems, merge: false, prompt: false });
-        setStatus("error");
         setMessage("The library changed in another tab or by an agent; your last library edit was not saved. The latest saved library is loaded; reapply your edit if needed.");
       } catch (reloadError) {
         if (activeWorkspaceIdRef.current !== workspaceId) return;
@@ -318,8 +316,9 @@ export default function App() {
   }, []);
 
   const activateWorkspaceLibrary = async (workspaceId: string) => {
-    const { items, revision } = await loadWorkspaceLibraryState(workspaceId);
     activeWorkspaceIdRef.current = workspaceId;
+    const { items, revision } = await loadWorkspaceLibraryState(workspaceId);
+    if (activeWorkspaceIdRef.current !== workspaceId) throw new Error("The active workspace changed while its library was loading. Retry the operation.");
     libraryRevisionRef.current = revision;
     libraryItemsRef.current = items;
     setLibraryItems(items);
@@ -1186,6 +1185,7 @@ export default function App() {
         action: storageAction,
       });
       if (revokedMcpCommandIds.current.has(event.id)) throw new Error("MCP command was revoked after the workspace operation committed; read the catalog before retrying.");
+      await activateWorkspaceLibrary(committed.activeWorkspaceId);
       setWorkspaces(committed.workspaces);
       setActiveWorkspaceId(committed.activeWorkspaceId);
       setCanvases(committed.canvases.filter((canvas) => canvas.workspaceId === committed.activeWorkspaceId));
@@ -1348,8 +1348,13 @@ export default function App() {
         throw new Error("CONFLICT: The expected document revision is stale. Read the current canvas and retry.");
       }
       if (["list_workspace_library", "read_workspace_library_item", "add_selection_to_workspace_library", "rename_workspace_library_item", "delete_workspace_library_item"].includes(event.operation)) {
-        const workspaceId = activeWorkspaceIdRef.current;
-        if (!workspaceId) throw new Error("The active Draw workspace is not available.");
+        const libraryCatalog = await getMcpWorkspaceCatalog();
+        const workspaceId = resolveLibraryWorkspaceFromCatalog(libraryCatalog, event.input.documentId);
+        if (current.document.id !== event.input.documentId) throw new Error("CONFLICT: The editor has not loaded the active canvas. Reload the current workspace before retrying.");
+        await activateWorkspaceLibrary(workspaceId);
+        const verifiedCatalog = await getMcpWorkspaceCatalog();
+        resolveLibraryWorkspaceFromCatalog(verifiedCatalog, event.input.documentId);
+        if (activeWorkspaceIdRef.current !== workspaceId) throw new Error("CONFLICT: The active workspace changed. Read the workspace catalog and retry the library operation.");
         const storedLibrary = await loadWorkspaceLibraryState(workspaceId);
         const items = storedLibrary.items;
         let libraryResult: Record<string, unknown>;
@@ -1487,8 +1492,13 @@ export default function App() {
         elements = update.elements;
         result = { updatedElementIds: update.updatedIds };
       } else if (event.operation === "insert_workspace_library_item") {
-        const workspaceId = activeWorkspaceIdRef.current;
-        if (!workspaceId) throw new Error("The active Draw workspace is not available.");
+        const libraryCatalog = await getMcpWorkspaceCatalog();
+        const workspaceId = resolveLibraryWorkspaceFromCatalog(libraryCatalog, event.input.documentId);
+        if (current.document.id !== event.input.documentId) throw new Error("CONFLICT: The editor has not loaded the active canvas. Reload the current workspace before retrying.");
+        await activateWorkspaceLibrary(workspaceId);
+        const verifiedCatalog = await getMcpWorkspaceCatalog();
+        resolveLibraryWorkspaceFromCatalog(verifiedCatalog, event.input.documentId);
+        if (activeWorkspaceIdRef.current !== workspaceId) throw new Error("CONFLICT: The active workspace changed. Read the workspace catalog and retry the library operation.");
         const item = (await loadWorkspaceLibraryState(workspaceId)).items.find((candidate) => candidate.id === event.input.itemId);
         if (!item) throw new Error("LIBRARY_ITEM_NOT_FOUND: The requested item is not in the active workspace library.");
         const copies = cloneLibraryElements(item.elements, randomId);

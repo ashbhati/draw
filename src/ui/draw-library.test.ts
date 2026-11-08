@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { DrawAsset, DrawElement } from "../document/document";
-import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, reloadLibraryAfterConflict, shouldPersistLibraryChange } from "./draw-library";
+import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, reloadLibraryAfterConflict, resolveLibraryWorkspaceFromCatalog, shouldPersistLibraryChange } from "./draw-library";
 
 describe("Draw reusable library items", () => {
   it("captures selected elements with bound labels and preserves element relationships", () => {
@@ -52,6 +52,12 @@ describe("Draw reusable library items", () => {
     await expect(reloadLibraryAfterConflict(new Error("Workspace does not exist."), shouldNotReload)).resolves.toEqual({ deleted: true });
     expect(shouldNotReload).not.toHaveBeenCalled();
     await expect(reloadLibraryAfterConflict(new Error("IndexedDB is unavailable."), async () => ({ revision: 3 }))).rejects.toThrow("IndexedDB is unavailable");
+  });
+
+  it("binds library access to the active workspace catalog and its document", () => {
+    const catalog = { activeWorkspaceId: "workspace-b", activeDocument: { document: { id: "doc-b" } } };
+    expect(resolveLibraryWorkspaceFromCatalog(catalog, "doc-b")).toBe("workspace-b");
+    expect(() => resolveLibraryWorkspaceFromCatalog(catalog, "doc-a")).toThrow(/active canvas changed/i);
   });
 
   it("inserts independent copies with fresh IDs and remapped labels, bindings, and groups", () => {

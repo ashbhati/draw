@@ -372,7 +372,7 @@ function createServer() {
   commandTool(server, "duplicate_elements", "Duplicate editable elements and their bound labels with new Draw IDs. Optionally set offsetX/offsetY (default 24).", {
     ...revisionContext, ids: z.array(z.string().min(1).max(200)).min(1).max(100), offsetX: z.number().finite().min(-100000).max(100000).optional(), offsetY: z.number().finite().min(-100000).max(100000).optional(),
   });
-  commandTool(server, "set_selection", "Select or clear elements in the open Draw canvas by stable IDs. Selection is transient and is not saved.", { documentId: z.string().min(1).max(200), ids: z.array(z.string().min(1).max(200)).max(100) });
+  commandTool(server, "set_selection", "Select or clear elements in the open Draw canvas by stable IDs. Selection is transient and is not saved. Include the active document revision.", { ...revisionContext, ids: z.array(z.string().min(1).max(200)).max(100) });
   commandTool(server, "group_elements", "Group two or more selected elements in the active Draw document.", idsSchema);
   commandTool(server, "ungroup_elements", "Remove the latest shared group from selected elements in the active Draw document.", idsSchema);
   commandTool(server, "arrange_elements", "Bring selected elements forward/back, align two or more, or distribute three or more. Bound labels travel with their shapes.", {
