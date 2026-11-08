@@ -326,11 +326,23 @@ export function fromExcalidrawScene(
       },
       elements: copyJsonValue([...scene.elements]) as DrawElement[],
       appState,
-      assets: normalizeSceneFiles(scene.files ?? {}),
+      assets: normalizeSceneFilesWithAttribution(scene.files ?? {}, scene.elements),
     },
   };
   validateDrawDocument(doc);
   return doc;
+}
+
+function normalizeSceneFilesWithAttribution(files: Record<string, unknown>, elements: readonly unknown[]): Record<string, DrawAsset> {
+  const assets = normalizeSceneFiles(files);
+  for (const rawElement of elements) {
+    if (!isRecord(rawElement) || rawElement.type !== "image" || typeof rawElement.fileId !== "string") continue;
+    const attribution = isRecord(rawElement.customData) ? rawElement.customData.drawAttribution : undefined;
+    if (!isRecord(attribution) || attribution.provider !== "Openverse") continue;
+    const asset = assets[rawElement.fileId];
+    if (asset) assets[rawElement.fileId] = { ...asset, attribution: copyJsonValue(attribution) };
+  }
+  return assets;
 }
 
 export function toExcalidrawScene(doc: DrawDocument): {

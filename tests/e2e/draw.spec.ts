@@ -17,13 +17,22 @@ function mcpAuthHeaders() {
   return { "x-draw-client-identity": clientIdentity, authorization: `Bearer ${capability}` };
 }
 
-async function startStdioMcp(baseURL: string, documentDir: string, pairingSecret?: string) {
+async function startStdioMcp(baseURL: string, documentDir: string, pairingSecret?: string, mockOpenverse = false) {
   const credentialPath = join(documentDir, "mcp-client-credential.json");
   if (!pairingSecret) {
     await writeFile(credentialPath, JSON.stringify({ installationId: "draw-e2e-mcp-host", clientIdentity: process.env.DRAW_E2E_MCP_CLIENT_ID, capability: process.env.DRAW_E2E_MCP_CLIENT_SECRET, expiresAt: Date.now() + 60 * 60_000 }), { mode: 0o600 });
     await chmod(credentialPath, 0o600);
   }
-  const child = spawn(process.execPath, ["--import", "tsx/esm", "src/integrations/mcp-server.ts"], {
+  const args = ["--import", "tsx/esm", "src/integrations/mcp-server.ts"];
+  if (mockOpenverse) {
+    const fixtureId = "123e4567-e89b-12d3-a456-426614174000";
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jJ5sAAAAASUVORK5CYII=", "base64");
+    const fixture = JSON.stringify({ id: fixtureId, title: "MCP chalk arrow", creator: "Draw Artist", creator_url: "https://artist.example/", foreign_landing_url: "https://source.example/chalk-arrow", license: "by", license_version: "4.0", license_url: "https://creativecommons.org/licenses/by/4.0/", attribution: "Draw Artist, CC BY 4.0", source: "Example Archive", width: 1, height: 1, filetype: "png", pngBase64: png.toString("base64") });
+    const preloaderPath = join(documentDir, "mock-openverse.mjs");
+    await writeFile(preloaderPath, `const fixture = ${fixture};\nconst originalFetch = globalThis.fetch;\nglobalThis.fetch = async (input, init) => {\n const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);\n if (url.origin !== "https://api.openverse.org") return originalFetch(input, init);\n if (url.pathname === "/v1/images/") return new Response(JSON.stringify({ results: [fixture] }), { status: 200, headers: { "content-type": "application/json" } });\n if (url.pathname === "/v1/images/" + fixture.id + "/") return new Response(JSON.stringify(fixture), { status: 200, headers: { "content-type": "application/json" } });\n if (url.pathname === "/v1/images/" + fixture.id + "/thumb/") return new Response(Buffer.from(fixture.pngBase64, "base64"), { status: 200, headers: { "content-type": "image/png" } });\n return new Response("not found", { status: 404 });\n};\n`);
+    args.unshift("--import", preloaderPath);
+  }
+  const child = spawn(process.execPath, args, {
     cwd: process.cwd(),
     env: { ...process.env, DRAW_MCP_BASE_URL: new URL(baseURL).origin, DRAW_MCP_DOCUMENT_DIR: documentDir, DRAW_MCP_CLIENT_CREDENTIAL_PATH: credentialPath, ...(pairingSecret ? { DRAW_MCP_PAIRING_SECRET: pairingSecret } : {}) },
     stdio: ["pipe", "pipe", "pipe"],
@@ -1610,6 +1619,117 @@ test("embedded image assets survive autosave and editable Draw save/reopen", asy
     const reopened = await currentBridgeDocument(page);
     return reopened.document.elements.some((element: any) => element.type === "image") && Object.keys(reopened.document.assets).length > 0;
   }).toBe(true);
+});
+
+test("Openverse picker previews license metadata and embeds an offline-editable image with a credits report", async ({ page }) => {
+  const id = "123e4567-e89b-12d3-a456-426614174000";
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jJ5sAAAAASUVORK5CYII=", "base64");
+  await page.route("https://api.openverse.org/v1/images/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname.endsWith("/thumb/")) {
+      await route.fulfill({ status: 200, contentType: "image/png", body: png });
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ results: [{
+      id, title: "Chalk arrow", creator: "Draw Artist", creator_url: "https://artist.example/", foreign_landing_url: "https://source.example/chalk-arrow",
+      license: "by", license_version: "4.0", license_url: "https://creativecommons.org/licenses/by/4.0/", attribution: "Draw Artist, CC BY 4.0",
+      source: "Example Archive", width: 1, height: 1, filetype: "png",
+    }] }) });
+  });
+  await page.getByRole("button", { name: "Images", exact: true }).click();
+  await expect(page.getByRole("link", { name: "Openverse", exact: true })).toHaveAttribute("href", "https://openverse.org/");
+  await page.getByLabel("Search images").fill("chalk arrow");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(page.getByText("Chalk arrow", { exact: true })).toBeVisible();
+  await expect(page.getByText("License: BY 4.0")).toBeVisible();
+  await expect(page.getByRole("link", { name: "Source" })).toHaveAttribute("href", "https://source.example/chalk-arrow");
+  await page.getByRole("button", { name: "Add to drawing" }).click();
+
+  await expect.poll(async () => {
+    const current = await freshBridgeDocument(page);
+    const imageElement = current.document.elements.find((element: any) => element.type === "image");
+    return Boolean(imageElement && current.document.assets[imageElement.fileId]?.attribution?.license === "by");
+  }).toBe(true);
+  const saved = await readLocalDocument(page);
+  const imageElement = saved.document.elements.find((element: any) => element.type === "image");
+  expect(saved.document.assets[imageElement.fileId]).toMatchObject({ dataURL: expect.stringMatching(/^data:image\/png;base64,/), attribution: { provider: "Openverse", providerId: id, license: "by", creator: "Draw Artist" } });
+
+  await page.getByRole("button", { name: "Image credits" }).click();
+  await expect(page.getByRole("heading", { name: "Image credits" })).toBeVisible();
+  const reportWait = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Download credits report" }).click();
+  const report = await reportWait;
+  const reportText = await readFile(await report.path(), "utf8");
+  expect(reportText).toContain("Chalk arrow");
+  expect(reportText).toContain("https://creativecommons.org/licenses/by/4.0/");
+  await page.getByRole("button", { name: "Close" }).last().click();
+
+  const drawWait = page.waitForEvent("download");
+  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  const drawDownload = await drawWait;
+  const drawFile = JSON.parse(await readFile(await drawDownload.path(), "utf8"));
+  expect(drawFile.document.assets[imageElement.fileId].attribution.providerId).toBe(id);
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.locator('input[type="file"][accept^=".draw"]').setInputFiles({ name: "openverse-image.draw", mimeType: "application/vnd.draw+json", buffer: Buffer.from(JSON.stringify(drawFile)) });
+  await expect.poll(async () => {
+    const reopened = await freshBridgeDocument(page);
+    const reopenedImage = reopened.document.elements.find((element: any) => element.type === "image");
+    return reopenedImage && reopened.document.assets[reopenedImage.fileId]?.attribution?.providerId;
+  }).toBe(id);
+
+});
+
+test("stdio MCP searches Openverse, inserts by provider ID, and saves a reopenable attributed Draw document", async ({ page, baseURL }) => {
+  test.setTimeout(60_000);
+  if (!baseURL) throw new Error("Playwright baseURL is required for the MCP image insertion test.");
+  const current = await freshBridgeDocument(page);
+  const documentDir = await mkdtemp(join(tmpdir(), "draw-openverse-mcp-"));
+  const mcp = await startStdioMcp(baseURL, documentDir, undefined, true);
+  try {
+    const available = await mcp.request("tools/list", {});
+    const toolNames = available.result.tools.map((tool: any) => tool.name);
+    expect(toolNames).toContain("search_openverse_images");
+    expect(toolNames).toContain("insert_openverse_image");
+
+    const search = await mcp.call("search_openverse_images", { documentId: current.document.id, expectedDocumentRevision: current.document.documentRevision, query: "chalk arrow", category: "illustration" });
+    expect(search.error).toBeUndefined();
+    const searchResult = JSON.parse(search.result.content[0].text);
+    expect(searchResult.results[0]).toMatchObject({ id: "123e4567-e89b-12d3-a456-426614174000", license: "by", creator: "Draw Artist" });
+
+    const inserted = await mcp.call("insert_openverse_image", {
+      documentId: current.document.id, expectedDocumentRevision: current.document.documentRevision,
+      idempotencyKey: "e2e-mcp-openverse-insert", imageId: searchResult.results[0].id, x: 420, y: 280,
+    });
+    expect(inserted.error).toBeUndefined();
+    const insertedResult = JSON.parse(inserted.result.content[0].text);
+    expect(insertedResult).toMatchObject({ embedded: true, license: "by" });
+
+    const changed = await freshBridgeDocument(page);
+    const imageElement = changed.document.elements.find((element: any) => element.type === "image");
+    expect(imageElement).toBeTruthy();
+    expect(changed.document.assets[imageElement.fileId]).toMatchObject({ attribution: { providerId: searchResult.results[0].id, license: "by", sourceUrl: "https://source.example/chalk-arrow" }, dataURL: expect.stringMatching(/^data:image\/png;base64,/) });
+
+    const latestCanvas = await mcp.call("get_current_canvas", {});
+    expect(latestCanvas.error).toBeUndefined();
+    const latestSummary = JSON.parse(latestCanvas.result.content[0].text);
+    expect(latestSummary.documentRevision).toBe(changed.document.documentRevision);
+    const saved = await mcp.call("save_document", { documentId: latestSummary.documentId, expectedDocumentRevision: latestSummary.documentRevision });
+    expect(saved.error).toBeUndefined();
+    expect(saved.result.content[0].text).toMatch(/"saved": true/);
+    const savedResult = JSON.parse(saved.result.content[0].text);
+    const savedDocument = JSON.parse(savedResult.drawFile);
+    expect(savedDocument.document.assets[imageElement.fileId].attribution.providerId).toBe(searchResult.results[0].id);
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.locator('input[type="file"][accept^=".draw"]').setInputFiles({ name: "mcp-openverse.draw", mimeType: "application/vnd.draw+json", buffer: Buffer.from(JSON.stringify(savedDocument)) });
+    await expect.poll(async () => {
+      const reopened = await freshBridgeDocument(page);
+      const image = reopened.document.elements.find((element: any) => element.type === "image");
+      return image && reopened.document.assets[image.fileId]?.attribution?.providerId;
+    }).toBe(searchResult.results[0].id);
+  } finally {
+    await mcp.close();
+    await rm(documentDir, { recursive: true, force: true });
+  }
 });
 
 test("PNG and JPEG exports keep the complete editable scene even when an object is selected", async ({ page }) => {

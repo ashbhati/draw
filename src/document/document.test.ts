@@ -110,6 +110,16 @@ describe("Draw document contract", () => {
     expect(toExcalidrawScene(doc)).toEqual(scene);
   });
 
+  it("copies Openverse attribution from image elements into the self-contained asset record", () => {
+    const attribution = { provider: "Openverse", providerId: "123e4567-e89b-12d3-a456-426614174000", title: "Chalk arrows", creator: "Artist", sourceUrl: "https://example.test/source", license: "by", licenseVersion: "4.0", licenseUrl: "https://creativecommons.org/licenses/by/4.0/", capturedAt: "2026-01-01T00:00:00.000Z" };
+    const doc = fromExcalidrawScene({
+      elements: [{ ...exampleElement, type: "image", fileId: "asset-1", customData: { drawAttribution: attribution } }],
+      files: { "asset-1": { id: "asset-1", mimeType: "image/png", dataURL: "data:image/png;base64,aGVsbG8=", created: 1 } },
+    });
+    expect(doc.document.assets["asset-1"]).toMatchObject({ dataURL: "data:image/png;base64,aGVsbG8=", attribution });
+    expect(parseDrawFile(serializeDrawFile(doc)).document.assets["asset-1"]?.attribution).toEqual(attribution);
+  });
+
   it("omits ephemeral collaborators from persisted Excalidraw app state", () => {
     const doc = fromExcalidrawScene({
       elements: [],
