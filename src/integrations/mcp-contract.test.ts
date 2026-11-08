@@ -229,11 +229,22 @@ describe("MCP tool input contract", () => {
     expect(parseMcpToolInputImpl("insert_image", {
       documentId: "doc-1", expectedDocumentRevision: 2, idempotencyKey: "image-1", x: 10, y: 20,
       dataURL: `data:image/png;base64,${"A".repeat(64)}`, mimeType: "image/png", width: 320, height: 180, attribution,
-    })).toMatchObject({ operation: "insert_image", input: { documentId: "doc-1", expectedDocumentRevision: 2, x: 10, y: 20, mimeType: "image/png", attribution: { providerId: attribution.providerId, license: "by" } } });
+      idempotencyPayload: { imageId: attribution.providerId, x: 10, y: 20, width: 320, height: 180 },
+    })).toMatchObject({ operation: "insert_image", input: { documentId: "doc-1", expectedDocumentRevision: 2, x: 10, y: 20, mimeType: "image/png", idempotencyPayload: { imageId: attribution.providerId, x: 10 }, attribution: { providerId: attribution.providerId, license: "by" } } });
     expect(() => parseMcpToolInputImpl("insert_image", {
       documentId: "doc-1", expectedDocumentRevision: 2, idempotencyKey: "image-2", x: 10, y: 20,
       url: "https://evil.example/image.png", mimeType: "image/png", dataURL: "data:image/png;base64,AA==", attribution,
     })).toThrow(/remote image URLs are not accepted/i);
+    const unsafeLink = parseMcpToolInputImpl("insert_image", {
+      documentId: "doc-1", expectedDocumentRevision: 2, idempotencyKey: "image-3", x: 10, y: 20,
+      dataURL: `data:image/png;base64,${"A".repeat(64)}`, mimeType: "image/png", attribution: { ...attribution, creatorUrl: "https://user:pass@evil.example/" },
+    });
+    if (unsafeLink.operation !== "insert_image") throw new Error("Expected an image insertion command.");
+    expect(unsafeLink.input.attribution).not.toHaveProperty("creatorUrl");
+    expect(() => parseMcpToolInputImpl("insert_image", {
+      documentId: "doc-1", expectedDocumentRevision: 2, idempotencyKey: "image-4", x: 10, y: 20,
+      dataURL: `data:image/png;base64,${"A".repeat(64)}`, mimeType: "image/png", attribution: { ...attribution, title: "x".repeat(501) },
+    })).toThrow(/valid Openverse ID/i);
   });
 
   it("rejects pressure values on lines and arrows and rejects zero-length paths", () => {

@@ -29,7 +29,7 @@ async function startStdioMcp(baseURL: string, documentDir: string, pairingSecret
     const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jJ5sAAAAASUVORK5CYII=", "base64");
     const fixture = JSON.stringify({ id: fixtureId, title: "MCP chalk arrow", creator: "Draw Artist", creator_url: "https://artist.example/", foreign_landing_url: "https://source.example/chalk-arrow", license: "by", license_version: "4.0", license_url: "https://creativecommons.org/licenses/by/4.0/", attribution: "Draw Artist, CC BY 4.0", source: "Example Archive", width: 1, height: 1, filetype: "png", pngBase64: png.toString("base64") });
     const preloaderPath = join(documentDir, "mock-openverse.mjs");
-    await writeFile(preloaderPath, `const fixture = ${fixture};\nconst originalFetch = globalThis.fetch;\nglobalThis.fetch = async (input, init) => {\n const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);\n if (url.origin !== "https://api.openverse.org") return originalFetch(input, init);\n if (url.pathname === "/v1/images/") return new Response(JSON.stringify({ results: [fixture] }), { status: 200, headers: { "content-type": "application/json" } });\n if (url.pathname === "/v1/images/" + fixture.id + "/") return new Response(JSON.stringify(fixture), { status: 200, headers: { "content-type": "application/json" } });\n if (url.pathname === "/v1/images/" + fixture.id + "/thumb/") return new Response(Buffer.from(fixture.pngBase64, "base64"), { status: 200, headers: { "content-type": "image/png" } });\n return new Response("not found", { status: 404 });\n};\n`);
+    await writeFile(preloaderPath, `const fixture = ${fixture};\nlet metadataReads = 0;\nconst originalFetch = globalThis.fetch;\nglobalThis.fetch = async (input, init) => {\n const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);\n if (url.origin !== "https://api.openverse.org") return originalFetch(input, init);\n if (url.pathname === "/v1/images/") return new Response(JSON.stringify({ results: [fixture] }), { status: 200, headers: { "content-type": "application/json" } });\n if (url.pathname === "/v1/images/" + fixture.id + "/") { metadataReads += 1; return new Response(JSON.stringify({ ...fixture, title: metadataReads === 1 ? fixture.title : "Changed metadata on retry" }), { status: 200, headers: { "content-type": "application/json" } }); }\n if (url.pathname === "/v1/images/" + fixture.id + "/thumb/") return new Response(Buffer.from(fixture.pngBase64, "base64"), { status: 200, headers: { "content-type": "image/png" } });\n return new Response("not found", { status: 404 });\n};\n`);
     args.unshift("--import", preloaderPath);
   }
   const child = spawn(process.execPath, args, {
@@ -1669,13 +1669,30 @@ test("Openverse picker previews license metadata and embeds an offline-editable 
   const drawDownload = await drawWait;
   const drawFile = JSON.parse(await readFile(await drawDownload.path(), "utf8"));
   expect(drawFile.document.assets[imageElement.fileId].attribution.providerId).toBe(id);
+  const hostileAttribution = {
+    ...drawFile.document.assets[imageElement.fileId].attribution,
+    title: "Untrusted file claim", license: "cc0", verification: "verified",
+    sourceUrl: "javascript:alert(document.domain)", creatorUrl: "http://evil.example/phish", licenseUrl: "data:text/html,evil",
+  };
+  drawFile.document.assets[imageElement.fileId].attribution = hostileAttribution;
+  const imageInFile = drawFile.document.elements.find((element: any) => element.type === "image");
+  imageInFile.customData.drawAttribution = hostileAttribution;
   page.once("dialog", (dialog) => dialog.accept());
   await page.locator('input[type="file"][accept^=".draw"]').setInputFiles({ name: "openverse-image.draw", mimeType: "application/vnd.draw+json", buffer: Buffer.from(JSON.stringify(drawFile)) });
   await expect.poll(async () => {
     const reopened = await freshBridgeDocument(page);
     const reopenedImage = reopened.document.elements.find((element: any) => element.type === "image");
-    return reopenedImage && reopened.document.assets[reopenedImage.fileId]?.attribution?.providerId;
-  }).toBe(id);
+    return reopenedImage && reopened.document.assets[reopenedImage.fileId]?.attribution;
+  }).toMatchObject({ providerId: id, title: "Untrusted file claim", verification: "unverified" });
+  const normalized = await freshBridgeDocument(page);
+  const normalizedImage = normalized.document.elements.find((element: any) => element.type === "image");
+  expect(normalized.document.assets[normalizedImage.fileId].attribution).not.toHaveProperty("sourceUrl");
+  expect(normalized.document.assets[normalizedImage.fileId].attribution).not.toHaveProperty("creatorUrl");
+  await page.getByRole("button", { name: "Image credits" }).click();
+  await expect(page.getByText(/file supplied claim \(unverified\)/i)).toBeVisible();
+  await expect(page.getByRole("link", { name: "Source" })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "Creator" })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "License" })).toHaveCount(0);
 
 });
 
@@ -1702,9 +1719,17 @@ test("stdio MCP searches Openverse, inserts by provider ID, and saves a reopenab
     });
     expect(inserted.error).toBeUndefined();
     const insertedResult = JSON.parse(inserted.result.content[0].text);
-    expect(insertedResult).toMatchObject({ embedded: true, license: "by" });
+    expect(insertedResult).toMatchObject({ embedded: true, license: "by", title: "MCP chalk arrow" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const retry = await mcp.call("insert_openverse_image", {
+      documentId: current.document.id, expectedDocumentRevision: current.document.documentRevision,
+      idempotencyKey: "e2e-mcp-openverse-insert", imageId: searchResult.results[0].id, x: 420, y: 280,
+    });
+    expect(retry.error).toBeUndefined();
+    expect(JSON.parse(retry.result.content[0].text)).toEqual(insertedResult);
 
     const changed = await freshBridgeDocument(page);
+    expect(changed.document.elements.filter((element: any) => element.type === "image")).toHaveLength(1);
     const imageElement = changed.document.elements.find((element: any) => element.type === "image");
     expect(imageElement).toBeTruthy();
     expect(changed.document.assets[imageElement.fileId]).toMatchObject({ attribution: { providerId: searchResult.results[0].id, license: "by", sourceUrl: "https://source.example/chalk-arrow" }, dataURL: expect.stringMatching(/^data:image\/png;base64,/) });

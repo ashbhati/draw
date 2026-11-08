@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canUndoMcpOperation, compactOperationLedger, OPERATION_RESULT_RETENTION_MS, OPERATION_SNAPSHOT_RETENTION_MS, OPERATION_TOMBSTONE_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "./operation-ledger";
+import { canUndoMcpOperation, compactOperationLedger, hashMcpOperation, OPERATION_RESULT_RETENTION_MS, OPERATION_SNAPSHOT_RETENTION_MS, OPERATION_TOMBSTONE_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "./operation-ledger";
 
 const operation: DurableMcpOperation = {
   documentId: "doc-1",
@@ -18,6 +18,15 @@ const operation: DurableMcpOperation = {
 };
 
 describe("durable MCP operation ledger", () => {
+  it("hashes Openverse image inserts from stable user intent rather than fetched bytes or timestamp", async () => {
+    const intent = { imageId: "123e4567-e89b-12d3-a456-426614174000", x: 2, y: 3, width: 100 };
+    const first = await hashMcpOperation("insert_image", { idempotencyKey: "same", idempotencyPayload: intent, dataURL: "data:image/png;base64,AAAA", attribution: { capturedAt: "2026-01-01T00:00:00.000Z" } });
+    const retry = await hashMcpOperation("insert_image", { idempotencyKey: "same", idempotencyPayload: intent, dataURL: "data:image/png;base64,BBBB", attribution: { capturedAt: "2026-01-01T00:00:05.000Z" } });
+    const differentPosition = await hashMcpOperation("insert_image", { idempotencyKey: "same", idempotencyPayload: { ...intent, x: 9 }, dataURL: "data:image/png;base64,BBBB" });
+    expect(retry).toBe(first);
+    expect(differentPosition).not.toBe(first);
+  });
+
   it("replays the original result only for the same actor, key, and payload", () => {
     expect(resolveOperationReplay(operation, { clientIdentity: "client-a", idempotencyKey: "key-1", payloadHash: "hash-a", now: operation.completedAt + 1 })).toEqual({ kind: "replay", operationId: "op-1", result: operation.result });
     expect(resolveOperationReplay(operation, { clientIdentity: "client-a", idempotencyKey: "key-1", payloadHash: "hash-b", now: operation.completedAt + 1 })).toEqual({ kind: "conflict", code: "IDEMPOTENCY_KEY_REUSE" });

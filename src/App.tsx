@@ -10,6 +10,7 @@ import {
   type DrawBackgroundPreset,
   type DrawDocument,
 } from "./document/document";
+import { isSafeHttpsUrl } from "./document/attribution";
 import { composeBackgroundSvg, hasSelectedExportElements, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorForBackgroundPreset } from "./export/background-recolor";
 import { saveCurrentDocument, loadCurrentDocument, commitMcpOperation, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createCanvas, duplicateCanvas, deleteCanvas, deleteWorkspace, listCanvases, listWorkspaces, loadCanvasDocument, renameCanvas, renameWorkspace, setActiveCanvas, type DrawCanvas, type DrawWorkspace } from "./ui/storage";
@@ -1645,10 +1646,11 @@ export default function App() {
         <div className="draw-image-credit-list">{imageCredits.map(({ id, attribution }) => <article key={id}>
           <strong>{attribution.title}</strong><span>{attribution.creator ?? "Creator not listed"}</span>
           <span>{attribution.license ? `${attribution.license.toUpperCase()}${attribution.licenseVersion ? ` ${attribution.licenseVersion}` : ""}` : "License not listed"}</span>
-          <div className="draw-image-links">{attribution.sourceUrl && <a href={attribution.sourceUrl} target="_blank" rel="noreferrer">Source</a>}{attribution.creatorUrl && <a href={attribution.creatorUrl} target="_blank" rel="noreferrer">Creator</a>}{attribution.licenseUrl && <a href={attribution.licenseUrl} target="_blank" rel="noreferrer">License</a>}</div>
+          <small>{attribution.verification === "unverified" ? "File supplied claim (unverified). Verify it with a trusted source." : "Openverse listing metadata; licensing claims are not independently verified."}</small>
+          <div className="draw-image-links">{isSafeHttpsUrl(attribution.sourceUrl) && <a href={attribution.sourceUrl} target="_blank" rel="noreferrer">Source</a>}{isSafeHttpsUrl(attribution.creatorUrl) && <a href={attribution.creatorUrl} target="_blank" rel="noreferrer">Creator</a>}{isSafeHttpsUrl(attribution.licenseUrl) && <a href={attribution.licenseUrl} target="_blank" rel="noreferrer">License</a>}</div>
         </article>)}</div>
         {imageCredits.length > 0 && <button className="button button-quiet" onClick={() => {
-          const report = imageCredits.map(({ attribution }) => `${attribution.title}\nCreator: ${attribution.creator ?? "Not listed"}${attribution.creatorUrl ? ` (${attribution.creatorUrl})` : ""}\nSource: ${attribution.sourceUrl ?? "Not listed"}\nLicense: ${attribution.license ? `${attribution.license.toUpperCase()} ${attribution.licenseVersion ?? ""}`.trim() : "Not listed"}${attribution.licenseUrl ? ` (${attribution.licenseUrl})` : ""}\n${attribution.attribution ?? ""}`).join("\n\n");
+          const report = imageCredits.map(({ attribution }) => `${attribution.title}\nAttribution status: ${attribution.verification === "unverified" ? "File supplied claim (unverified)" : "Openverse listing metadata; not independently verified"}\nCreator: ${attribution.creator ?? "Not listed"}${isSafeHttpsUrl(attribution.creatorUrl) ? ` (${attribution.creatorUrl})` : ""}\nSource: ${isSafeHttpsUrl(attribution.sourceUrl) ? attribution.sourceUrl : "Not listed"}\nLicense: ${attribution.license ? `${attribution.license.toUpperCase()} ${attribution.licenseVersion ?? ""}`.trim() : "Not listed"}${isSafeHttpsUrl(attribution.licenseUrl) ? ` (${attribution.licenseUrl})` : ""}\n${attribution.attribution ?? ""}`).join("\n\n");
           download(new Blob([report], { type: "text/plain;charset=utf-8" }), filename(doc.document.title, "credits.txt"));
         }}>Download credits report</button>}
         <p className="draw-confirmation-expiry">Verify each item's license and any requirements for sharing adaptations or commercial use.</p>

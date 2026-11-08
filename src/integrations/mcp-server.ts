@@ -11,7 +11,7 @@ import { serializeDrawFile } from "../document/document";
 import { readConfiguredPairingSecret } from "./mcp-pairing-config";
 import { requestDrawIpc } from "../runtime/ipc-client";
 import { drawStartRequiredError } from "./mcp-transport-error";
-import { fetchOpenverseImage, getOpenverseImageMetadata, imageAttributionFromOpenverseResult, searchOpenverseImages } from "./openverse";
+import { fetchOpenverseImage, getOpenverseImageMetadata, imageAttributionFromOpenverseResult, OPENVERSE_REQUEST_TIMEOUT_MS, searchOpenverseImages, type OpenverseAttribution } from "./openverse";
 
 const defaultBaseUrl = "http://127.0.0.1:5173";
 const requestTimeoutMs = 25_000;
@@ -238,17 +238,25 @@ function createServer() {
     }).strict(),
   }, async (input) => {
     const document = await bridgeRequest("/__draw/api/document?flush=1");
-    assertDocumentContext(document, input.documentId, input.expectedDocumentRevision);
-    const metadata = await getOpenverseImageMetadata(input.imageId);
+    assertDocumentIdentity(document, input.documentId);
+    const deadline = Date.now() + OPENVERSE_REQUEST_TIMEOUT_MS;
+    const metadata = await getOpenverseImageMetadata(input.imageId, fetch, deadline - Date.now());
     if (!metadata.license) throw new Error("Openverse has no license information for this image. Draw will not insert it.");
-    const image = await fetchOpenverseImage(input.imageId, imageAttributionFromOpenverseResult(metadata));
+    const image = await fetchOpenverseImage(input.imageId, imageAttributionFromOpenverseResult(metadata), fetch, deadline - Date.now());
     const command = parseMcpToolInput("insert_image", {
       documentId: input.documentId, expectedDocumentRevision: input.expectedDocumentRevision, idempotencyKey: input.idempotencyKey,
       x: input.x, y: input.y, ...(input.width ? { width: input.width } : {}), ...(input.height ? { height: input.height } : {}),
       mimeType: image.mimeType, dataURL: image.dataURL, attribution: image.attribution,
+      idempotencyPayload: { imageId: input.imageId, x: input.x, y: input.y, ...(input.width ? { width: input.width } : {}), ...(input.height ? { height: input.height } : {}) },
     });
     const result = await bridgeRequest("/__draw/api/commands", { method: "POST", body: JSON.stringify(command) });
-    return textResult({ ...result.result, documentId: result.documentId, documentRevision: result.documentRevision, title: metadata.title, license: metadata.license ?? null, licenseUrl: metadata.licenseUrl ?? null, embedded: true });
+    const storedResult = result.result as Record<string, any>;
+    const attribution = storedResult.attribution as OpenverseAttribution | undefined;
+    return textResult({
+      ...storedResult,
+      ...(attribution ? { title: attribution.title, license: attribution.license ?? null, licenseUrl: attribution.licenseUrl ?? null } : {}),
+      embedded: true,
+    });
   });
 
   server.registerTool(
@@ -399,8 +407,12 @@ function createServer() {
 }
 
 function assertDocumentContext(document: any, documentId: string, expectedRevision: number): void {
-  if (document?.document?.id !== documentId) throw new Error("Document ID does not match the active Draw canvas.");
+  assertDocumentIdentity(document, documentId);
   if ((document?.document?.documentRevision ?? 0) !== expectedRevision) throw new Error("Document revision conflict. Read the latest canvas and retry with its current revision.");
+}
+
+function assertDocumentIdentity(document: any, documentId: string): void {
+  if (document?.document?.id !== documentId) throw new Error("Document ID does not match the active Draw canvas.");
 }
 
 try {

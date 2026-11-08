@@ -1,6 +1,8 @@
 /** Portable, self-contained Draw document format. Version 1 stores editor
  * elements and app state verbatim so opening a file restores editable content. */
 
+import { normalizeDrawImageAttributions } from "./attribution";
+
 export type DrawBackgroundPreset = "blackboard" | "white";
 
 export interface DrawViewport {
@@ -292,6 +294,7 @@ export function parseDrawFile(input: string | unknown): DrawDocument {
   const normalized = looksLikeLegacyPrimitiveDocument(raw)
     ? normalizeLegacyDraw(raw)
     : normalizeVersionOneDocument(raw);
+  normalizeDrawImageAttributions(normalized, "unverified");
   validateDrawDocument(normalized);
   return normalized;
 }
@@ -329,6 +332,7 @@ export function fromExcalidrawScene(
       assets: normalizeSceneFilesWithAttribution(scene.files ?? {}, scene.elements),
     },
   };
+  normalizeDrawImageAttributions(doc, "openverse-index");
   validateDrawDocument(doc);
   return doc;
 }

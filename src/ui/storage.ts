@@ -1,4 +1,5 @@
 import { createEmptyDocument, validateDrawDocument, type DrawDocument } from "../document/document";
+import { normalizeDrawImageAttributions } from "../document/attribution";
 import { compactOperationLedger, operationLedgerKey, OPERATION_SNAPSHOT_RETENTION_MS, OPERATION_TOMBSTONE_RETENTION_MS, sameSceneSnapshot, type DurableMcpOperation, type DurableMcpOperationResult, type DurableMcpRedo, type DurableMcpTombstone, type OperationLedgerEntry } from "../integrations/operation-ledger";
 
 const DATABASE_NAME = "draw-local";
@@ -336,6 +337,7 @@ export async function loadCurrentDocument(): Promise<DrawDocument | null> {
     await waitForTransaction(transaction);
     if (value === undefined) throw new DrawStorageRecoveryError(`Canvas ${active.id} is damaged: its document disappeared during loading.`);
     validateDrawDocument(value);
+    normalizeDrawImageAttributions(value, "unverified");
     return value;
   } finally {
     database.close();
@@ -429,7 +431,7 @@ export async function loadCanvasDocument(canvasId: string): Promise<DrawDocument
       canvasReq.onerror = () => reject(canvasReq.error);
     });
     const [value] = await Promise.all([result, waitForTransaction(tx)]);
-    if (value) validateDrawDocument(value);
+    if (value) { validateDrawDocument(value); normalizeDrawImageAttributions(value, "unverified"); }
     return value;
   } finally { db.close(); }
 }
