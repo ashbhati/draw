@@ -1,21 +1,39 @@
-import { validateDrawDocument, type DrawDocument } from "../document/document";
+import { createEmptyDocument, validateDrawDocument, type DrawDocument } from "../document/document";
 import { compactOperationLedger, operationLedgerKey, OPERATION_SNAPSHOT_RETENTION_MS, OPERATION_TOMBSTONE_RETENTION_MS, sameSceneSnapshot, type DurableMcpOperation, type DurableMcpOperationResult, type DurableMcpRedo, type DurableMcpTombstone, type OperationLedgerEntry } from "../integrations/operation-ledger";
 
 const DATABASE_NAME = "draw-local";
-const DATABASE_VERSION = 4;
+const DATABASE_VERSION = 6;
 const DOCUMENTS_STORE = "documents";
 const MCP_OPERATIONS_STORE = "mcpOperations";
 const MCP_UNDO_STORE = "mcpUndo";
 const MCP_REDO_STORE = "mcpRedo";
 const MCP_META_STORE = "mcpMeta";
+const WORKSPACES_STORE = "workspaces";
+const CANVASES_STORE = "canvases";
+const WORKSPACE_META_STORE = "workspaceMeta";
+const MIGRATION_MARKER_KEY = "migration-v6-complete";
+const LEGACY_RECOVERY_KEY = "legacy-recovery";
 const CURRENT_DOCUMENT_KEY = "current";
 const CURRENT_WRITE_ORDER_KEY = "current-write-order";
+const ACTIVE_POINTER_KEY = "active";
+const INITIALIZED_KEY = "has-canvas-history";
 const AUTOSAVE_SESSION_ID = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 let autosaveSequence = 0;
 const MCP_COMPACTION_INTERVAL = 32;
 const MAX_DOCUMENT_SNAPSHOTS = 100;
 
 type AutosaveOrder = { sessionId: string; sequence: number };
+
+export interface DrawWorkspace { id: string; name: string; createdAt: number; updatedAt: number }
+export interface DrawCanvas { id: string; workspaceId: string; name: string; documentId: string; createdAt: number; updatedAt: number }
+interface ActiveCanvasPointer { workspaceId: string; canvasId: string }
+
+export class DrawStorageRecoveryError extends Error {
+  constructor(message: string) { super(message); this.name = "DrawStorageRecoveryError"; }
+}
+
+function documentKey(id: string): IDBValidKey { return ["draw-document", id]; }
+function writeOrderKey(id: string): IDBValidKey { return ["draw-write-order", id]; }
 
 function autosaveSceneAndMetadata(document: DrawDocument): string {
   const { appState: _appState, ...metadata } = document.document;
@@ -30,7 +48,7 @@ function openDatabase(): Promise<IDBDatabase> {
 
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = (event) => {
       const database = request.result;
       if (!database.objectStoreNames.contains(DOCUMENTS_STORE)) {
         database.createObjectStore(DOCUMENTS_STORE);
@@ -49,6 +67,82 @@ function openDatabase(): Promise<IDBDatabase> {
       if (database.objectStoreNames.contains(MCP_UNDO_STORE) && !request.transaction!.objectStore(MCP_UNDO_STORE).indexNames.contains("byCompletedAt")) request.transaction!.objectStore(MCP_UNDO_STORE).createIndex("byCompletedAt", "completedAt", { unique: false });
       if (database.objectStoreNames.contains(MCP_REDO_STORE) && !request.transaction!.objectStore(MCP_REDO_STORE).indexNames.contains("byCompletedAt")) request.transaction!.objectStore(MCP_REDO_STORE).createIndex("byCompletedAt", "operation.completedAt", { unique: false });
       if (!database.objectStoreNames.contains(MCP_META_STORE)) database.createObjectStore(MCP_META_STORE);
+      const workspaces = database.objectStoreNames.contains(WORKSPACES_STORE)
+        ? request.transaction!.objectStore(WORKSPACES_STORE) : database.createObjectStore(WORKSPACES_STORE);
+      const canvases = database.objectStoreNames.contains(CANVASES_STORE)
+        ? request.transaction!.objectStore(CANVASES_STORE) : database.createObjectStore(CANVASES_STORE);
+      if (!canvases.indexNames.contains("byWorkspaceId")) canvases.createIndex("byWorkspaceId", "workspaceId", { unique: false });
+      if (!canvases.indexNames.contains("byDocumentId")) canvases.createIndex("byDocumentId", "documentId", { unique: true });
+      if (!database.objectStoreNames.contains(WORKSPACE_META_STORE)) database.createObjectStore(WORKSPACE_META_STORE);
+      const meta = request.transaction!.objectStore(WORKSPACE_META_STORE);
+      const documents = request.transaction!.objectStore(DOCUMENTS_STORE);
+      if (event.oldVersion < 5) {
+        // V1 used literal keys. Migrate valid content, but quarantine malformed
+        // content without throwing in onupgradeneeded (which would brick opens).
+        const legacyRequest = documents.get(CURRENT_DOCUMENT_KEY);
+        legacyRequest.onsuccess = () => {
+          const legacy = legacyRequest.result as unknown;
+          if (legacy !== undefined) {
+            try {
+              validateDrawDocument(legacy);
+              const doc = legacy as DrawDocument;
+              const workspaceId = `workspace-${doc.document.id}`;
+              const canvasId = `canvas-${doc.document.id}`;
+              const now = Date.now();
+              documents.put(doc, documentKey(doc.document.id));
+              workspaces.put({ id: workspaceId, name: "My workspace", createdAt: now, updatedAt: now } satisfies DrawWorkspace, workspaceId);
+              canvases.put({ id: canvasId, workspaceId, name: doc.document.title, documentId: doc.document.id, createdAt: now, updatedAt: now } satisfies DrawCanvas, canvasId);
+              meta.put({ workspaceId, canvasId } satisfies ActiveCanvasPointer, ACTIVE_POINTER_KEY);
+              meta.put(true, INITIALIZED_KEY);
+              const oldOrder = documents.get(CURRENT_WRITE_ORDER_KEY);
+              oldOrder.onsuccess = () => {
+                if (oldOrder.result !== undefined) documents.put(oldOrder.result, writeOrderKey(doc.document.id));
+                documents.delete(CURRENT_WRITE_ORDER_KEY);
+              };
+            } catch {
+              meta.put(legacy, LEGACY_RECOVERY_KEY);
+            }
+          }
+          meta.put(true, MIGRATION_MARKER_KEY);
+        };
+      } else {
+        // PR #47's first v5 draft keyed documents by raw IDs. Re-key every
+        // referenced row before accepting arbitrary IDs from portable files.
+        const canvasRequest = canvases.getAll();
+        canvasRequest.onsuccess = () => {
+          const entries = canvasRequest.result as DrawCanvas[];
+          const documentIds = new Set(entries.map((canvas) => canvas.documentId));
+          let remaining = entries.length;
+          const finish = () => { if (remaining === 0) { meta.put(true, MIGRATION_MARKER_KEY); if (entries.length) meta.put(true, INITIALIZED_KEY); } };
+          if (!remaining) { finish(); return; }
+          for (const canvas of entries) {
+            const oldDocumentRequest = documents.get(canvas.documentId);
+            oldDocumentRequest.onsuccess = () => {
+              const raw = oldDocumentRequest.result as unknown;
+              try {
+                validateDrawDocument(raw);
+                documents.put(raw, documentKey(canvas.documentId));
+                if (canvas.documentId !== CURRENT_DOCUMENT_KEY && canvas.documentId !== CURRENT_WRITE_ORDER_KEY) documents.delete(canvas.documentId);
+                const oldOrderKey = `${canvas.documentId}-write-order`;
+                const orderRequest = documents.get(oldOrderKey);
+                orderRequest.onsuccess = () => {
+                  const order = orderRequest.result as Partial<AutosaveOrder> | undefined;
+                  if (typeof order?.sessionId === "string" && Number.isSafeInteger(order.sequence)) documents.put(order, writeOrderKey(canvas.documentId));
+                  // An arbitrary legacy document ID may equal another row's
+                  // old write-order key; never delete a key that is a document.
+                  if (!documentIds.has(oldOrderKey)) documents.delete(oldOrderKey);
+                  remaining -= 1;
+                  finish();
+                };
+              } catch {
+                meta.put({ source: "v5-canvas", canvasId: canvas.id, raw: raw ?? null }, LEGACY_RECOVERY_KEY);
+                remaining -= 1;
+                finish();
+              }
+            };
+          }
+        };
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("Could not open the Draw autosave database."));
@@ -98,43 +192,134 @@ function assertDurableMcpOperation(value: unknown): asserts value is DurableMcpO
 }
 
 /** Save the current editable scene locally; this is separate from image export. */
-export async function saveCurrentDocument(document: DrawDocument, options: { replaceDocument?: boolean; writeToken?: AutosaveOrder } = {}): Promise<{ saved: boolean }> {
+export async function saveCurrentDocument(document: DrawDocument, options: { replaceDocument?: boolean; writeToken?: AutosaveOrder } = {}): Promise<{ saved: boolean; document?: DrawDocument }> {
   validateDrawDocument(document);
   const writeOrder = options.writeToken ?? { sessionId: AUTOSAVE_SESSION_ID, sequence: ++autosaveSequence };
   const database = await openDatabase();
   try {
-    const transaction = database.transaction(DOCUMENTS_STORE, "readwrite");
-    const store = transaction.objectStore(DOCUMENTS_STORE);
-    const currentRequest = store.get(CURRENT_DOCUMENT_KEY);
-    const orderRequest = store.get(CURRENT_WRITE_ORDER_KEY);
-    let saved = false;
-    let readsRemaining = 2;
-    const maybeSave = () => {
-      readsRemaining -= 1;
-      if (readsRemaining > 0) return;
-      const current = currentRequest.result as DrawDocument | undefined;
-      const currentOrder = orderRequest.result as AutosaveOrder | undefined;
-      if (current && current.document.id !== document.document.id && !options.replaceDocument) return;
-      if (current && (
+    const resolvedCanvas = await resolveActiveCanvas(database);
+    if (!resolvedCanvas) {
+      const metaTx = database.transaction(WORKSPACE_META_STORE, "readonly");
+      const hasCanvasHistory = await requestValue<boolean | undefined>(metaTx.objectStore(WORKSPACE_META_STORE).get(INITIALIZED_KEY));
+      await waitForTransaction(metaTx);
+      if (hasCanvasHistory) throw new DrawStorageRecoveryError("There is no active canvas. Create a canvas before saving; the deleted document will not be recreated automatically.");
+      const now = Date.now();
+      const workspaceId = `workspace-${crypto.randomUUID()}`;
+      const canvasId = `canvas-${crypto.randomUUID()}`;
+      const tx = database.transaction([DOCUMENTS_STORE, WORKSPACES_STORE, CANVASES_STORE, WORKSPACE_META_STORE], "readwrite");
+      tx.objectStore(DOCUMENTS_STORE).put(document, documentKey(document.document.id));
+      tx.objectStore(WORKSPACES_STORE).put({ id: workspaceId, name: "My workspace", createdAt: now, updatedAt: now } satisfies DrawWorkspace, workspaceId);
+      const initialCanvas = { id: canvasId, workspaceId, name: document.document.title, documentId: document.document.id, createdAt: now, updatedAt: now } satisfies DrawCanvas;
+      tx.objectStore(CANVASES_STORE).put(initialCanvas, canvasId);
+      tx.objectStore(WORKSPACE_META_STORE).put({ workspaceId, canvasId } satisfies ActiveCanvasPointer, ACTIVE_POINTER_KEY);
+      tx.objectStore(WORKSPACE_META_STORE).put(true, INITIALIZED_KEY);
+      tx.objectStore(DOCUMENTS_STORE).put(document, CURRENT_DOCUMENT_KEY);
+      await waitForTransaction(tx);
+      return { saved: true, document };
+    }
+
+    const transaction = database.transaction([DOCUMENTS_STORE, CANVASES_STORE, WORKSPACE_META_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE], "readwrite");
+    const documents = transaction.objectStore(DOCUMENTS_STORE);
+    const canvases = transaction.objectStore(CANVASES_STORE);
+    const meta = transaction.objectStore(WORKSPACE_META_STORE);
+    const operations = transaction.objectStore(MCP_OPERATIONS_STORE);
+    const undo = transaction.objectStore(MCP_UNDO_STORE);
+    const redo = transaction.objectStore(MCP_REDO_STORE);
+    const activePointerRequest = meta.get(ACTIVE_POINTER_KEY);
+    let activeCanvas: DrawCanvas | undefined;
+    let current: DrawDocument | undefined;
+    let previousOrder: AutosaveOrder | undefined;
+    let readsRemaining = 0;
+    let savedDocument: DrawDocument | undefined;
+    let saveError: Error | undefined;
+    const finishSave = () => {
+      const pointer = activePointerRequest.result as ActiveCanvasPointer | undefined;
+      const canvas = activeCanvas;
+      // A switch or replacement between the preflight recovery and this
+      // transaction is an ordinary stale autosave. The pointer, canvas, doc,
+      // and write all belong to this transaction, so it cannot cross canvases.
+      if (!pointer || !canvas || pointer.canvasId !== canvas.id) return;
+      if (!current) {
+        saveError = new DrawStorageRecoveryError("The active Draw canvas is damaged: its editable document is missing.");
+        transaction.abort();
+        return;
+      }
+      if (!options.replaceDocument && document.document.id !== canvas.documentId) return;
+      if (!options.replaceDocument && current && (
         (current.document.documentRevision ?? 0) > (document.document.documentRevision ?? 0)
         || (current.document.documentRevision ?? 0) === (document.document.documentRevision ?? 0)
           && (current.document.viewRevision ?? 0) > (document.document.viewRevision ?? 0)
       )) return;
-      if (current
+      if (!options.replaceDocument && current
         && (current.document.documentRevision ?? 0) === (document.document.documentRevision ?? 0)
         && (current.document.viewRevision ?? 0) === (document.document.viewRevision ?? 0)
         && JSON.stringify(current) !== JSON.stringify(document)
-        && !options.replaceDocument
         && (autosaveSceneAndMetadata(current) !== autosaveSceneAndMetadata(document)
-          || currentOrder?.sessionId === writeOrder.sessionId && currentOrder.sequence > writeOrder.sequence)) return;
-      store.put(document, CURRENT_DOCUMENT_KEY);
-      store.put(writeOrder, CURRENT_WRITE_ORDER_KEY);
-      saved = true;
+          || previousOrder?.sessionId === writeOrder.sessionId && previousOrder.sequence > writeOrder.sequence)) return;
+
+      const next = structuredClone(document);
+      if (options.replaceDocument) {
+        next.document.id = crypto.randomUUID();
+        next.document.documentRevision = Math.max(document.document.documentRevision, current.document.documentRevision + 1);
+        next.document.viewRevision = Math.max(document.document.viewRevision, current.document.viewRevision + 1);
+      }
+      const oldDocumentId = canvas.documentId;
+      const nextCanvas = { ...canvas, documentId: next.document.id, name: next.document.title, updatedAt: Date.now() };
+      if (options.replaceDocument) {
+        documents.delete(documentKey(oldDocumentId));
+        documents.delete(writeOrderKey(oldDocumentId));
+        undo.delete(oldDocumentId);
+        redo.delete(oldDocumentId);
+        const keysRequest = operations.getAllKeys();
+        const valuesRequest = operations.getAll();
+        let ledgerReads = 2;
+        const clearOldLedger = () => {
+          ledgerReads -= 1;
+          if (ledgerReads) return;
+          (valuesRequest.result as Array<{ documentId?: string }>).forEach((value, index) => {
+            if (value?.documentId === oldDocumentId) operations.delete((keysRequest.result as IDBValidKey[])[index]);
+          });
+          writeReplacement();
+        };
+        keysRequest.onsuccess = clearOldLedger;
+        valuesRequest.onsuccess = clearOldLedger;
+        keysRequest.onerror = valuesRequest.onerror = () => { saveError = new Error("Could not clean replaced document history."); transaction.abort(); };
+      } else writeReplacement();
+
+      function writeReplacement() {
+        documents.put(next, documentKey(next.document.id));
+        documents.put(writeOrder, writeOrderKey(next.document.id));
+        documents.put(next, CURRENT_DOCUMENT_KEY);
+        canvases.put(nextCanvas, nextCanvas.id);
+        meta.put(true, INITIALIZED_KEY);
+        savedDocument = next;
+      }
     };
-    currentRequest.onsuccess = maybeSave;
-    orderRequest.onsuccess = maybeSave;
-    await waitForTransaction(transaction);
-    return { saved };
+    activePointerRequest.onsuccess = () => {
+      const pointer = activePointerRequest.result as ActiveCanvasPointer | undefined;
+      if (!pointer) return;
+      const activeCanvasRequest = canvases.get(pointer.canvasId);
+      activeCanvasRequest.onsuccess = () => {
+        activeCanvas = activeCanvasRequest.result as DrawCanvas | undefined;
+        if (!activeCanvas) {
+          saveError = new DrawStorageRecoveryError("The active Draw canvas pointer is damaged; no canvas row exists for it.");
+          transaction.abort();
+          return;
+        }
+        const currentRequest = documents.get(documentKey(activeCanvas.documentId));
+        const orderRequest = documents.get(writeOrderKey(activeCanvas.documentId));
+        readsRemaining = 2;
+        const maybeFinish = () => { readsRemaining -= 1; if (readsRemaining === 0) finishSave(); };
+        currentRequest.onsuccess = () => { current = currentRequest.result as DrawDocument | undefined; maybeFinish(); };
+        orderRequest.onsuccess = () => { previousOrder = orderRequest.result as AutosaveOrder | undefined; maybeFinish(); };
+        currentRequest.onerror = orderRequest.onerror = () => { saveError = new Error("Could not inspect the active Draw document before saving."); transaction.abort(); };
+      };
+      activeCanvasRequest.onerror = () => { saveError = activeCanvasRequest.error ?? new Error("Could not inspect the active Draw canvas."); transaction.abort(); };
+    };
+    activePointerRequest.onerror = () => { saveError = activePointerRequest.error ?? new Error("Could not inspect the active Draw canvas selection."); transaction.abort(); };
+    try { await waitForTransaction(transaction); } catch (error) { throw saveError ?? error; }
+    if (saveError) throw saveError;
+    return savedDocument ? { saved: true, document: savedDocument } : { saved: false };
   } finally {
     database.close();
   }
@@ -144,21 +329,221 @@ export async function saveCurrentDocument(document: DrawDocument, options: { rep
 export async function loadCurrentDocument(): Promise<DrawDocument | null> {
   const database = await openDatabase();
   try {
+    const active = await resolveActiveCanvas(database);
+    if (!active) return null;
     const transaction = database.transaction(DOCUMENTS_STORE, "readonly");
-    const request = transaction.objectStore(DOCUMENTS_STORE).get(CURRENT_DOCUMENT_KEY);
-    const [value] = await Promise.all([
-      new Promise<unknown>((resolve, reject) => {
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error ?? new Error("Could not read the autosaved Draw document."));
-      }),
-      waitForTransaction(transaction),
-    ]);
-    if (value === undefined) return null;
+    const value = await requestValue<unknown>(transaction.objectStore(DOCUMENTS_STORE).get(documentKey(active.documentId)));
+    await waitForTransaction(transaction);
+    if (value === undefined) throw new DrawStorageRecoveryError(`Canvas ${active.id} is damaged: its document disappeared during loading.`);
     validateDrawDocument(value);
     return value;
   } finally {
     database.close();
   }
+}
+
+/** List workspaces in creation order. Storage API intended for the V2 shell. */
+export async function listWorkspaces(): Promise<DrawWorkspace[]> {
+  return readAll<DrawWorkspace>(WORKSPACES_STORE);
+}
+
+export async function listCanvases(workspaceId: string): Promise<DrawCanvas[]> {
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction(CANVASES_STORE, "readonly");
+    const req = tx.objectStore(CANVASES_STORE).index("byWorkspaceId").getAll(workspaceId);
+    const [items] = await Promise.all([requestValue<DrawCanvas[]>(req), waitForTransaction(tx)]);
+    return items.sort((a, b) => a.createdAt - b.createdAt);
+  } finally { db.close(); }
+}
+
+async function readAll<T>(storeName: string): Promise<T[]> {
+  const db = await openDatabase();
+  try { const tx = db.transaction(storeName, "readonly"); const req = tx.objectStore(storeName).getAll(); const [items] = await Promise.all([requestValue<T[]>(req), waitForTransaction(tx)]); return items.sort((a: any, b: any) => a.createdAt - b.createdAt); }
+  finally { db.close(); }
+}
+
+function requestValue<T>(request: IDBRequest<T>): Promise<T> { return new Promise((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error ?? new Error("IndexedDB request failed.")); }); }
+
+/** Repair a missing/dangling active pointer by selecting the first intact canvas. */
+async function resolveActiveCanvas(database: IDBDatabase): Promise<DrawCanvas | null> {
+  const tx = database.transaction([CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE], "readwrite");
+  const canvasesStore = tx.objectStore(CANVASES_STORE);
+  const documents = tx.objectStore(DOCUMENTS_STORE);
+  const meta = tx.objectStore(WORKSPACE_META_STORE);
+  const pointerRequest = meta.get(ACTIVE_POINTER_KEY);
+  const canvasesRequest = canvasesStore.getAll();
+  const recoveryRequest = meta.get(LEGACY_RECOVERY_KEY);
+  let reads = 3;
+  let pointer: ActiveCanvasPointer | undefined;
+  let canvases: DrawCanvas[] = [];
+  let recovery: unknown;
+  let result: DrawCanvas | null = null;
+  let failure: Error | undefined;
+  const inspect = () => {
+    reads -= 1;
+    if (reads) return;
+    const candidates = canvases.sort((a, b) => a.createdAt - b.createdAt);
+    if (pointer) {
+      const active = candidates.find((canvas) => canvas.id === pointer!.canvasId && canvas.workspaceId === pointer!.workspaceId);
+      if (active) candidates.splice(candidates.indexOf(active), 1), candidates.unshift(active);
+    }
+    let index = 0;
+    const checkNext = () => {
+      const candidate = candidates[index++];
+      if (!candidate) {
+        if (canvases.length) failure = new DrawStorageRecoveryError("Draw storage is damaged: canvases exist, but none has a valid editable document. The stored data was left untouched for recovery.");
+        else if (recovery !== undefined) failure = new DrawStorageRecoveryError("The previous Draw document is damaged and was quarantined. The database is available, but the document needs recovery before editing.");
+        return;
+      }
+      const docRequest = documents.get(documentKey(candidate.documentId));
+      docRequest.onsuccess = () => {
+        try {
+          if (!docRequest.result) throw new Error("missing");
+          validateDrawDocument(docRequest.result);
+          result = candidate;
+          const nextPointer = { workspaceId: candidate.workspaceId, canvasId: candidate.id } satisfies ActiveCanvasPointer;
+          if (pointer?.canvasId !== candidate.id || pointer.workspaceId !== candidate.workspaceId) meta.put(nextPointer, ACTIVE_POINTER_KEY);
+        } catch { checkNext(); }
+      };
+      docRequest.onerror = () => { failure = docRequest.error ?? new DrawStorageRecoveryError("Could not inspect a stored Draw canvas."); tx.abort(); };
+    };
+    checkNext();
+  };
+  pointerRequest.onsuccess = () => { pointer = pointerRequest.result as ActiveCanvasPointer | undefined; inspect(); };
+  canvasesRequest.onsuccess = () => { canvases = canvasesRequest.result as DrawCanvas[]; inspect(); };
+  recoveryRequest.onsuccess = () => { recovery = recoveryRequest.result; inspect(); };
+  for (const request of [pointerRequest, canvasesRequest, recoveryRequest]) request.onerror = () => { failure = request.error ?? new Error("Could not inspect Draw workspace storage."); tx.abort(); };
+  try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
+  if (failure) throw failure;
+  return result;
+}
+
+export async function loadCanvasDocument(canvasId: string): Promise<DrawDocument | null> {
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction([CANVASES_STORE, DOCUMENTS_STORE], "readonly");
+    const canvasReq = tx.objectStore(CANVASES_STORE).get(canvasId);
+    const result = new Promise<DrawDocument | null>((resolve, reject) => {
+      canvasReq.onsuccess = () => { const canvas = canvasReq.result as DrawCanvas | undefined; if (!canvas) { resolve(null); return; } const docReq = tx.objectStore(DOCUMENTS_STORE).get(documentKey(canvas.documentId)); docReq.onsuccess = () => { if (!docReq.result) { reject(new DrawStorageRecoveryError(`Canvas ${canvas.id} is damaged: its document is missing.`)); return; } resolve(docReq.result); }; docReq.onerror = () => reject(docReq.error); };
+      canvasReq.onerror = () => reject(canvasReq.error);
+    });
+    const [value] = await Promise.all([result, waitForTransaction(tx)]);
+    if (value) validateDrawDocument(value);
+    return value;
+  } finally { db.close(); }
+}
+
+export async function createWorkspace(name: string): Promise<DrawWorkspace> {
+  const workspace = { id: crypto.randomUUID(), name: name.trim() || "Untitled workspace", createdAt: Date.now(), updatedAt: Date.now() } satisfies DrawWorkspace;
+  const db = await openDatabase();
+  try { const tx = db.transaction(WORKSPACES_STORE, "readwrite"); tx.objectStore(WORKSPACES_STORE).put(workspace, workspace.id); await waitForTransaction(tx); return workspace; }
+  finally { db.close(); }
+}
+
+export async function createCanvas(workspaceId: string, name: string, source?: DrawDocument, hooks: { afterDocumentWrite?: () => void } = {}): Promise<DrawCanvas> {
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction([WORKSPACES_STORE, CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE], "readwrite");
+    const workspaces = tx.objectStore(WORKSPACES_STORE); const workspaceReq = workspaces.get(workspaceId);
+    const canvas = { id: crypto.randomUUID(), workspaceId, name: name.trim() || "Untitled canvas", documentId: "", createdAt: Date.now(), updatedAt: Date.now() } satisfies DrawCanvas;
+    let failure: Error | undefined;
+    workspaceReq.onsuccess = () => {
+      if (!workspaceReq.result) { failure = new Error("Workspace does not exist."); tx.abort(); return; }
+      const doc = source ? structuredClone(source) : createEmptyDocument(canvas.name);
+      validateDrawDocument(doc);
+      doc.document.id = crypto.randomUUID(); doc.document.title = canvas.name; doc.document.documentRevision = 0; doc.document.viewRevision = 0;
+      canvas.documentId = doc.document.id;
+      tx.objectStore(DOCUMENTS_STORE).put(doc, documentKey(doc.document.id));
+      try { hooks.afterDocumentWrite?.(); } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); tx.abort(); return; }
+      tx.objectStore(CANVASES_STORE).put(canvas, canvas.id);
+      tx.objectStore(WORKSPACE_META_STORE).put(true, INITIALIZED_KEY);
+    };
+    try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
+    return canvas;
+  } finally { db.close(); }
+}
+
+export async function setActiveCanvas(canvasId: string): Promise<void> {
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction([CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE], "readwrite"); const canvases = tx.objectStore(CANVASES_STORE); const req = canvases.get(canvasId); let failure: Error | undefined;
+    req.onsuccess = () => { const canvas = req.result as DrawCanvas | undefined; if (!canvas) { failure = new Error("Canvas does not exist."); tx.abort(); return; } const docRequest = tx.objectStore(DOCUMENTS_STORE).get(documentKey(canvas.documentId)); docRequest.onsuccess = () => { try { if (!docRequest.result) throw new Error("missing"); validateDrawDocument(docRequest.result); tx.objectStore(WORKSPACE_META_STORE).put({ workspaceId: canvas.workspaceId, canvasId } satisfies ActiveCanvasPointer, ACTIVE_POINTER_KEY); } catch { failure = new DrawStorageRecoveryError(`Canvas ${canvas.id} is damaged: its editable document is missing or invalid.`); tx.abort(); } }; docRequest.onerror = () => { failure = docRequest.error ?? new Error("Could not inspect the canvas document."); tx.abort(); }; };
+    try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
+  } finally { db.close(); }
+}
+
+export async function deleteCanvas(canvasId: string): Promise<void> {
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction([CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE], "readwrite");
+    const canvases = tx.objectStore(CANVASES_STORE); const req = canvases.get(canvasId); const meta = tx.objectStore(WORKSPACE_META_STORE);
+    const activeRequest = meta.get(ACTIVE_POINTER_KEY);
+    const aliasRequest = tx.objectStore(DOCUMENTS_STORE).get(CURRENT_DOCUMENT_KEY);
+    let reads = 3;
+    let canvas: DrawCanvas | undefined;
+    let active: ActiveCanvasPointer | undefined;
+    let alias: DrawDocument | undefined;
+    const finish = () => {
+      reads -= 1;
+      if (reads) return;
+      canvas = req.result as DrawCanvas | undefined;
+      active = activeRequest.result as ActiveCanvasPointer | undefined;
+      alias = aliasRequest.result as DrawDocument | undefined;
+      if (!canvas) return;
+      const documents = tx.objectStore(DOCUMENTS_STORE);
+      canvases.delete(canvasId);
+      documents.delete(documentKey(canvas.documentId));
+      documents.delete(writeOrderKey(canvas.documentId));
+      documents.delete(CURRENT_WRITE_ORDER_KEY);
+      tx.objectStore(MCP_UNDO_STORE).delete(canvas.documentId);
+      tx.objectStore(MCP_REDO_STORE).delete(canvas.documentId);
+      const operationStore = tx.objectStore(MCP_OPERATIONS_STORE);
+      const operationKeys = operationStore.getAllKeys();
+      const operationValues = operationStore.getAll();
+      let ledgerReads = 2;
+      const pruneLedger = () => {
+        ledgerReads -= 1;
+        if (ledgerReads) return;
+        (operationValues.result as Array<{ documentId?: string }>).forEach((operation, index) => {
+          if (operation?.documentId === canvas!.documentId) operationStore.delete((operationKeys.result as IDBValidKey[])[index]);
+        });
+      };
+      operationKeys.onsuccess = pruneLedger;
+      operationValues.onsuccess = pruneLedger;
+      const candidatesRequest = canvases.getAll();
+      candidatesRequest.onsuccess = () => {
+        const candidates = (candidatesRequest.result as DrawCanvas[]).sort((a, b) => a.createdAt - b.createdAt);
+        const preferred = active?.canvasId === canvasId ? undefined : candidates.find((item) => item.id === active?.canvasId);
+        const ordered = preferred ? [preferred, ...candidates.filter((item) => item.id !== preferred.id)] : candidates;
+        let index = 0;
+        const chooseNext = () => {
+          const candidate = ordered[index++];
+          if (!candidate) {
+            if (active?.canvasId === canvasId) meta.delete(ACTIVE_POINTER_KEY);
+            if (alias?.document?.id === canvas!.documentId || !active || active.canvasId === canvasId) documents.delete(CURRENT_DOCUMENT_KEY);
+            return;
+          }
+          const storedRequest = documents.get(documentKey(candidate.documentId));
+          storedRequest.onsuccess = () => {
+            try {
+              if (!storedRequest.result) throw new Error("missing");
+              validateDrawDocument(storedRequest.result);
+              if (active?.canvasId === canvasId || !active || active.canvasId !== candidate.id) {
+                meta.put({ workspaceId: candidate.workspaceId, canvasId: candidate.id } satisfies ActiveCanvasPointer, ACTIVE_POINTER_KEY);
+              }
+              if (alias?.document?.id === canvas!.documentId || active?.canvasId === canvasId || !active) documents.put(storedRequest.result, CURRENT_DOCUMENT_KEY);
+            } catch { chooseNext(); }
+          };
+        };
+        chooseNext();
+      };
+    };
+    req.onsuccess = finish;
+    activeRequest.onsuccess = finish;
+    aliasRequest.onsuccess = finish;
+    await waitForTransaction(tx);
+  } finally { db.close(); }
 }
 
 /** Atomically commit an MCP-authored scene revision and the replay/undo record. */
@@ -189,7 +574,7 @@ export async function commitMcpOperation(
     const meta = transaction.objectStore(MCP_META_STORE);
     let commitError: Error | null = null;
     const operationKey = operationLedgerKey(operation.documentId, operation.clientIdentity, operation.idempotencyKey);
-    const currentRequest = documents.get(CURRENT_DOCUMENT_KEY);
+    const currentRequest = documents.get(documentKey(operation.documentId));
     const existingRequest = operations.get(operationKey);
     const undoRequest = undo.get(operation.documentId);
     const redoRequest = redo.get(operation.documentId);
@@ -260,6 +645,7 @@ export async function commitMcpOperation(
         transaction.abort();
         return;
       }
+      documents.put(document, documentKey(operation.documentId));
       documents.put(document, CURRENT_DOCUMENT_KEY);
       try {
         if (ledgerKeys.length) {
@@ -379,7 +765,7 @@ export async function restoreMcpCommandSnapshot(
     const undo = transaction.objectStore(MCP_UNDO_STORE);
     const redo = transaction.objectStore(MCP_REDO_STORE);
     const key = operationLedgerKey(before.document.id, identity.clientIdentity, identity.idempotencyKey);
-    const currentRequest = documents.get(CURRENT_DOCUMENT_KEY);
+    const currentRequest = documents.get(documentKey(before.document.id));
     const operationRequest = operations.get(key);
     const undoRequest = undo.get(before.document.id);
     const redoRequest = redo.get(before.document.id);
@@ -421,6 +807,7 @@ export async function restoreMcpCommandSnapshot(
         return;
       }
       try {
+        documents.put(before, documentKey(before.document.id));
         documents.put(before, CURRENT_DOCUMENT_KEY);
         operations.put({
           documentId: operation.documentId,

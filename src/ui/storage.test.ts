@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import "fake-indexeddb/auto";
 import { createEmptyDocument } from "../document/document";
-import { commitMcpOperation, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadMcpOperation, restoreMcpCommandSnapshot, saveCurrentDocument } from "./storage";
+import { commitMcpOperation, createCanvas, createWorkspace, deleteCanvas, DrawStorageRecoveryError, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadMcpOperation, restoreMcpCommandSnapshot, saveCurrentDocument, setActiveCanvas } from "./storage";
 import { canRedoMcpOperation, canUndoMcpOperation, OPERATION_RESULT_RETENTION_MS, OPERATION_SNAPSHOT_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "../integrations/operation-ledger";
 
 describe("local Draw autosave", () => {
@@ -38,6 +38,285 @@ describe("local Draw autosave", () => {
 
   it("returns null before the first autosave", async () => {
     expect(await loadCurrentDocument()).toBeNull();
+  });
+
+  it("migrates the existing current document into a default workspace without changing its portable content", async () => {
+    const legacy = createEmptyDocument("Existing V1 work");
+    legacy.document.elements.push({ id: "legacy-shape", type: "rectangle", x: 10, y: 20, width: 70, height: 45, strokeColor: "#fff" });
+    legacy.document.assets["asset-1"] = { id: "asset-1", dataURL: "data:image/png;base64,AA==" };
+    legacy.document.canvas.viewport = { x: -31, y: 74, zoom: 0.8 };
+    legacy.document.documentRevision = 12;
+    legacy.document.viewRevision = 8;
+    await seedLegacyCurrentDocument(legacy);
+
+    expect(await loadCurrentDocument()).toEqual(legacy);
+    const workspaces = await listWorkspaces();
+    expect(workspaces).toHaveLength(1);
+    const canvases = await listCanvases(workspaces[0].id);
+    expect(canvases).toHaveLength(1);
+    expect(canvases[0]).toMatchObject({ workspaceId: workspaces[0].id, documentId: legacy.document.id, name: "Existing V1 work" });
+    expect(await loadCanvasDocument(canvases[0].id)).toEqual(legacy);
+    expect(await readLegacyCurrentDocument()).toEqual(legacy);
+  });
+
+  it("rekeys draft V5 document rows without losing canvas selections or revisions", async () => {
+    const document = createEmptyDocument("Draft V5");
+    document.document.documentRevision = 4;
+    await seedV5Document(document);
+    expect(await loadCurrentDocument()).toEqual(document);
+    const workspaces = await listWorkspaces();
+    expect(await listCanvases(workspaces[0].id)).toMatchObject([{ documentId: document.document.id, name: "Draft V5" }]);
+    const db = await openDrawDatabaseForTest();
+    const tx = db.transaction("documents", "readonly");
+    const keys = await requestValue(tx.objectStore("documents").getAllKeys());
+    await transactionDone(tx);
+    db.close();
+    expect(keys).toContainEqual(["draw-document", document.document.id]);
+    expect(keys).not.toContain(document.document.id);
+  });
+
+  it("isolates per-canvas autosaves and will not let a delayed inactive-canvas save switch or overwrite the active canvas", async () => {
+    const first = createEmptyDocument("First canvas");
+    await saveCurrentDocument(first);
+    const workspace = (await listWorkspaces())[0];
+    const secondCanvas = await createCanvas(workspace.id, "Second canvas");
+    const second = await loadCanvasDocument(secondCanvas.id);
+    expect(second).not.toBeNull();
+    expect(second!.document.id).not.toBe(first.document.id);
+    expect(second!.document.title).toBe("Second canvas");
+    await setActiveCanvas(secondCanvas.id);
+
+    const editedSecond = structuredClone(second!);
+    editedSecond.document.documentRevision = 1;
+    editedSecond.document.elements.push({ id: "second-shape", type: "ellipse", x: 2, y: 4, width: 20, height: 15 });
+    expect(await saveCurrentDocument(editedSecond)).toMatchObject({ saved: true });
+
+    const staleFirst = structuredClone(first);
+    staleFirst.document.documentRevision = 1;
+    staleFirst.document.elements.push({ id: "stale-shape", type: "rectangle", x: 0, y: 0, width: 10, height: 10 });
+    expect(await saveCurrentDocument(staleFirst)).toEqual({ saved: false });
+    expect((await loadCurrentDocument())?.document.id).toBe(second!.document.id);
+    expect(await loadCanvasDocument(secondCanvas.id)).toEqual(editedSecond);
+    const firstCanvas = (await listCanvases(workspace.id)).find((canvas) => canvas.documentId === first.document.id)!;
+    expect(await loadCanvasDocument(firstCanvas.id)).toEqual(first);
+  });
+
+  it("commits workspace/canvas creation atomically and keeps V1 .draw import as a new document", async () => {
+    const imported = createEmptyDocument("Portable drawing");
+    imported.document.elements.push({ id: "imported-shape", type: "diamond", x: 20, y: 30, width: 40, height: 50 });
+    imported.document.assets.asset1 = { id: "asset1", dataURL: "data:image/png;base64,AA==" };
+    const workspace = await createWorkspace("Research project");
+    const canvas = await createCanvas(workspace.id, imported.document.title, imported);
+    const stored = await loadCanvasDocument(canvas.id);
+
+    expect(stored).toMatchObject({ format: "draw", formatVersion: 1 });
+    expect(stored!.document.id).not.toBe(imported.document.id);
+    expect(stored!.document.documentRevision).toBe(0);
+    expect(stored!.document.elements).toEqual(imported.document.elements);
+    expect(stored!.document.assets).toEqual(imported.document.assets);
+    expect((await listCanvases(workspace.id))).toContainEqual(expect.objectContaining({ id: canvas.id, documentId: stored!.document.id }));
+  });
+
+  it("rolls back imported document and canvas together when canvas creation fails", async () => {
+    const workspace = await createWorkspace("Atomic workspace");
+    const imported = createEmptyDocument("Should not persist");
+    await expect(createCanvas(workspace.id, imported.document.title, imported, { afterDocumentWrite: () => { throw new Error("injected failure"); } })).rejects.toThrow("injected failure");
+    expect(await listCanvases(workspace.id)).toEqual([]);
+    const database = await openDrawDatabaseForTest();
+    const tx = database.transaction("documents", "readonly");
+    const keys = await requestValue(tx.objectStore("documents").getAllKeys());
+    await transactionDone(tx);
+    database.close();
+    expect(keys).not.toContain(imported.document.id);
+  });
+
+  it("deletes a canvas and its document without changing another workspace's active document", async () => {
+    const first = createEmptyDocument("Kept canvas");
+    await saveCurrentDocument(first);
+    const defaultWorkspace = (await listWorkspaces())[0];
+    const otherWorkspace = await createWorkspace("Other project");
+    const otherCanvas = await createCanvas(otherWorkspace.id, "Other canvas");
+    await setActiveCanvas(otherCanvas.id);
+    const deletedDocument = await loadCanvasDocument(otherCanvas.id);
+
+    await deleteCanvas(otherCanvas.id);
+    expect(await saveCurrentDocument(deletedDocument!)).toEqual({ saved: false });
+
+    expect(await loadCanvasDocument(otherCanvas.id)).toBeNull();
+    expect(await loadCurrentDocument()).toEqual(first);
+    expect(await listCanvases(defaultWorkspace.id)).toHaveLength(1);
+    expect(await listCanvases(otherWorkspace.id)).toHaveLength(0);
+    expect(await listWorkspaces()).toHaveLength(2);
+  });
+
+  it("deletes the only canvas without retaining or resurrecting its legacy alias", async () => {
+    const secret = createEmptyDocument("Secret to delete");
+    secret.document.elements.push({ id: "secret", type: "text", text: "private" });
+    await saveCurrentDocument(secret);
+    const canvas = (await listCanvases((await listWorkspaces())[0].id))[0];
+    await deleteCanvas(canvas.id);
+    expect(await loadCurrentDocument()).toBeNull();
+    await expect(saveCurrentDocument(secret)).rejects.toThrow(/no active canvas/i);
+    const db = await openDrawDatabaseForTest();
+    const tx = db.transaction("documents", "readonly");
+    const keys = await requestValue(tx.objectStore("documents").getAllKeys());
+    const rows = await requestValue(tx.objectStore("documents").getAll());
+    await transactionDone(tx);
+    db.close();
+    expect(keys).not.toContain("current");
+    expect(keys).not.toContain("current-write-order");
+    expect(JSON.stringify(rows)).not.toContain("Secret to delete");
+    expect(JSON.stringify(rows)).not.toContain("private");
+  });
+
+  it("replaces content without changing canvas identity or colliding with sibling IDs", async () => {
+    const initial = createEmptyDocument("Original");
+    initial.document.documentRevision = 9;
+    initial.document.viewRevision = 4;
+    await saveCurrentDocument(initial);
+    const workspace = (await listWorkspaces())[0];
+    const canvasA = (await listCanvases(workspace.id))[0];
+    const canvasB = await createCanvas(workspace.id, "Sibling");
+    const siblingDocument = (await loadCanvasDocument(canvasB.id))!;
+    const incoming = structuredClone(siblingDocument);
+    incoming.document.title = "Replacement content";
+    incoming.document.elements.push({ id: "new", type: "rectangle", x: 0, y: 0, width: 20, height: 10 });
+    await writeStore("mcpUndo", (store) => store.put({ completedAt: Date.now() }, initial.document.id));
+    await writeStore("mcpRedo", (store) => store.put({ operation: { completedAt: Date.now() } }, initial.document.id));
+    await writeStore("mcpOperations", (store) => store.put({ documentId: initial.document.id }, "old-operation"));
+
+    const outcome = await saveCurrentDocument(incoming, { replaceDocument: true });
+    expect(outcome.saved).toBe(true);
+    expect(outcome.document?.document.id).not.toBe(siblingDocument.document.id);
+    expect(outcome.document?.document.documentRevision).toBe(10);
+    expect(outcome.document?.document.viewRevision).toBeGreaterThan(4);
+    expect((await listCanvases(workspace.id)).find((canvas) => canvas.id === canvasA.id)).toMatchObject({
+      id: canvasA.id,
+      documentId: outcome.document!.document.id,
+      name: "Replacement content",
+    });
+    expect(await loadCanvasDocument(canvasB.id)).toEqual(siblingDocument);
+    expect(await loadCurrentDocument()).toEqual(outcome.document);
+    const db = await openDrawDatabaseForTest();
+    const tx = db.transaction(["documents", "mcpUndo", "mcpRedo", "mcpOperations"], "readonly");
+    const docKeys = await requestValue(tx.objectStore("documents").getAllKeys());
+    const undo = await requestValue(tx.objectStore("mcpUndo").get(initial.document.id));
+    const redo = await requestValue(tx.objectStore("mcpRedo").get(initial.document.id));
+    const operations = await requestValue(tx.objectStore("mcpOperations").get("old-operation"));
+    await transactionDone(tx);
+    db.close();
+    expect(docKeys).not.toContainEqual(["draw-document", initial.document.id]);
+    expect(docKeys).not.toContainEqual(["draw-write-order", initial.document.id]);
+    expect(undo).toBeUndefined();
+    expect(redo).toBeUndefined();
+    expect(operations).toBeUndefined();
+  });
+
+  it("drops an autosave for the old document after a replacement without throwing", async () => {
+    const original = createEmptyDocument("Before replacement");
+    await saveCurrentDocument(original);
+    const imported = createEmptyDocument("Imported replacement");
+    const replacement = await saveCurrentDocument(imported, { replaceDocument: true });
+    expect(replacement.saved).toBe(true);
+    await expect(saveCurrentDocument(original)).resolves.toEqual({ saved: false });
+    expect(await loadCurrentDocument()).toEqual(replacement.document);
+  });
+
+  it("invalidates old MCP replay and rejects the pre-open revision after replacement", async () => {
+    const before = createEmptyDocument("MCP before open");
+    await saveCurrentDocument(before);
+    const after = structuredClone(before);
+    after.document.documentRevision = 1;
+    const operation: DurableMcpOperation = {
+      documentId: before.document.id, clientIdentity: "open-test-client", idempotencyKey: "pre-open", payloadHash: "pre-open-hash",
+      operationId: "pre-open-operation", actor: "open-test-client", baseRevision: 0, resultingRevision: 1,
+      result: { operationId: "pre-open-operation" }, beforeDocument: before, afterDocument: after, undoEligible: true, completedAt: Date.now(),
+    };
+    await commitMcpOperation(after, operation);
+    const replacement = await saveCurrentDocument(createEmptyDocument("MCP after open"), { replaceDocument: true });
+    expect(replacement.document?.document.documentRevision).toBe(2);
+    expect(await loadMcpOperation(before.document.id, operation.clientIdentity, operation.idempotencyKey)).toBeNull();
+    const stale = structuredClone(after);
+    stale.document.documentRevision = 2;
+    await expect(commitMcpOperation(stale, {
+      ...operation, idempotencyKey: "stale-after-open", operationId: "stale-after-open", baseRevision: 1, resultingRevision: 2,
+      beforeDocument: after, afterDocument: stale,
+    })).rejects.toThrow(/CONFLICT/i);
+  });
+
+  it("serializes an autosave racing a replacement without surfacing a recovery error", async () => {
+    const original = createEmptyDocument("Original for race");
+    await saveCurrentDocument(original);
+    const imported = createEmptyDocument("Replacement for race");
+    const staleSave = saveCurrentDocument(original);
+    const replacementSave = saveCurrentDocument(imported, { replaceDocument: true });
+    const results = await Promise.all([staleSave, replacementSave]);
+    expect(results[1].saved).toBe(true);
+    expect(await loadCurrentDocument()).toMatchObject({ document: { title: "Replacement for race" } });
+  });
+
+  it("quarantines malformed V1 autosave and keeps the upgraded database usable", async () => {
+    await seedLegacyCurrentDocument({ garbage: true } as never);
+    await expect(loadCurrentDocument()).rejects.toBeInstanceOf(DrawStorageRecoveryError);
+    await expect(listWorkspaces()).resolves.toEqual([]);
+    const db = await openDrawDatabaseForTest();
+    const tx = db.transaction(["documents", "workspaceMeta"], "readonly");
+    const raw = await requestValue(tx.objectStore("documents").get("current"));
+    const recovery = await requestValue(tx.objectStore("workspaceMeta").get("legacy-recovery"));
+    await transactionDone(tx);
+    db.close();
+    expect(raw).toEqual({ garbage: true });
+    expect(recovery).toEqual({ garbage: true });
+  });
+
+  it("repairs a missing active pointer to a valid sibling canvas and reports missing document rows", async () => {
+    const first = createEmptyDocument("First");
+    await saveCurrentDocument(first);
+    const workspace = (await listWorkspaces())[0];
+    const secondCanvas = await createCanvas(workspace.id, "Second");
+    const secondDocument = (await loadCanvasDocument(secondCanvas.id))!;
+    await setActiveCanvas(secondCanvas.id);
+    await writeStore("workspaceMeta", (store) => store.delete("active"));
+    const fallback = await loadCurrentDocument();
+    expect([first.document.id, secondDocument.document.id]).toContain(fallback?.document.id);
+    expect(await saveCurrentDocument(fallback!)).toMatchObject({ saved: true });
+
+    await writeStore("workspaceMeta", (store) => store.put({ workspaceId: workspace.id, canvasId: "dangling" }, "active"));
+    expect((await loadCurrentDocument())?.document.id).toBe(fallback?.document.id);
+    expect(await saveCurrentDocument(fallback!)).toMatchObject({ saved: true });
+
+    await setActiveCanvas(secondCanvas.id);
+    await writeStore("documents", (store) => store.delete(["draw-document", secondDocument.document.id]));
+    await expect(loadCanvasDocument(secondCanvas.id)).rejects.toThrow(/damaged|missing/i);
+    await writeStore("documents", (store) => store.delete(["draw-document", first.document.id]));
+    await expect(loadCurrentDocument()).rejects.toThrow(/damaged|missing/i);
+    await expect(saveCurrentDocument(secondDocument)).rejects.toThrow(/damaged|missing/i);
+  });
+
+  it("selects a sibling canvas atomically when deleting the active canvas", async () => {
+    const first = createEmptyDocument("First");
+    await saveCurrentDocument(first);
+    const workspace = (await listWorkspaces())[0];
+    const sibling = await createCanvas(workspace.id, "Sibling");
+    const siblingDoc = await loadCanvasDocument(sibling.id);
+    const firstCanvas = (await listCanvases(workspace.id)).find((canvas) => canvas.documentId === first.document.id)!;
+    await setActiveCanvas(firstCanvas.id);
+    await deleteCanvas(firstCanvas.id);
+    expect(await loadCurrentDocument()).toEqual(siblingDoc);
+    expect((await saveCurrentDocument(siblingDoc!)).saved).toBe(true);
+  });
+
+  it.each(["current", "current-write-order"])("safely stores a document with reserved legacy ID %s", async (id) => {
+    const doc = createEmptyDocument("Reserved ID");
+    doc.document.id = id;
+    await saveCurrentDocument(doc);
+    expect(await loadCurrentDocument()).toEqual(doc);
+    const db = await openDrawDatabaseForTest();
+    const tx = db.transaction("documents", "readonly");
+    const values = await requestValue(tx.objectStore("documents").getAll());
+    await transactionDone(tx);
+    db.close();
+    expect(values).toContainEqual(doc);
   });
 
   it("atomically stores the scene revision and MCP operation result", async () => {
@@ -246,13 +525,17 @@ describe("local Draw autosave", () => {
 
   it("does not let a delayed autosave from a previous document replace the active document", async () => {
     const active = createEmptyDocument("Active document");
+    active.document.documentRevision = 9;
     await saveCurrentDocument(active);
     const staleOtherDocument = createEmptyDocument("Stale previous document");
     await saveCurrentDocument(staleOtherDocument);
     expect(await loadCurrentDocument()).toEqual(active);
 
     await saveCurrentDocument(staleOtherDocument, { replaceDocument: true });
-    expect(await loadCurrentDocument()).toEqual(staleOtherDocument);
+    const replaced = await loadCurrentDocument();
+    expect(replaced?.document.id).not.toBe(staleOtherDocument.document.id);
+    expect(replaced?.document.title).toBe(staleOtherDocument.document.title);
+    expect(replaced?.document.documentRevision).toBe(10);
   });
 
   it("durably replays viewport mutations and CAS-checks their view revision", async () => {
@@ -307,6 +590,7 @@ describe("local Draw autosave", () => {
 
   it("restores actor-safe undo after reload and conflicts after a later human revision", async () => {
     const before = createEmptyDocument("Undo after reload");
+    await saveCurrentDocument(before);
     const after = structuredClone(before);
     after.document.documentRevision = 1;
     after.document.elements.push({ id: "mcp-shape", type: "rectangle", x: 1, y: 2, width: 50, height: 40, strokeColor: "#ffffff" });
@@ -399,7 +683,7 @@ describe("local Draw autosave", () => {
     const document = createEmptyDocument("Malformed ledger");
     await saveCurrentDocument(document);
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open("draw-local", 4);
+      const request = indexedDB.open("draw-local");
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
@@ -414,10 +698,72 @@ describe("local Draw autosave", () => {
 
 async function openDrawDatabaseForTest(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open("draw-local", 4);
+    const request = indexedDB.open("draw-local");
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
+}
+
+async function seedLegacyCurrentDocument(document: import("../document/document").DrawDocument): Promise<void> {
+  const database = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open("draw-local", 4);
+    request.onupgradeneeded = () => { if (!request.result.objectStoreNames.contains("documents")) request.result.createObjectStore("documents"); };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  const transaction = database.transaction("documents", "readwrite");
+  transaction.objectStore("documents").put(document, "current");
+  await transactionDone(transaction);
+  database.close();
+}
+
+async function seedV5Document(document: import("../document/document").DrawDocument): Promise<void> {
+  const db = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open("draw-local", 5);
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      database.createObjectStore("documents");
+      const workspaces = database.createObjectStore("workspaces");
+      const canvases = database.createObjectStore("canvases");
+      canvases.createIndex("byWorkspaceId", "workspaceId", { unique: false });
+      canvases.createIndex("byDocumentId", "documentId", { unique: true });
+      database.createObjectStore("workspaceMeta");
+      const now = Date.now();
+      const workspaceId = "old-workspace";
+      const canvasId = "old-canvas";
+      const transaction = request.transaction!;
+      transaction.objectStore("documents").put(document, document.document.id);
+      transaction.objectStore("documents").put({ sessionId: "old", sequence: 1 }, `${document.document.id}-write-order`);
+      transaction.objectStore("documents").put(document, "current");
+      workspaces.put({ id: workspaceId, name: "My workspace", createdAt: now, updatedAt: now }, workspaceId);
+      canvases.put({ id: canvasId, workspaceId, name: document.document.title, documentId: document.document.id, createdAt: now, updatedAt: now }, canvasId);
+      transaction.objectStore("workspaceMeta").put({ workspaceId, canvasId }, "active");
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  db.close();
+}
+
+async function readLegacyCurrentDocument(): Promise<unknown> {
+  const database = await openDrawDatabaseForTest();
+  const transaction = database.transaction("documents", "readonly");
+  const value = await requestValue(transaction.objectStore("documents").get("current"));
+  await transactionDone(transaction);
+  database.close();
+  return value;
+}
+
+async function writeStore(storeName: string, change: (store: IDBObjectStore) => void): Promise<void> {
+  const database = await openDrawDatabaseForTest();
+  const transaction = database.transaction(storeName, "readwrite");
+  change(transaction.objectStore(storeName));
+  await transactionDone(transaction);
+  database.close();
+}
+
+function requestValue<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
 }
 
 async function transactionDone(transaction: IDBTransaction): Promise<void> {

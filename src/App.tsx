@@ -397,10 +397,10 @@ export default function App() {
     };
   }, [autosave, bridgeAutosave]);
 
-  const loadDocument = useCallback(async (next: DrawDocument) => {
+  const loadDocument = useCallback(async (next: DrawDocument): Promise<DrawDocument | null> => {
     if (!writerOwned.current) {
       setMessage("This tab is read-only because another Draw tab owns autosave.");
-      return;
+      return null;
     }
     if (autosave.isBusy()) await autosave.flush();
     if (bridgeAutosave.isBusy()) await bridgeAutosave.flush();
@@ -411,17 +411,23 @@ export default function App() {
     const opened = rebaseOpenedDocument(docRef.current ?? next, next);
     lastMcpOperation.current = null;
     lastUndoneOperation.current = null;
-    setDocument(opened);
-    setStatus("ready"); setMessage(""); setEditorKey((key) => key + 1);
+    setStatus("ready"); setMessage("");
     setAutosaveBlocked(false);
     try {
-      await saveCurrentDocument(opened, { replaceDocument: true });
+      const replacement = await saveCurrentDocument(opened, { replaceDocument: true });
+      if (!replacement.saved || !replacement.document) throw new Error("The active canvas did not accept the replacement document.");
+      setDocument(replacement.document);
+      setEditorKey((key) => key + 1);
       setStatus("saved");
-      await syncBridgeDocument(opened);
+      await syncBridgeDocument(replacement.document);
+      return replacement.document;
     } catch (error) {
+      setDocument(opened);
+      setEditorKey((key) => key + 1);
       setAutosaveBlocked(true);
       setStatus("error");
       setMessage(`The file opened, but local autosave failed: ${error instanceof Error ? error.message : String(error)}. Use Save .draw to preserve it.`);
+      return null;
     }
   }, [autosave, bridgeAutosave, setDocument, syncBridgeDocument]);
 
@@ -936,9 +942,10 @@ export default function App() {
         }
       } else if (event.operation === "open_document") {
         if (!event.document) throw new Error("Open document command is missing its validated Draw file.");
-        await loadDocument(event.document);
-        result = { opened: true, documentId: event.document.document.id, title: event.document.document.title };
-        nextDocument = docRef.current;
+        const opened = await loadDocument(event.document);
+        if (!opened) throw new Error("The Draw document could not be opened into the active canvas.");
+        result = { opened: true, documentId: opened.document.id, title: opened.document.title, documentRevision: opened.document.documentRevision };
+        nextDocument = opened;
       } else if (event.operation === "export_image") {
         const allElements = api.getSceneElements();
         const state = api.getAppState() as any;
