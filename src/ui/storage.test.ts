@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import "fake-indexeddb/auto";
 import { createEmptyDocument, parseDrawFile, serializeDrawFile } from "../document/document";
-import { commitMcpOperation, createCanvas, createWorkspace, deleteCanvas, deleteWorkspace, duplicateCanvas, DrawStorageRecoveryError, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadMcpOperation, renameCanvas, renameWorkspace, restoreMcpCommandSnapshot, saveCurrentDocument, setActiveCanvas } from "./storage";
+import { commitMcpOperation, commitMcpWorkspaceOperation, createCanvas, createWorkspace, deleteCanvas, deleteWorkspace, duplicateCanvas, DrawStorageRecoveryError, getMcpWorkspaceCatalog, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadMcpOperation, loadMcpWorkspaceOperationReceipt, renameCanvas, renameWorkspace, restoreMcpCommandSnapshot, saveCurrentDocument, setActiveCanvas } from "./storage";
 import { canRedoMcpOperation, canUndoMcpOperation, OPERATION_RESULT_RETENTION_MS, OPERATION_SNAPSHOT_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "../integrations/operation-ledger";
 
 describe("local Draw autosave", () => {
@@ -102,6 +102,118 @@ describe("local Draw autosave", () => {
     expect((await loadCurrentDocument())?.document.id).toBe(keep.document.id);
     expect(keepWorkspace.id).not.toBe(doomedWorkspace.id);
     expect(doomedDocument).not.toBeNull();
+  });
+
+  it("commits MCP workspace creation with an atomic receipt and replays exact results", async () => {
+    await saveCurrentDocument(createEmptyDocument("Existing"));
+    const before = await getMcpWorkspaceCatalog();
+    const request = {
+      clientIdentity: "agent-one",
+      idempotencyKey: "create-platform",
+      payloadHash: "payload-create-platform",
+      expectedCatalogRevision: before.catalogRevision,
+      action: { type: "create_workspace" as const, name: "Platform" },
+    };
+
+    const created = await commitMcpWorkspaceOperation(request);
+    const replay = await commitMcpWorkspaceOperation(request);
+
+    expect(replay).toEqual(created);
+    expect(await loadMcpWorkspaceOperationReceipt("agent-one", "create-platform", "payload-create-platform")).toEqual(created);
+    expect(created.workspace).toMatchObject({ name: "Platform" });
+    expect(created.canvas).toMatchObject({ workspaceId: created.workspace?.id, name: "Untitled drawing" });
+    expect(created.activeWorkspaceId).toBe(created.workspace?.id);
+    expect(created.activeCanvasId).toBe(created.canvas?.id);
+    expect(created.activeDocument.document.id).toBe(created.canvas?.documentId);
+    expect(created.catalogRevision).toBe(before.catalogRevision + 1);
+    expect((await listWorkspaces()).filter((item) => item.name === "Platform")).toHaveLength(1);
+    expect((await listCanvases(created.workspace!.id))).toHaveLength(1);
+  });
+
+  it("keeps workspace receipts scoped to the authenticated caller", async () => {
+    await saveCurrentDocument(createEmptyDocument("Existing"));
+    const before = await getMcpWorkspaceCatalog();
+    const result = await commitMcpWorkspaceOperation({
+      clientIdentity: "agent-one", idempotencyKey: "same-key", payloadHash: "same-payload",
+      expectedCatalogRevision: before.catalogRevision,
+      action: { type: "create_workspace", name: "One" },
+    });
+    await expect(loadMcpWorkspaceOperationReceipt("agent-two", "same-key", "same-payload")).resolves.toBeNull();
+    expect(await loadMcpWorkspaceOperationReceipt("agent-one", "same-key", "same-payload")).toEqual(result);
+  });
+
+  it("atomically applies MCP canvas rename, duplicate, select, and confirmation-approved delete targets", async () => {
+    await saveCurrentDocument(createEmptyDocument("Original"));
+    const catalog = await getMcpWorkspaceCatalog();
+    const workspaceId = catalog.activeWorkspaceId;
+    const originalCanvasId = catalog.activeCanvasId;
+    const renamed = await commitMcpWorkspaceOperation({
+      clientIdentity: "agent-one", idempotencyKey: "rename-canvas", payloadHash: "rename-hash",
+      expectedCatalogRevision: catalog.catalogRevision,
+      action: { type: "rename_canvas", canvasId: originalCanvasId, name: "Source map" },
+    });
+    expect(renamed.canvas?.name).toBe("Source map");
+    expect(renamed.activeDocument.document.title).toBe("Source map");
+    const duplicate = await commitMcpWorkspaceOperation({
+      clientIdentity: "agent-one", idempotencyKey: "duplicate-canvas", payloadHash: "duplicate-hash",
+      expectedCatalogRevision: renamed.catalogRevision,
+      action: { type: "duplicate_canvas", canvasId: originalCanvasId },
+    });
+    expect(duplicate.canvas?.name).toBe("Source map copy");
+    const selected = await commitMcpWorkspaceOperation({
+      clientIdentity: "agent-one", idempotencyKey: "select-original", payloadHash: "select-hash",
+      expectedCatalogRevision: duplicate.catalogRevision,
+      action: { type: "select_canvas", workspaceId, canvasId: originalCanvasId },
+    });
+    expect(selected.activeCanvasId).toBe(originalCanvasId);
+    expect(selected.activeDocument.document.title).toBe("Source map");
+    const deleted = await commitMcpWorkspaceOperation({
+      clientIdentity: "agent-one", idempotencyKey: "delete-copy", payloadHash: "delete-hash",
+      expectedCatalogRevision: selected.catalogRevision,
+      action: { type: "delete_canvas", canvasId: duplicate.canvas!.id },
+    });
+    expect(deleted.activeCanvasId).toBe(originalCanvasId);
+    expect(deleted.canvases.map((item) => item.id)).toEqual([originalCanvasId]);
+    expect(await loadCanvasDocument(duplicate.canvas!.id)).toBeNull();
+  });
+
+  it("rejects a reused workspace key with a different payload and stale catalog revisions without mutation", async () => {
+    await saveCurrentDocument(createEmptyDocument("Existing"));
+    const before = await getMcpWorkspaceCatalog();
+    const first = await commitMcpWorkspaceOperation({
+      clientIdentity: "agent-one", idempotencyKey: "rename", payloadHash: "hash-a",
+      expectedCatalogRevision: before.catalogRevision,
+      action: { type: "create_workspace", name: "One" },
+    });
+    await expect(commitMcpWorkspaceOperation({
+      clientIdentity: "agent-one", idempotencyKey: "rename", payloadHash: "hash-b",
+      expectedCatalogRevision: before.catalogRevision,
+      action: { type: "create_workspace", name: "Two" },
+    })).rejects.toThrow(/IDEMPOTENCY_KEY_REUSE/);
+    await expect(commitMcpWorkspaceOperation({
+      clientIdentity: "agent-two", idempotencyKey: "stale", payloadHash: "hash-c",
+      expectedCatalogRevision: before.catalogRevision,
+      action: { type: "create_workspace", name: "Stale" },
+    })).rejects.toThrow(/CONFLICT.*catalog revision/i);
+    expect((await getMcpWorkspaceCatalog()).catalogRevision).toBe(first.catalogRevision);
+    expect((await listWorkspaces()).some((item) => item.name === "Two" || item.name === "Stale")).toBe(false);
+  });
+
+  it("imports a Draw document as an independently editable canvas", async () => {
+    await saveCurrentDocument(createEmptyDocument("Existing"));
+    const catalog = await getMcpWorkspaceCatalog();
+    const workspaceId = catalog.activeWorkspaceId!;
+    const imported = createEmptyDocument("Agent diagram");
+    imported.document.elements.push({ id: "source-node", type: "rectangle", x: 12, y: 24, width: 90, height: 60 });
+    const result = await commitMcpWorkspaceOperation({
+      clientIdentity: "agent-one", idempotencyKey: "import-diagram", payloadHash: "import-hash",
+      expectedCatalogRevision: catalog.catalogRevision,
+      action: { type: "import_draw_file_as_canvas", workspaceId, name: "Imported", document: imported },
+    });
+    expect(result.canvas?.name).toBe("Imported");
+    expect(result.activeDocument.document.id).not.toBe(imported.document.id);
+    expect(result.activeDocument.document.elements).toEqual(imported.document.elements);
+    expect((await loadCanvasDocument(result.canvas!.id))?.document.elements[0]).toMatchObject({ id: "source-node", type: "rectangle" });
   });
 
   it("migrates the existing current document into a default workspace without changing its portable content", async () => {

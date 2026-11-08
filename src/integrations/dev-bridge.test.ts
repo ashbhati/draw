@@ -267,6 +267,36 @@ describe("Draw MCP Vite bridge", () => {
     expect((await bridge.mcpRequest("client-B", capabilityB, "GET", "/__draw/api/document")).status).toBe(200);
   });
 
+  it("binds workspace deletion approval to the target and allows same-intent retry after an acknowledgement loss", async () => {
+    const capability = "a".repeat(64);
+    const bridge = createBridgeHarness({}, { extraMcpClients: [{ identity: "workspace-agent", capability }] });
+    const document = createEmptyDocument("Active project canvas");
+    await bridge.registerClient("editor-tab");
+    await bridge.editorRequest("editor-tab", "PUT", "/__draw/api/document", { clientId: "editor-tab", document });
+    const request = {
+      action: "delete_workspace", documentId: document.document.id, expectedDocumentRevision: 0,
+      expectedCatalogRevision: 3, targetId: "workspace-42", targetName: "Research", workspaceName: "Research",
+      canvasCount: 2, idempotencyKey: "delete-research", fingerprint: "e".repeat(64),
+    };
+    const challenge = await bridge.mcpRequest("workspace-agent", capability, "POST", "/__draw/api/confirmations", request);
+    expect(challenge.status).toBe(202);
+    expect(bridge.events.find(({ event }) => event === "draw:confirmation-required")?.data).toMatchObject({
+      action: "delete_workspace", targetId: "workspace-42", targetName: "Research", canvasCount: 2,
+    });
+    expect((await bridge.editorRequest("editor-tab", "POST", `/__draw/api/confirmations/${challenge.body.confirmationToken}/respond`, {
+      clientId: "editor-tab", approved: true,
+    })).body.status).toBe("APPROVED");
+    const consume = {
+      action: "delete_workspace", targetId: "workspace-42", documentId: document.document.id,
+      expectedDocumentRevision: 0, expectedCatalogRevision: 3, idempotencyKey: "delete-research",
+      clientId: "editor-tab", clientIdentity: "workspace-agent",
+    };
+    const path = `/__draw/api/confirmations/${challenge.body.confirmationToken}/consume`;
+    expect((await bridge.editorRequest("editor-tab", "POST", path, consume)).body.status).toBe("APPROVED");
+    expect((await bridge.mcpRequest("workspace-agent", capability, "POST", path, consume)).body.status).toBe("APPROVED");
+    expect((await bridge.mcpRequest("workspace-agent", capability, "POST", path, { ...consume, idempotencyKey: "different-intent" })).body.status).toBe("STALE");
+  });
+
   it("only accepts loopback requests", async () => {
     const bridge = createBridgeHarness();
     const response = await bridge.request("GET", "/__draw/api/health", undefined, "192.168.1.2");

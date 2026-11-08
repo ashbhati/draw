@@ -115,6 +115,22 @@ export type InsertImageInput = {
   idempotencyPayload?: { imageId: string; x: number; y: number; width?: number; height?: number };
 };
 
+export type McpWorkspaceAction =
+  | { action: "list_workspaces" }
+  | { action: "list_canvases"; workspaceId: string }
+  | ({ action: "create_workspace"; name: string } & WorkspaceMutationContext)
+  | ({ action: "rename_workspace"; workspaceId: string; name: string } & WorkspaceMutationContext)
+  | ({ action: "select_workspace"; workspaceId: string } & WorkspaceMutationContext)
+  | ({ action: "create_canvas"; workspaceId: string; name: string } & WorkspaceMutationContext)
+  | ({ action: "rename_canvas"; canvasId: string; name: string } & WorkspaceMutationContext)
+  | ({ action: "duplicate_canvas"; canvasId: string; name?: string } & WorkspaceMutationContext)
+  | ({ action: "select_canvas"; workspaceId: string; canvasId: string } & WorkspaceMutationContext)
+  | ({ action: "delete_canvas"; canvasId: string; confirmationToken?: string } & WorkspaceMutationContext)
+  | ({ action: "delete_workspace"; workspaceId: string; confirmationToken?: string } & WorkspaceMutationContext)
+  | ({ action: "import_draw_file_as_canvas"; workspaceId: string; path: string; name?: string } & WorkspaceMutationContext);
+
+export type WorkspaceMutationContext = { expectedCatalogRevision: number; idempotencyKey: string };
+
 export type McpCommand =
   | { operation: "create_diagram"; input: CreateDiagramInput }
   | { operation: "create_elements"; input: CreateElementsInput }
@@ -131,7 +147,10 @@ export type McpCommand =
   | { operation: "open_document"; input: OpenDocumentInput; document?: DrawDocument }
   | { operation: "save_document"; input: SaveDocumentInput }
   | { operation: "export_image"; input: ExportImageInput }
-  | { operation: "insert_image"; input: InsertImageInput };
+  | { operation: "insert_image"; input: InsertImageInput }
+  | WorkspaceActionCommand;
+// Workspace operations are delivered to the active authenticated editor, which owns local IndexedDB.
+export type WorkspaceActionCommand = { operation: "workspace_action"; input: McpWorkspaceAction; document?: DrawDocument };
 
 export class McpValidationError extends Error {
   constructor(message: string) {
@@ -654,9 +673,56 @@ export function parseMcpToolInput(
   if (name === "update_elements") {
     return { operation: "update_elements", input: parseUpdateElements(input) };
   }
+  if (name === "workspace_action") {
+    return parseWorkspaceAction(input);
+  }
   const sceneTool = parseSceneTool(name, input);
   if (sceneTool) return sceneTool;
   throw new McpValidationError(`Unknown Draw MCP tool "${name}".`);
+}
+
+const WORKSPACE_ACTIONS = new Set([
+  "list_workspaces", "list_canvases", "create_workspace", "rename_workspace", "select_workspace",
+  "create_canvas", "rename_canvas", "duplicate_canvas", "select_canvas", "delete_canvas",
+  "delete_workspace", "import_draw_file_as_canvas",
+]);
+
+function parseWorkspaceAction(value: unknown): WorkspaceActionCommand {
+  const input = requireRecord(value, "workspace_action input");
+  const action = input.action;
+  if (typeof action !== "string" || !WORKSPACE_ACTIONS.has(action)) throw new McpValidationError("workspace_action.action must name a supported workspace or canvas action.");
+  const mutation = action !== "list_workspaces" && action !== "list_canvases";
+  const allowed = new Set(["action"]);
+  const fieldsByAction: Record<string, string[]> = {
+    list_workspaces: [], list_canvases: ["workspaceId"], create_workspace: ["name"],
+    rename_workspace: ["workspaceId", "name"], select_workspace: ["workspaceId"],
+    create_canvas: ["workspaceId", "name"], rename_canvas: ["canvasId", "name"],
+    duplicate_canvas: ["canvasId", "name"], select_canvas: ["workspaceId", "canvasId"],
+    delete_canvas: ["canvasId", "confirmationToken"], delete_workspace: ["workspaceId", "confirmationToken"],
+    import_draw_file_as_canvas: ["workspaceId", "path", "name"],
+  };
+  for (const field of fieldsByAction[action] ?? []) allowed.add(field);
+  if (mutation) { allowed.add("expectedCatalogRevision"); allowed.add("idempotencyKey"); }
+  for (const key of Object.keys(input)) if (!allowed.has(key)) throw new McpValidationError(`workspace_action has unsupported field "${key}".`);
+  const result: Record<string, unknown> = { action };
+  const requiredStrings = new Set(["workspaceId", "canvasId", "name", "path"]);
+  for (const field of fieldsByAction[action] ?? []) {
+    const raw = input[field];
+    if (field === "name" && action === "duplicate_canvas" && raw === undefined) continue;
+    if (field === "confirmationToken" && raw === undefined) continue;
+    if (field === "path") result.path = parseRelativeFileName(raw, "workspace_action.path", [".draw"]);
+    else if (field === "name") result.name = requireString(raw, "workspace_action.name", 200);
+    else if (field === "confirmationToken") result.confirmationToken = requireString(raw, "workspace_action.confirmationToken", 200);
+    else if (requiredStrings.has(field)) result[field] = requireString(raw, `workspace_action.${field}`, 200);
+  }
+  if (mutation) {
+    if (!Number.isSafeInteger(input.expectedCatalogRevision) || (input.expectedCatalogRevision as number) < 0) {
+      throw new McpValidationError("workspace_action.expectedCatalogRevision must be a non-negative integer.");
+    }
+    result.expectedCatalogRevision = input.expectedCatalogRevision;
+    result.idempotencyKey = requireIdempotencyKey(input, "workspace_action");
+  }
+  return { operation: "workspace_action", input: result as unknown as McpWorkspaceAction };
 }
 
 export interface CanvasPageOptions {

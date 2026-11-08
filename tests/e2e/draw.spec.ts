@@ -75,7 +75,8 @@ async function startStdioMcp(baseURL: string, documentDir: string, pairingSecret
     call: async (name: string, args: Record<string, unknown>) => {
       const durableMutation = ["create_diagram", "create_elements", "update_elements", "delete_elements", "duplicate_elements", "group_elements", "ungroup_elements", "arrange_elements", "undo_operation", "redo_operation", "set_canvas_settings", "set_viewport"].includes(name);
       const argumentsWithKey = durableMutation && typeof args.idempotencyKey !== "string" ? { ...args, idempotencyKey: `e2e-${crypto.randomUUID()}` } : args;
-      return request("tools/call", { name, arguments: argumentsWithKey });
+      try { return await request("tools/call", { name, arguments: argumentsWithKey }); }
+      catch (error) { throw new Error(`MCP tool ${name} failed: ${error instanceof Error ? error.message : String(error)}`); }
     },
     credentialPath,
     close: async () => {
@@ -2810,4 +2811,72 @@ test("V1 current-document data migrates into the default workspace without losin
   expect(migrated.document.elements).toEqual(legacy.document.elements);
   expect(migrated.document.canvas.viewport).toEqual(legacy.document.canvas.viewport);
   expect(migrated.document.documentRevision).toBe(12);
+});
+
+test("stdio MCP manages stable workspaces and canvases with durable replay, safe import, and human-approved deletion", async ({ page, baseURL }) => {
+  const directory = await mkdtemp(join(tmpdir(), "draw-e2e-workspace-mcp-"));
+  const source = await readLocalDocument(page);
+  source.document.id = "mcp-import-source";
+  source.document.title = "Agent import source";
+  source.document.elements = [{ id: "agent-import-node", type: "rectangle", x: 80, y: 90, width: 180, height: 90, angle: 0, strokeColor: "#e03131", backgroundColor: "transparent", fillStyle: "solid", strokeWidth: 2, roughness: 1, opacity: 100, groupIds: [], frameId: null, roundness: { type: 3 }, seed: 410, version: 1, versionNonce: 411, isDeleted: false, boundElements: [], updated: Date.now(), link: null, locked: false }];
+  await writeFile(join(directory, "agent-source.draw"), JSON.stringify(source), { mode: 0o600 });
+  let mcp: Awaited<ReturnType<typeof startStdioMcp>> | null = null;
+  try {
+    mcp = await startStdioMcp(baseURL!, directory);
+    const result = async (response: any) => {
+      expect(response.error, JSON.stringify(response.error)).toBeUndefined();
+      expect(response.result?.isError, response.result?.content?.[0]?.text).not.toBe(true);
+      return JSON.parse(response.result.content[0].text);
+    };
+    const initial = await result(await mcp.call("list_workspaces", {}));
+    expect(initial.activeWorkspaceId).toBeTruthy();
+    expect(initial.activeCanvasId).toBeTruthy();
+    expect(initial.activeDocument.document.id).toBeTruthy();
+    const revision = initial.catalogRevision;
+    const createArgs = { expectedCatalogRevision: revision, idempotencyKey: "mcp-create-workspace-e2e", name: "Agent project" };
+    const created = await result(await mcp.call("create_workspace", createArgs));
+    expect(created.activeWorkspaceId).not.toBe(initial.activeWorkspaceId);
+    expect(created.activeCanvasId).toBeTruthy();
+    expect(created.activeDocument.document.id).toBeTruthy();
+    const retry = await result(await mcp.call("create_workspace", createArgs));
+    expect(retry.activeWorkspaceId).toBe(created.activeWorkspaceId);
+    const conflict = await mcp.call("create_workspace", { ...createArgs, name: "Changed intent" });
+    expect(conflict.result?.isError).toBe(true);
+    const canvasArgs = { expectedCatalogRevision: created.catalogRevision, idempotencyKey: "mcp-import-canvas-e2e", workspaceId: created.activeWorkspaceId, path: "agent-source.draw", name: "Imported agent plan" };
+    const imported = await result(await mcp.call("import_draw_file_as_canvas", canvasArgs));
+    expect(imported.activeCanvasId).not.toBe(created.activeCanvasId);
+    expect(imported.activeDocument.document.title).toBe("Imported agent plan");
+    expect(imported.activeDocument.document.elements.some((element: any) => element.id === "agent-import-node")).toBe(true);
+    const stale = await mcp.call("create_canvas", { expectedCatalogRevision: created.catalogRevision, idempotencyKey: "mcp-stale-catalog", workspaceId: created.activeWorkspaceId, name: "Should conflict" });
+    expect(stale.result?.isError).toBe(true);
+    const canvasList = await result(await mcp.call("list_canvases", { workspaceId: created.activeWorkspaceId }));
+    expect(canvasList.canvases.some((canvas: any) => canvas.id === imported.activeCanvasId)).toBe(true);
+    expect(canvasList.activeDocument.document.id).toBe(imported.activeDocument.document.id);
+    const duplicate = await result(await mcp.call("duplicate_canvas", { expectedCatalogRevision: imported.catalogRevision, idempotencyKey: "mcp-duplicate-canvas-e2e", canvasId: imported.activeCanvasId, name: "Editable duplicate" }));
+    expect(duplicate.activeCanvasId).not.toBe(imported.activeCanvasId);
+    expect(duplicate.activeDocument.document.elements.some((element: any) => element.id === "agent-import-node")).toBe(true);
+    const deleteArgs = { expectedCatalogRevision: duplicate.catalogRevision, idempotencyKey: "mcp-delete-workspace-e2e", workspaceId: created.activeWorkspaceId };
+    const needsApproval = await result(await mcp.call("delete_workspace", deleteArgs));
+    expect(needsApproval.status).toBe("NEEDS_CONFIRMATION");
+    await expect(page.getByRole("dialog", { name: "Delete this workspace?" })).toBeVisible();
+    await page.getByRole("button", { name: "Keep drawings" }).click();
+    const denied = await mcp.call("delete_workspace", { ...deleteArgs, confirmationToken: needsApproval.confirmationToken });
+    expect(denied.result?.isError).toBe(true);
+    const latest = await result(await mcp.call("list_workspaces", {}));
+    const secondArgs = { expectedCatalogRevision: latest.catalogRevision, idempotencyKey: "mcp-delete-workspace-approved-e2e", workspaceId: created.activeWorkspaceId };
+    const approval = await result(await mcp.call("delete_workspace", secondArgs));
+    await expect(page.getByRole("dialog", { name: "Delete this workspace?" })).toBeVisible();
+    await page.getByRole("button", { name: "Approve deletion" }).click();
+    const deleted = await result(await mcp.call("delete_workspace", { ...secondArgs, confirmationToken: approval.confirmationToken }));
+    expect(deleted.workspaces.some((workspace: any) => workspace.id === created.activeWorkspaceId)).toBe(false);
+    await page.reload();
+    await page.locator(".topbar").waitFor();
+    await connectEditorToMcp(page);
+    const afterReload = await result(await mcp.call("list_workspaces", {}));
+    expect(afterReload.workspaces.some((workspace: any) => workspace.id === created.activeWorkspaceId)).toBe(false);
+    expect(afterReload.activeDocument.document.id).toBeTruthy();
+  } finally {
+    await mcp?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
