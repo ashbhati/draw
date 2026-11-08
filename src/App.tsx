@@ -12,7 +12,7 @@ import {
 } from "./document/document";
 import { composeBackgroundSvg, hasSelectedExportElements, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorForBackgroundPreset } from "./export/background-recolor";
-import { saveCurrentDocument, loadCurrentDocument, commitMcpOperation, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation } from "./ui/storage";
+import { saveCurrentDocument, loadCurrentDocument, commitMcpOperation, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createCanvas, duplicateCanvas, deleteCanvas, deleteWorkspace, listCanvases, listWorkspaces, loadCanvasDocument, renameCanvas, renameWorkspace, setActiveCanvas, type DrawCanvas, type DrawWorkspace } from "./ui/storage";
 import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
 import { createDebouncedSaver } from "./ui/autosave";
@@ -128,6 +128,10 @@ async function blobToBase64(blob: Blob): Promise<string> {
 
 export default function App() {
   const [doc, setDoc] = useState<DrawDocument | null>(null);
+  const [workspaces, setWorkspaces] = useState<DrawWorkspace[]>([]);
+  const [canvases, setCanvases] = useState<DrawCanvas[]>([]);
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState("");
+  const [activeCanvasId, setActiveCanvasId] = useState("");
   const [status, setStatus] = useState<Status>("loading");
   const [message, setMessage] = useState("");
   const [confirmation, setConfirmation] = useState<BridgeConfirmation | null>(null);
@@ -215,6 +219,13 @@ export default function App() {
     setDoc(next);
   }, []);
 
+  useEffect(() => {
+    if (!doc || !activeCanvasId) return;
+    setCanvases((current) => current.map((canvas) => canvas.id === activeCanvasId && canvas.name !== doc.document.title
+      ? { ...canvas, name: doc.document.title }
+      : canvas));
+  }, [activeCanvasId, doc?.document.id, doc?.document.title]);
+
   const autosave = useMemo(() => createDebouncedSaver<DrawDocument>(async (value) => {
     if (!writerOwned.current) return;
     const outcome = await saveCurrentDocument(value);
@@ -263,8 +274,41 @@ export default function App() {
             : "This browser cannot coordinate Draw tabs safely. This tab is read-only to protect your autosave.");
         }
         try {
-          const stored = await loadCurrentDocument();
+          let stored = await loadCurrentDocument();
           if (!live) return;
+          let workspaceItems = await listWorkspaces();
+          if (!workspaceItems.length) {
+            const workspace = await createWorkspace("My workspace");
+            const canvas = await createCanvas(workspace.id, stored?.document.title ?? "Untitled drawing", stored ?? undefined);
+            await setActiveCanvas(canvas.id);
+            stored = await loadCanvasDocument(canvas.id);
+            workspaceItems = [workspace];
+          }
+          let workspaceId = "";
+          let canvasItems: DrawCanvas[] = [];
+          if (stored) {
+            for (const workspace of workspaceItems) {
+              const items = await listCanvases(workspace.id);
+              const active = items.find((item) => item.documentId === stored!.document.id);
+              if (active) { workspaceId = workspace.id; canvasItems = items; break; }
+            }
+          }
+          if (!workspaceId) {
+            const workspace = workspaceItems[0];
+            workspaceId = workspace.id;
+            canvasItems = await listCanvases(workspaceId);
+            if (!canvasItems.length) {
+              const canvas = await createCanvas(workspaceId, "Untitled drawing");
+              canvasItems = [canvas];
+            }
+            await setActiveCanvas(canvasItems[0].id);
+            stored = await loadCanvasDocument(canvasItems[0].id);
+          }
+          if (!stored) throw new Error("The active canvas document is unavailable.");
+          setWorkspaces(workspaceItems);
+          setCanvases(canvasItems);
+          setActiveWorkspaceId(workspaceId);
+          setActiveCanvasId(canvasItems.find((item) => item.documentId === stored!.document.id)?.id ?? "");
           setDocument(stored ?? createEmptyDocument());
           if (stored) {
             try {
@@ -536,14 +580,138 @@ export default function App() {
 
   const openFile = async (file?: File) => {
     if (!file) return;
-    if (docRef.current && shouldRequireOpenConfirmation(docRef.current) &&
-      !window.confirm("Open this file and replace the current canvas? Save an editable .draw copy first if you need to keep both.")) {
-      if (fileInput.current) fileInput.current.value = "";
-      return;
+    try {
+      const imported = await parseDrawFile(await file.text());
+      await switchToNewCanvas(activeWorkspaceId, imported.document.title, imported);
+      setMessage("Imported as a new editable canvas.");
     }
-    try { await loadDocument(await parseDrawFile(await file.text())); }
     catch (error) { setMessage(error instanceof Error ? error.message : "Could not open this Draw file."); }
     finally { if (fileInput.current) fileInput.current.value = ""; }
+  };
+
+  const refreshWorkspaceList = async (selectWorkspaceId = activeWorkspaceId, selectCanvasId = activeCanvasId) => {
+    const nextWorkspaces = await listWorkspaces();
+    const nextCanvases = selectWorkspaceId ? await listCanvases(selectWorkspaceId) : [];
+    setWorkspaces(nextWorkspaces);
+    setCanvases(nextCanvases);
+    setActiveWorkspaceId(selectWorkspaceId);
+    setActiveCanvasId(selectCanvasId);
+  };
+
+  const settleEditorBeforeSwitch = async () => {
+    if (viewRevisionTimer.current !== null) { window.clearTimeout(viewRevisionTimer.current); viewRevisionTimer.current = null; }
+    await Promise.all([autosave.flush(), bridgeAutosave.flush()]);
+  };
+
+  const switchToCanvas = async (canvasId: string, workspaceId = activeWorkspaceId) => {
+    if (!canvasId || canvasId === activeCanvasId || !writerOwned.current) return;
+    try {
+      await settleEditorBeforeSwitch();
+      const next = await loadCanvasDocument(canvasId);
+      if (!next) throw new Error("The selected canvas has no saved document.");
+      await setActiveCanvas(canvasId);
+      lastMcpOperation.current = null; lastUndoneOperation.current = null;
+      setDocument(next); setEditorKey((key) => key + 1); setStatus("saved"); setMessage("");
+      await refreshWorkspaceList(workspaceId, canvasId);
+    } catch (error) { setMessage(`Could not open canvas: ${error instanceof Error ? error.message : String(error)}`); }
+  };
+
+  const switchToNewCanvas = async (workspaceId: string, name: string, source?: DrawDocument) => {
+    await settleEditorBeforeSwitch();
+    const created = await createCanvas(workspaceId, name, source);
+    const next = await loadCanvasDocument(created.id);
+    if (!next) throw new Error("The new canvas could not be loaded.");
+    await setActiveCanvas(created.id);
+    setDocument(next); setEditorKey((key) => key + 1); setStatus("saved");
+    await refreshWorkspaceList(workspaceId, created.id);
+  };
+
+  const createNewWorkspace = async () => {
+    try {
+      await settleEditorBeforeSwitch();
+      const workspace = await createWorkspace("New workspace");
+      await switchToNewCanvas(workspace.id, "Untitled drawing");
+    } catch (error) { setMessage(`Could not create workspace: ${error instanceof Error ? error.message : String(error)}`); }
+  };
+
+  const selectWorkspace = async (workspaceId: string) => {
+    if (workspaceId === activeWorkspaceId) return;
+    try {
+      const items = await listCanvases(workspaceId);
+      if (!items.length) { await switchToNewCanvas(workspaceId, "Untitled drawing"); return; }
+      await switchToCanvas(items[0].id, workspaceId);
+    } catch (error) { setMessage(`Could not open workspace: ${error instanceof Error ? error.message : String(error)}`); }
+  };
+
+  const createNewCanvas = async () => {
+    try { await switchToNewCanvas(activeWorkspaceId, "Untitled drawing"); }
+    catch (error) { setMessage(`Could not create canvas: ${error instanceof Error ? error.message : String(error)}`); }
+  };
+
+  const duplicateActiveCanvas = async () => {
+    try {
+      await settleEditorBeforeSwitch();
+      const duplicate = await duplicateCanvas(activeCanvasId);
+      const next = await loadCanvasDocument(duplicate.id);
+      if (!next) throw new Error("The copy could not be loaded.");
+      await setActiveCanvas(duplicate.id); setDocument(next); setEditorKey((key) => key + 1);
+      await refreshWorkspaceList(activeWorkspaceId, duplicate.id);
+    } catch (error) { setMessage(`Could not duplicate canvas: ${error instanceof Error ? error.message : String(error)}`); }
+  };
+
+  const renameActiveCanvas = async () => {
+    const name = window.prompt("Canvas name", canvases.find((item) => item.id === activeCanvasId)?.name ?? "Untitled drawing");
+    if (name === null) return;
+    try {
+      await settleEditorBeforeSwitch();
+      const renamed = await renameCanvas(activeCanvasId, name);
+      const next = await loadCanvasDocument(activeCanvasId);
+      if (next) { setDocument(next); setEditorKey((key) => key + 1); }
+      await refreshWorkspaceList(activeWorkspaceId, activeCanvasId);
+      setMessage(`Canvas renamed to ${renamed.name}.`);
+    } catch (error) { setMessage(`Could not rename canvas: ${error instanceof Error ? error.message : String(error)}`); }
+  };
+
+  const renameActiveWorkspace = async () => {
+    const current = workspaces.find((item) => item.id === activeWorkspaceId);
+    const name = window.prompt("Workspace name", current?.name ?? "My workspace");
+    if (name === null) return;
+    try { await renameWorkspace(activeWorkspaceId, name); await refreshWorkspaceList(); }
+    catch (error) { setMessage(`Could not rename workspace: ${error instanceof Error ? error.message : String(error)}`); }
+  };
+
+  const removeActiveCanvas = async () => {
+    const target = canvases.find((item) => item.id === activeCanvasId);
+    if (!target || !window.confirm(`Delete canvas “${target.name}”? Its saved editable drawing and history will be removed from this device.`)) return;
+    try {
+      await settleEditorBeforeSwitch(); await deleteCanvas(target.id);
+      const next = await loadCurrentDocument();
+      let updated = await listCanvases(activeWorkspaceId);
+      if (!updated.length) { const fresh = await createCanvas(activeWorkspaceId, "Untitled drawing"); updated = [fresh]; await setActiveCanvas(fresh.id); }
+      const active = updated.find((item) => item.documentId === next?.document.id) ?? updated[0];
+      const activeDocument = next?.document.id === active.documentId ? next : await loadCanvasDocument(active.id);
+      if (activeDocument) { await setActiveCanvas(active.id); setDocument(activeDocument); setEditorKey((key) => key + 1); }
+      await refreshWorkspaceList(activeWorkspaceId, active.id);
+    } catch (error) { setMessage(`Could not delete canvas: ${error instanceof Error ? error.message : String(error)}`); }
+  };
+
+  const removeActiveWorkspace = async () => {
+    const workspace = workspaces.find((item) => item.id === activeWorkspaceId);
+    if (!workspace || !window.confirm(`Delete workspace “${workspace.name}” and all ${canvases.length} saved canvas${canvases.length === 1 ? "" : "es"}? This permanently removes those editable drawings and their history from this device.`)) return;
+    try {
+      await settleEditorBeforeSwitch(); await deleteWorkspace(workspace.id);
+      let remaining = await listWorkspaces();
+      if (!remaining.length) remaining = [await createWorkspace("My workspace")];
+      const nextWorkspace = remaining[0];
+      let nextCanvases = await listCanvases(nextWorkspace.id);
+      if (!nextCanvases.length) nextCanvases = [await createCanvas(nextWorkspace.id, "Untitled drawing")];
+      const nextCanvas = nextCanvases[0];
+      await setActiveCanvas(nextCanvas.id);
+      const next = await loadCanvasDocument(nextCanvas.id);
+      if (!next) throw new Error("The replacement canvas could not be loaded.");
+      setDocument(next); setEditorKey((key) => key + 1);
+      await refreshWorkspaceList(nextWorkspace.id, nextCanvas.id);
+    } catch (error) { setMessage(`Could not delete workspace: ${error instanceof Error ? error.message : String(error)}`); }
   };
 
   const saveFile = () => {
@@ -1285,6 +1453,7 @@ export default function App() {
       <div className="brand"><span className="brand-mark">D</span><span className="brand-name">draw</span><span className="brand-divider"/><span className="doc-title"><input ref={titleInput} aria-label="Drawing title" disabled={!canWrite} value={doc.document.title} onChange={(event) => {
         const next = { ...doc, document: { ...doc.document, title: event.target.value, documentRevision: doc.document.documentRevision + 1 } };
         setDocument(next);
+        setCanvases((current) => current.map((canvas) => canvas.id === activeCanvasId ? { ...canvas, name: event.target.value } : canvas));
         if (autosaveBlocked) { setStatus("error"); return; }
         setStatus("saving");
         autosave.schedule(next);
@@ -1300,6 +1469,18 @@ export default function App() {
         <div className="export-group"><button className="button button-quiet export-main" disabled={exportScope === "selection" && !selectionAvailable} title={exportScope === "selection" && !selectionAvailable ? "Select one or more objects to export a selection" : undefined} onClick={() => void exportImage("image/png")}>Export</button><select aria-label="Export scope" value={exportScope} onChange={(event) => setExportScope(event.target.value as "canvas" | "selection")}><option value="canvas">Whole drawing</option><option value="selection">Selection only</option></select><select aria-label="Image export format" value="image/png" onChange={(event) => void exportImage(event.target.value as "image/png" | "image/jpeg")}><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option></select></div>
       </div>
     </header>
+    <nav className="project-toolbar" aria-label="Workspace and canvas management">
+      <label>Workspace <select aria-label="Workspace" value={activeWorkspaceId} disabled={!canWrite} onChange={(event) => void selectWorkspace(event.target.value)}>{workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}</select></label>
+      <button className="button" disabled={!canWrite} onClick={() => void createNewWorkspace()}>New workspace</button>
+      <button className="button" disabled={!canWrite} onClick={() => void renameActiveWorkspace()}>Rename workspace</button>
+      <button className="button button-danger-quiet" disabled={!canWrite || workspaces.length < 1} onClick={() => void removeActiveWorkspace()}>Delete workspace</button>
+      <span className="project-divider" />
+      <label>Canvas <select aria-label="Canvas" value={activeCanvasId} disabled={!canWrite} onChange={(event) => void switchToCanvas(event.target.value)}>{canvases.map((canvas) => <option key={canvas.id} value={canvas.id}>{canvas.name}</option>)}</select></label>
+      <button className="button" disabled={!canWrite} onClick={() => void createNewCanvas()}>New canvas</button>
+      <button className="button" disabled={!canWrite || !activeCanvasId} onClick={() => void duplicateActiveCanvas()}>Duplicate canvas</button>
+      <button className="button" disabled={!canWrite || !activeCanvasId} onClick={() => void renameActiveCanvas()}>Rename canvas</button>
+      <button className="button button-danger-quiet" disabled={!canWrite || !activeCanvasId} onClick={() => void removeActiveCanvas()}>Delete canvas</button>
+    </nav>
     <div className="workspace">
       <section className="canvas-area" aria-label="Drawing canvas">
     <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onChange} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS}

@@ -28,7 +28,9 @@ npm install
 npm run dev
 ```
 
-Open <http://127.0.0.1:5173>. The Blackboard and Whiteboard presets are saved in the document.
+Open <http://127.0.0.1:5173>. Draw organizes work into **Workspaces** (project containers) and **Canvases** (individual infinite Draw documents). Create, switch, rename, duplicate, and delete them from the bar below the title. Each canvas autosaves independently in this browser on this device; deleting a workspace removes its canvases and their local history. Draw asks you to confirm before destructive deletes. The Blackboard and Whiteboard presets are saved per canvas.
+
+Use **Save .draw** to download the active editable document. **Open .draw** imports that file as a new canvas in the current workspace, so the current canvas stays intact. PNG and JPEG exports are flattened images for sharing and cannot be edited as Draw objects.
 
 ## Connect an MCP client
 
