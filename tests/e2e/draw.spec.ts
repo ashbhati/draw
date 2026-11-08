@@ -2388,3 +2388,236 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("workspaces and canvases create, switch, rename, duplicate, delete, and survive reload", async ({ page }) => {
+  const workspacePicker = page.locator('select[aria-label="Workspace"]');
+  const canvasPicker = page.locator('nav select[aria-label="Canvas"]');
+  const firstWorkspaceId = await workspacePicker.inputValue();
+  const firstCanvasId = await canvasPicker.inputValue();
+  await page.getByLabel("Drawing title").fill("Alpha notes");
+  await expect(page.getByText("Saved on this device")).toBeVisible();
+
+  await page.getByRole("button", { name: "New canvas" }).click();
+  await expect(canvasPicker.locator("option")).toHaveCount(2);
+  await page.getByLabel("Drawing title").fill("Beta notes");
+  await expect.poll(async () => (await readLocalDocument(page))?.document.title).toBe("Beta notes");
+  await canvasPicker.selectOption(firstCanvasId);
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Alpha notes");
+  await page.reload();
+  await page.locator(".topbar").waitFor();
+  await expect(workspacePicker).toHaveValue(firstWorkspaceId);
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Alpha notes");
+
+  await canvasPicker.selectOption({ index: 1 });
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Beta notes");
+  const canvas = page.locator(".excalidraw canvas").last();
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error("The drawing canvas is unavailable.");
+  for (const offset of [-210, 30]) {
+    await page.locator('.excalidraw label[title^="Rectangle"]').click();
+    const startX = box.x + box.width / 2 + offset;
+    const startY = box.y + box.height / 2 - 35;
+    await page.mouse.move(startX, startY);
+    await page.mouse.down(); await page.mouse.move(startX + 120, startY + 80, { steps: 3 }); await page.mouse.up();
+  }
+  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.length).toBe(2);
+  page.once("dialog", (dialog) => dialog.accept("Beta renamed"));
+  await page.getByRole("button", { name: "Rename canvas" }).click();
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Beta renamed");
+  const renamedScene = await readLocalDocument(page);
+  const lastShape = renamedScene.document.elements.at(-1);
+  const undoCanvas = page.locator(".excalidraw canvas").last();
+  const undoBounds = await undoCanvas.boundingBox();
+  if (!undoBounds || !lastShape) throw new Error("The renamed scene is unavailable.");
+  await page.mouse.click(undoBounds.x + lastShape.x + lastShape.width / 2, undoBounds.y + lastShape.y + lastShape.height / 2);
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.filter((element: any) => !element.isDeleted).length).toBe(1);
+  await page.getByRole("button", { name: "Duplicate canvas" }).click();
+  await expect(canvasPicker.locator("option")).toHaveCount(3);
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Beta renamed copy");
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete canvas" }).click();
+  await expect(canvasPicker.locator("option")).toHaveCount(2);
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Alpha notes");
+
+  page.once("dialog", (dialog) => dialog.accept("Research workspace"));
+  await page.getByRole("button", { name: "Rename workspace" }).click();
+  await expect(workspacePicker.locator("option").first()).toHaveText("Research workspace");
+  await page.getByRole("button", { name: "New workspace" }).click();
+  await expect(workspacePicker.locator("option")).toHaveCount(2);
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete workspace" }).click();
+  await expect(workspacePicker.locator("option")).toHaveCount(1);
+  await expect(workspacePicker.locator("option").first()).toHaveText("Research workspace");
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Alpha notes");
+});
+
+test("pending autosave is discarded safely when switching or deleting a canvas", async ({ page }) => {
+  const canvasPicker = page.locator('nav select[aria-label="Canvas"]');
+  const firstCanvasId = await canvasPicker.inputValue();
+  await page.getByRole("button", { name: "New canvas" }).click();
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
+  const canvas = page.locator(".excalidraw canvas").last();
+  await expect(canvas).toBeVisible();
+  await expect.poll(() => canvas.boundingBox()).not.toBeNull();
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error("The drawing canvas is unavailable.");
+  await page.locator('.excalidraw label[title^="Rectangle"]').click();
+  const startX = box.x + box.width / 2 - 70;
+  const startY = box.y + box.height / 2 - 30;
+  await page.mouse.move(startX, startY);
+  await page.mouse.down(); await page.mouse.move(startX + 140, startY + 100, { steps: 2 }); await page.mouse.up();
+  await canvasPicker.selectOption(firstCanvasId);
+  await expect(page.getByText("Saved on this device")).toBeVisible();
+  await expect(page.getByText(/reload the page to continue/i)).toHaveCount(0);
+  await canvasPicker.selectOption({ index: 1 });
+  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.length).toBe(1);
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete canvas" }).click();
+  await expect(canvasPicker.locator("option")).toHaveCount(1);
+  await expect(page.getByText("Saved on this device")).toBeVisible();
+  await expect(page.getByText(/reload the page to continue/i)).toHaveCount(0);
+});
+
+test("same-canvas save conflicts show an error, then deleting canvas or workspace resets status", async ({ page }) => {
+  const createSameCanvasSaveConflict = async (title: string) => {
+    await expect(page.getByText("Saved on this device")).toBeVisible();
+    // Let a just-created workspace/canvas finish its initial debounced write
+    // before installing the competing revision used by this fixture.
+    await page.waitForTimeout(450);
+    const current = await readLocalDocument(page);
+    const newerSaved = structuredClone(current);
+    newerSaved.document.documentRevision += 1_000_000;
+    await page.evaluate((document) => new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open("draw-local");
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const db = request.result;
+        const tx = db.transaction("documents", "readwrite");
+        tx.objectStore("documents").put(document, ["draw-document", document.document.id]);
+        tx.objectStore("documents").put(document, "current");
+        tx.oncomplete = () => { db.close(); resolve(); };
+        tx.onerror = () => { db.close(); reject(tx.error); };
+        tx.onabort = () => { db.close(); reject(tx.error); };
+      };
+    }), newerSaved);
+    await expect.poll(async () => (await readLocalDocument(page))?.document.documentRevision)
+      .toBe(newerSaved.document.documentRevision);
+    await page.getByLabel("Drawing title").fill(title);
+    await expect(page.getByText("Save issue")).toBeVisible();
+    await expect(page.getByText(/newer saved scene/i)).toBeVisible();
+  };
+
+  const canvasPicker = page.locator('nav select[aria-label="Canvas"]');
+  await createSameCanvasSaveConflict("Canvas conflict");
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete canvas" }).click();
+  await expect(canvasPicker.locator("option")).toHaveCount(1);
+  await expect(page.getByText("Saved on this device")).toBeVisible();
+  await expect(page.getByText(/newer saved scene/i)).toHaveCount(0);
+
+  await page.getByRole("button", { name: "New workspace" }).click();
+  await createSameCanvasSaveConflict("Workspace conflict");
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete workspace" }).click();
+  await expect(page.locator('select[aria-label="Workspace"] option')).toHaveCount(1);
+  await expect(page.getByText("Saved on this device")).toBeVisible();
+  await expect(page.getByText(/newer saved scene/i)).toHaveCount(0);
+});
+
+test("a read-only tab does not bootstrap a fresh workspace or active canvas pointer", async ({ browser, baseURL }) => {
+  const context = await browser.newContext();
+  await context.addInitScript(() => {
+    const win = window as typeof window & { __drawLockReady?: Promise<void> };
+    win.__drawLockReady = new Promise<void>((resolve) => {
+      void navigator.locks.request("draw-local-writer-v1", { mode: "exclusive" }, async () => {
+        resolve();
+        await new Promise<void>(() => {});
+      });
+    });
+  });
+  const page = await context.newPage();
+  try {
+    await page.goto(baseURL!);
+    await page.evaluate(() => (window as typeof window & { __drawLockReady?: Promise<void> }).__drawLockReady);
+    await expect(page.getByText(/already open in another tab/i)).toBeVisible();
+    const records = await page.evaluate(async () => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open("draw-local");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const values = await new Promise<{ workspaces: unknown[]; canvases: unknown[]; pointer: unknown }>((resolve, reject) => {
+        const tx = db.transaction(["workspaces", "canvases", "workspaceMeta"], "readonly");
+        const workspaces = tx.objectStore("workspaces").getAll();
+        const canvases = tx.objectStore("canvases").getAll();
+        const pointer = tx.objectStore("workspaceMeta").get("activeCanvas");
+        tx.oncomplete = () => resolve({ workspaces: workspaces.result, canvases: canvases.result, pointer: pointer.result });
+        tx.onerror = () => reject(tx.error);
+      });
+      db.close();
+      return values;
+    });
+    expect(records).toEqual({ workspaces: [], canvases: [], pointer: undefined });
+  } finally {
+    await context.close();
+  }
+});
+
+test("importing a .draw file adds a separate editable canvas and keeps the active drawing", async ({ page }) => {
+  const create = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
+    operation: "create_diagram",
+    input: { idempotencyKey: "e2e-workspace-import-fixture", nodes: [{ id: "import-fixture", label: "Preserve in imported copy", x: 100, y: 100 }], edges: [] },
+  } });
+  expect(create.ok(), await create.text()).toBeTruthy();
+  const before = await readLocalDocument(page);
+  const source = structuredClone(before);
+  source.document.id = "portable-source-id";
+  source.document.title = "Imported reference";
+  const canvasPicker = page.locator('nav select[aria-label="Canvas"]');
+  const countBefore = await canvasPicker.locator("option").count();
+  const importInput = page.locator('input[type="file"][accept^=".draw"]');
+  await importInput.setInputFiles({ name: "reference.draw", mimeType: "application/vnd.draw+json", buffer: Buffer.from(JSON.stringify(source)) });
+  await expect(canvasPicker.locator("option")).toHaveCount(countBefore + 1);
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Imported reference");
+  const imported = await readLocalDocument(page);
+  expect(imported.document.id).not.toBe("portable-source-id");
+  expect(imported.document.elements).toEqual(before.document.elements);
+  await canvasPicker.selectOption({ index: 0 });
+  await expect(page.getByLabel("Drawing title")).toHaveValue(before.document.title);
+  expect((await readLocalDocument(page)).document.elements).toEqual(before.document.elements);
+});
+
+test("V1 current-document data migrates into the default workspace without losing its editable scene", async ({ page }) => {
+  const legacy = await readLocalDocument(page);
+  legacy.document.title = "Migrated V1 diagram";
+  legacy.document.documentRevision = 12;
+  legacy.document.canvas.viewport = { x: -38, y: 52, zoom: 0.8 };
+  await page.evaluate(async (document) => {
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.deleteDatabase("draw-local");
+      request.onsuccess = () => resolve(); request.onerror = () => reject(request.error); request.onblocked = () => reject(new Error("Draw database remained open during the migration fixture."));
+    });
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("draw-local", 4);
+      request.onupgradeneeded = () => request.result.createObjectStore("documents");
+      request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const tx = database.transaction("documents", "readwrite");
+      tx.objectStore("documents").put(document, "current");
+      tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error);
+    });
+    database.close();
+  }, legacy);
+  await page.reload();
+  await page.locator(".topbar").waitFor();
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Migrated V1 diagram");
+  await expect(page.locator('select[aria-label="Workspace"] option')).toHaveCount(1);
+  await expect(page.locator('nav select[aria-label="Canvas"] option')).toHaveCount(1);
+  const migrated = await readLocalDocument(page);
+  expect(migrated.document.elements).toEqual(legacy.document.elements);
+  expect(migrated.document.canvas.viewport).toEqual(legacy.document.canvas.viewport);
+  expect(migrated.document.documentRevision).toBe(12);
+});

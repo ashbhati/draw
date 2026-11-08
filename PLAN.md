@@ -103,13 +103,16 @@ The MCP bridge currently requires the Vite development server and an open Draw t
 
 Keep these out of the first build, then prioritize them based on actual use:
 
-- Multiple canvases, projects, folders, and pages.
 - Cloud sync, user accounts, collaboration, view/edit permissions, and comments.
 - Excalidraw file import/export or compatibility, if it becomes useful.
 - Broader Excalidraw feature coverage after a focused feature audit.
 - Add selected elements to the reusable library (tracked in [issue #11](https://github.com/ashbhati/draw/issues/11)); library browsing works, saving new items is deferred.
 - Additional board/background presets, richer illustration tools, and presentation workflows.
 - Package the app and MCP bridge for a production or desktop workflow.
+
+## V2 workspace and canvas progress
+
+Issue [#34](https://github.com/ashbhati/draw/issues/34) adds browser-local project organization after V1. The storage foundation is merged in PR [#47](https://github.com/ashbhati/draw/pull/47): per-canvas documents and autosave, isolated revisions/history, V1 single-document migration, and safe active-canvas recovery. The follow-up UI work adds Workspaces as project containers and Canvases as individual infinite Draw documents, with create/switch/rename/duplicate/delete, editable `.draw` import as a new canvas, workspace deletion confirmation, and Chrome coverage for reload and V1 migration. Image library additions, cloud sync, and packaged production MCP remain separate backlog items.
 
 ## Initial decisions
 

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import "fake-indexeddb/auto";
 import { createEmptyDocument } from "../document/document";
-import { commitMcpOperation, createCanvas, createWorkspace, deleteCanvas, DrawStorageRecoveryError, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadMcpOperation, restoreMcpCommandSnapshot, saveCurrentDocument, setActiveCanvas } from "./storage";
+import { commitMcpOperation, createCanvas, createWorkspace, deleteCanvas, deleteWorkspace, duplicateCanvas, DrawStorageRecoveryError, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadMcpOperation, renameCanvas, renameWorkspace, restoreMcpCommandSnapshot, saveCurrentDocument, setActiveCanvas } from "./storage";
 import { canRedoMcpOperation, canUndoMcpOperation, OPERATION_RESULT_RETENTION_MS, OPERATION_SNAPSHOT_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "../integrations/operation-ledger";
 
 describe("local Draw autosave", () => {
@@ -38,6 +38,52 @@ describe("local Draw autosave", () => {
 
   it("returns null before the first autosave", async () => {
     expect(await loadCurrentDocument()).toBeNull();
+  });
+
+  it("renames canvases and workspaces while keeping the canvas document title in sync", async () => {
+    const original = createEmptyDocument("Architecture");
+    await saveCurrentDocument(original);
+    const workspace = (await listWorkspaces())[0];
+    const canvas = (await listCanvases(workspace.id))[0];
+    await renameWorkspace(workspace.id, "Platform");
+    await renameCanvas(canvas.id, "Service map");
+    expect((await listWorkspaces())[0].name).toBe("Platform");
+    expect((await listCanvases(workspace.id))[0].name).toBe("Service map");
+    expect((await loadCanvasDocument(canvas.id))?.document.title).toBe("Service map");
+  });
+
+  it("duplicates an editable canvas into a new independent document", async () => {
+    const source = createEmptyDocument("Original");
+    source.document.elements.push({ id: "node-original", type: "rectangle", x: 11, y: 22, width: 90, height: 40 });
+    source.document.canvas.viewport = { x: -40, y: 18, zoom: 0.75 };
+    await saveCurrentDocument(source);
+    const workspace = (await listWorkspaces())[0];
+    const originalCanvas = (await listCanvases(workspace.id))[0];
+    const copyCanvas = await duplicateCanvas(originalCanvas.id, "Copy");
+    const copy = await loadCanvasDocument(copyCanvas.id);
+    expect(copyCanvas.id).not.toBe(originalCanvas.id);
+    expect(copy?.document.id).not.toBe(source.document.id);
+    expect(copy?.document.title).toBe("Copy");
+    expect(copy?.document.elements).toEqual(source.document.elements);
+    expect(copy?.document.canvas.viewport).toEqual(source.document.canvas.viewport);
+    expect(copy?.document.documentRevision).toBe(0);
+  });
+
+  it("deletes an active workspace and its documents, selecting a sibling canvas transactionally", async () => {
+    const keep = createEmptyDocument("Keep");
+    await saveCurrentDocument(keep);
+    const keepWorkspace = (await listWorkspaces())[0];
+    const doomedWorkspace = await createWorkspace("Doomed");
+    const doomedCanvas = await createCanvas(doomedWorkspace.id, "Private diagram");
+    const doomedDocument = await loadCanvasDocument(doomedCanvas.id);
+    await setActiveCanvas(doomedCanvas.id);
+    await deleteWorkspace(doomedWorkspace.id);
+    expect(await listWorkspaces()).toHaveLength(1);
+    expect(await listCanvases(doomedWorkspace.id)).toEqual([]);
+    expect(await loadCanvasDocument(doomedCanvas.id)).toBeNull();
+    expect((await loadCurrentDocument())?.document.id).toBe(keep.document.id);
+    expect(keepWorkspace.id).not.toBe(doomedWorkspace.id);
+    expect(doomedDocument).not.toBeNull();
   });
 
   it("migrates the existing current document into a default workspace without changing its portable content", async () => {
@@ -99,6 +145,17 @@ describe("local Draw autosave", () => {
     expect(await loadCanvasDocument(secondCanvas.id)).toEqual(editedSecond);
     const firstCanvas = (await listCanvases(workspace.id)).find((canvas) => canvas.documentId === first.document.id)!;
     expect(await loadCanvasDocument(firstCanvas.id)).toEqual(first);
+  });
+
+  it("keeps the V1 current-document alias aligned when the active canvas changes", async () => {
+    const first = createEmptyDocument("First");
+    await saveCurrentDocument(first);
+    const workspace = (await listWorkspaces())[0];
+    const secondCanvas = await createCanvas(workspace.id, "Second");
+    const second = await loadCanvasDocument(secondCanvas.id);
+    await setActiveCanvas(secondCanvas.id);
+    expect(await readLegacyCurrentDocument()).toEqual(second);
+    expect(await loadCurrentDocument()).toEqual(second);
   });
 
   it("commits workspace/canvas creation atomically and keeps V1 .draw import as a new document", async () => {

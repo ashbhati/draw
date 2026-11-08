@@ -441,6 +441,164 @@ export async function createWorkspace(name: string): Promise<DrawWorkspace> {
   finally { db.close(); }
 }
 
+export async function renameWorkspace(workspaceId: string, name: string): Promise<DrawWorkspace> {
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction(WORKSPACES_STORE, "readwrite");
+    const store = tx.objectStore(WORKSPACES_STORE);
+    const request = store.get(workspaceId);
+    let renamed: DrawWorkspace | undefined;
+    let failure: Error | undefined;
+    request.onsuccess = () => {
+      if (!request.result) { failure = new Error("Workspace does not exist."); tx.abort(); return; }
+      renamed = { ...(request.result as DrawWorkspace), name: name.trim() || "Untitled workspace", updatedAt: Date.now() };
+      store.put(renamed, workspaceId);
+    };
+    try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
+    return renamed!;
+  } finally { db.close(); }
+}
+
+export async function renameCanvas(canvasId: string, name: string): Promise<DrawCanvas> {
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction([CANVASES_STORE, DOCUMENTS_STORE], "readwrite");
+    const canvases = tx.objectStore(CANVASES_STORE);
+    const request = canvases.get(canvasId);
+    let renamed: DrawCanvas | undefined;
+    let failure: Error | undefined;
+    request.onsuccess = () => {
+      const canvas = request.result as DrawCanvas | undefined;
+      if (!canvas) { failure = new Error("Canvas does not exist."); tx.abort(); return; }
+      const docRequest = tx.objectStore(DOCUMENTS_STORE).get(documentKey(canvas.documentId));
+      docRequest.onsuccess = () => {
+        try {
+          if (!docRequest.result) throw new DrawStorageRecoveryError(`Canvas ${canvasId} is damaged: its editable document is missing.`);
+          const document = docRequest.result as DrawDocument;
+          validateDrawDocument(document);
+          const nextName = name.trim() || "Untitled canvas";
+          document.document.title = nextName;
+          document.document.documentRevision += 1;
+          renamed = { ...canvas, name: nextName, updatedAt: Date.now() };
+          tx.objectStore(DOCUMENTS_STORE).put(document, documentKey(canvas.documentId));
+          canvases.put(renamed, canvasId);
+        } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); tx.abort(); }
+      };
+      docRequest.onerror = () => { failure = docRequest.error ?? new Error("Could not read the canvas document."); tx.abort(); };
+    };
+    try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
+    return renamed!;
+  } finally { db.close(); }
+}
+
+export async function duplicateCanvas(canvasId: string, name?: string): Promise<DrawCanvas> {
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction([CANVASES_STORE, DOCUMENTS_STORE, WORKSPACES_STORE, WORKSPACE_META_STORE], "readwrite");
+    const sourceRequest = tx.objectStore(CANVASES_STORE).get(canvasId);
+    let duplicate: DrawCanvas | undefined;
+    let failure: Error | undefined;
+    sourceRequest.onsuccess = () => {
+      const source = sourceRequest.result as DrawCanvas | undefined;
+      if (!source) { failure = new Error("Canvas does not exist."); tx.abort(); return; }
+      const documentRequest = tx.objectStore(DOCUMENTS_STORE).get(documentKey(source.documentId));
+      documentRequest.onsuccess = () => {
+        try {
+          if (!documentRequest.result) throw new DrawStorageRecoveryError(`Canvas ${canvasId} is damaged: its editable document is missing.`);
+          const sourceDocument = structuredClone(documentRequest.result as DrawDocument);
+          validateDrawDocument(sourceDocument);
+          const nextName = name?.trim() || `${source.name} copy`;
+          sourceDocument.document.title = nextName;
+          sourceDocument.document.documentRevision = 0;
+          sourceDocument.document.viewRevision = 0;
+          duplicate = { id: crypto.randomUUID(), workspaceId: source.workspaceId, name: nextName, documentId: crypto.randomUUID(), createdAt: Date.now(), updatedAt: Date.now() };
+          sourceDocument.document.id = duplicate.documentId;
+          tx.objectStore(DOCUMENTS_STORE).put(sourceDocument, documentKey(duplicate.documentId));
+          tx.objectStore(CANVASES_STORE).put(duplicate, duplicate.id);
+          tx.objectStore(WORKSPACE_META_STORE).put(true, INITIALIZED_KEY);
+        } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); tx.abort(); }
+      };
+      documentRequest.onerror = () => { failure = documentRequest.error ?? new Error("Could not read the canvas document."); tx.abort(); };
+    };
+    try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
+    return duplicate!;
+  } finally { db.close(); }
+}
+
+export async function deleteWorkspace(workspaceId: string): Promise<void> {
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction([WORKSPACES_STORE, CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE], "readwrite");
+    const workspaces = tx.objectStore(WORKSPACES_STORE);
+    const canvases = tx.objectStore(CANVASES_STORE);
+    const documents = tx.objectStore(DOCUMENTS_STORE);
+    const meta = tx.objectStore(WORKSPACE_META_STORE);
+    const requests = [
+      workspaces.get(workspaceId),
+      canvases.index("byWorkspaceId").getAll(workspaceId),
+      canvases.getAll(),
+      meta.get(ACTIVE_POINTER_KEY),
+      documents.get(CURRENT_DOCUMENT_KEY),
+      tx.objectStore(MCP_OPERATIONS_STORE).getAllKeys(),
+      tx.objectStore(MCP_OPERATIONS_STORE).getAll(),
+    ];
+    let pending = requests.length;
+    let failure: Error | undefined;
+    const abort = (error: unknown) => { failure = error instanceof Error ? error : new Error(String(error)); tx.abort(); };
+    const finish = () => {
+      pending -= 1;
+      if (pending) return;
+      if (!requests[0].result) return;
+      const removed = requests[1].result as DrawCanvas[];
+      const allCanvases = requests[2].result as DrawCanvas[];
+      const active = requests[3].result as ActiveCanvasPointer | undefined;
+      const alias = requests[4].result as DrawDocument | undefined;
+      const operationKeys = requests[5].result as IDBValidKey[];
+      const operations = requests[6].result as Array<{ documentId?: string }>;
+      const removedIds = new Set(removed.map((canvas) => canvas.documentId));
+      workspaces.delete(workspaceId);
+      for (const canvas of removed) {
+        canvases.delete(canvas.id);
+        documents.delete(documentKey(canvas.documentId));
+        documents.delete(writeOrderKey(canvas.documentId));
+        tx.objectStore(MCP_UNDO_STORE).delete(canvas.documentId);
+        tx.objectStore(MCP_REDO_STORE).delete(canvas.documentId);
+      }
+      operations.forEach((operation, index) => { if (operation?.documentId && removedIds.has(operation.documentId)) tx.objectStore(MCP_OPERATIONS_STORE).delete(operationKeys[index]); });
+      if (!active || !removed.some((canvas) => canvas.id === active.canvasId)) return;
+      const candidates = allCanvases.filter((canvas) => canvas.workspaceId !== workspaceId).sort((a, b) => a.createdAt - b.createdAt);
+      let index = 0;
+      const pickSibling = () => {
+        const candidate = candidates[index++];
+        if (!candidate) {
+          meta.delete(ACTIVE_POINTER_KEY);
+          documents.delete(CURRENT_DOCUMENT_KEY);
+          documents.delete(CURRENT_WRITE_ORDER_KEY);
+          return;
+        }
+        const request = documents.get(documentKey(candidate.documentId));
+        request.onsuccess = () => {
+          try {
+            if (!request.result) throw new Error("missing sibling document");
+            validateDrawDocument(request.result);
+            meta.put({ workspaceId: candidate.workspaceId, canvasId: candidate.id } satisfies ActiveCanvasPointer, ACTIVE_POINTER_KEY);
+            documents.put(request.result, CURRENT_DOCUMENT_KEY);
+          } catch { pickSibling(); }
+        };
+        request.onerror = () => abort(request.error ?? new Error("Could not recover a canvas after deleting its workspace."));
+      };
+      // A legacy alias can only be removed when it references deleted data.
+      if (alias && removedIds.has(alias.document.id)) documents.delete(CURRENT_DOCUMENT_KEY);
+      pickSibling();
+    };
+    requests.forEach((request) => {
+      request.onsuccess = finish;
+      request.onerror = () => abort(request.error ?? new Error("Could not inspect workspace storage before deletion."));
+    });
+    try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
+  } finally { db.close(); }
+}
+
 export async function createCanvas(workspaceId: string, name: string, source?: DrawDocument, hooks: { afterDocumentWrite?: () => void } = {}): Promise<DrawCanvas> {
   const db = await openDatabase();
   try {
@@ -468,7 +626,7 @@ export async function setActiveCanvas(canvasId: string): Promise<void> {
   const db = await openDatabase();
   try {
     const tx = db.transaction([CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE], "readwrite"); const canvases = tx.objectStore(CANVASES_STORE); const req = canvases.get(canvasId); let failure: Error | undefined;
-    req.onsuccess = () => { const canvas = req.result as DrawCanvas | undefined; if (!canvas) { failure = new Error("Canvas does not exist."); tx.abort(); return; } const docRequest = tx.objectStore(DOCUMENTS_STORE).get(documentKey(canvas.documentId)); docRequest.onsuccess = () => { try { if (!docRequest.result) throw new Error("missing"); validateDrawDocument(docRequest.result); tx.objectStore(WORKSPACE_META_STORE).put({ workspaceId: canvas.workspaceId, canvasId } satisfies ActiveCanvasPointer, ACTIVE_POINTER_KEY); } catch { failure = new DrawStorageRecoveryError(`Canvas ${canvas.id} is damaged: its editable document is missing or invalid.`); tx.abort(); } }; docRequest.onerror = () => { failure = docRequest.error ?? new Error("Could not inspect the canvas document."); tx.abort(); }; };
+    req.onsuccess = () => { const canvas = req.result as DrawCanvas | undefined; if (!canvas) { failure = new Error("Canvas does not exist."); tx.abort(); return; } const docRequest = tx.objectStore(DOCUMENTS_STORE).get(documentKey(canvas.documentId)); docRequest.onsuccess = () => { try { if (!docRequest.result) throw new Error("missing"); validateDrawDocument(docRequest.result); tx.objectStore(WORKSPACE_META_STORE).put({ workspaceId: canvas.workspaceId, canvasId } satisfies ActiveCanvasPointer, ACTIVE_POINTER_KEY); tx.objectStore(DOCUMENTS_STORE).put(docRequest.result, CURRENT_DOCUMENT_KEY); } catch { failure = new DrawStorageRecoveryError(`Canvas ${canvas.id} is damaged: its editable document is missing or invalid.`); tx.abort(); } }; docRequest.onerror = () => { failure = docRequest.error ?? new Error("Could not inspect the canvas document."); tx.abort(); }; };
     try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
   } finally { db.close(); }
 }
