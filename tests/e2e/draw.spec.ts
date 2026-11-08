@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import type { Page } from "@playwright/test";
+import type { Download, Page } from "@playwright/test";
 import { chmod, readFile, stat, writeFile } from "node:fs/promises";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -129,6 +129,22 @@ function expectedSceneExportSize(elements: any[], padding = 32) {
 function expectExportSizeMatchesScene(actual: { width: number; height: number }, expected: { width: number; height: number }) {
   expect(Math.abs(actual.width - expected.width), "bitmap width must equal scene bounds plus 32px padding on both sides").toBeLessThanOrEqual(1);
   expect(Math.abs(actual.height - expected.height), "bitmap height must equal scene bounds plus 32px padding on both sides").toBeLessThanOrEqual(1);
+}
+
+async function captureSingleDownload(page: Page, trigger: () => Promise<void>): Promise<Download> {
+  const observed: Download[] = [];
+  const trackDownload = (download: Download) => observed.push(download);
+  page.on("download", trackDownload);
+  try {
+    const downloadWait = page.waitForEvent("download");
+    await trigger();
+    const download = await downloadWait;
+    await page.waitForTimeout(250);
+    expect(observed, "one format change or Export click must create exactly one download before the next export").toEqual([download]);
+    return download;
+  } finally {
+    page.off("download", trackDownload);
+  }
 }
 
 function contrastRatio(foreground: string, background: string): number {
@@ -1684,8 +1700,6 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
     await page.getByRole("button", { name: presetButton, exact: true }).click();
     for (const mime of ["image/png", "image/jpeg"] as const) {
       const formatControl = page.getByLabel("Image export format");
-      const downloadWait = page.waitForEvent("download");
-      await formatControl.selectOption(mime);
       const sequenceBeforeExport = await page.evaluate(() => {
         const current = window as any;
         const previous = current.__drawExportSvgSequence ?? 0;
@@ -1693,8 +1707,12 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
         current.__drawLastExportSvgSequence = undefined;
         return previous;
       });
-      await page.getByRole("button", { name: "Export" }).click();
-      const image = await readFile(await (await downloadWait).path());
+      const download = await captureSingleDownload(page, async () => {
+        if (await formatControl.inputValue() === mime) await page.getByRole("button", { name: "Export" }).click();
+        else await formatControl.selectOption(mime); // Changing format exports immediately.
+      });
+      expect(download.suggestedFilename().endsWith(mime === "image/png" ? ".png" : ".jpg"), `${mime} export should download with the matching image extension`).toBe(true);
+      const image = await readFile(await download.path());
       const sample = await inspectImagePixels(page, image, mime);
       const svgViewport = await page.evaluate(async (startingSequence) => {
         const current = window as any;
