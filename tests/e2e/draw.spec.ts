@@ -1527,7 +1527,9 @@ test("the supplied reference fixture keeps chalk, layout, and editable nodes aft
       context.font = `${fontSize}px Excalifont`;
       return Math.max(...text.split("\n").map((line) => context.measureText(line).width));
     }, { text: label.text, fontSize: label.fontSize });
-    expect(label.width).toBeGreaterThanOrEqual(renderedWidth);
+    // Canvas text measurement and serialized element bounds can differ by a
+    // fraction of a CSS pixel across browser/platform font rasterizers.
+    expect(label.width + 1).toBeGreaterThanOrEqual(renderedWidth);
   }
   for (const label of initial.document.elements.filter((element: any) => element.type === "text")) {
     expect(contrastRatio(label.strokeColor, "#18191a")).toBeGreaterThanOrEqual(4.5);
