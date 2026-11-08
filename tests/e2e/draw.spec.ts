@@ -2840,9 +2840,35 @@ test("stdio MCP manages stable workspaces and canvases with durable replay, safe
     expect(created.activeDocument.document.id).toBeTruthy();
     const retry = await result(await mcp.call("create_workspace", createArgs));
     expect(retry.activeWorkspaceId).toBe(created.activeWorkspaceId);
+    await page.getByLabel("Drawing title").fill("Human edited agent canvas");
+    await expect.poll(async () => (await readLocalDocument(page))?.document.title).toBe("Human edited agent canvas");
+    await page.getByRole("button", { name: "New canvas" }).click();
+    await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
+    await page.getByLabel("Drawing title").fill("Current human canvas");
+    await expect.poll(async () => (await readLocalDocument(page))?.document.title).toBe("Current human canvas");
+    const currentCanvas = page.locator(".excalidraw canvas").last();
+    const currentBounds = await currentCanvas.boundingBox();
+    if (!currentBounds) throw new Error("The active editable canvas is unavailable after adding a canvas.");
+    await page.locator('.excalidraw label[title^="Rectangle"]').click();
+    const rectangleX = currentBounds.x + currentBounds.width / 2 - 60;
+    const rectangleY = currentBounds.y + currentBounds.height / 2 - 35;
+    await page.mouse.move(rectangleX, rectangleY);
+    await page.mouse.down(); await page.mouse.move(rectangleX + 120, rectangleY + 70, { steps: 2 }); await page.mouse.up();
+    await expect.poll(async () => (await readLocalDocument(page))?.document.elements.length).toBe(1);
+    const currentBeforeReplay = await readLocalDocument(page);
+    const currentWorkspaceId = await page.locator('select[aria-label="Workspace"]').inputValue();
+    const currentCanvasId = await page.locator('nav select[aria-label="Canvas"]').inputValue();
+    const safeReplay = await result(await mcp.call("create_workspace", createArgs));
+    expect(safeReplay.activeWorkspaceId).toBe(currentWorkspaceId);
+    expect(safeReplay.activeCanvasId).toBe(currentCanvasId);
+    expect(safeReplay.activeDocument.document.title).toBe("Current human canvas");
+    expect(safeReplay.activeDocument.document.elements).toHaveLength(1);
+    expect(await readLocalDocument(page)).toEqual(currentBeforeReplay);
+    await expect(page.getByLabel("Drawing title")).toHaveValue("Current human canvas");
     const conflict = await mcp.call("create_workspace", { ...createArgs, name: "Changed intent" });
     expect(conflict.result?.isError).toBe(true);
-    const canvasArgs = { expectedCatalogRevision: created.catalogRevision, idempotencyKey: "mcp-import-canvas-e2e", workspaceId: created.activeWorkspaceId, path: "agent-source.draw", name: "Imported agent plan" };
+    const beforeImport = await result(await mcp.call("list_workspaces", {}));
+    const canvasArgs = { expectedCatalogRevision: beforeImport.catalogRevision, idempotencyKey: "mcp-import-canvas-e2e", workspaceId: created.activeWorkspaceId, path: "agent-source.draw", name: "Imported agent plan" };
     const imported = await result(await mcp.call("import_draw_file_as_canvas", canvasArgs));
     expect(imported.activeCanvasId).not.toBe(created.activeCanvasId);
     expect(imported.activeDocument.document.title).toBe("Imported agent plan");
@@ -2855,6 +2881,23 @@ test("stdio MCP manages stable workspaces and canvases with durable replay, safe
     const duplicate = await result(await mcp.call("duplicate_canvas", { expectedCatalogRevision: imported.catalogRevision, idempotencyKey: "mcp-duplicate-canvas-e2e", canvasId: imported.activeCanvasId, name: "Editable duplicate" }));
     expect(duplicate.activeCanvasId).not.toBe(imported.activeCanvasId);
     expect(duplicate.activeDocument.document.elements.some((element: any) => element.id === "agent-import-node")).toBe(true);
+    const confirmationCatalog = await result(await mcp.call("list_workspaces", {}));
+    const spoofedConfirmation = await page.request.post("/__draw/api/confirmations", { headers: mcpAuthHeaders(), data: {
+      action: "delete_workspace", documentId: confirmationCatalog.activeDocument.document.id,
+      expectedDocumentRevision: confirmationCatalog.activeDocument.document.documentRevision,
+      expectedCatalogRevision: confirmationCatalog.catalogRevision, targetId: created.activeWorkspaceId,
+      idempotencyKey: "raw-spoofed-confirmation", fingerprint: "f".repeat(64),
+      targetName: "Forged target", workspaceName: "Forged project", canvasCount: 999,
+    } });
+    expect(spoofedConfirmation.ok(), await spoofedConfirmation.text()).toBeTruthy();
+    await expect(page.getByRole("dialog", { name: "Delete this workspace?" })).toBeVisible();
+    const spoofDialogText = await page.getByRole("dialog").innerText();
+    expect(spoofDialogText).toContain("Agent project");
+    expect(spoofDialogText).not.toContain("Forged target");
+    expect(spoofDialogText).not.toContain("Forged project");
+    expect(spoofDialogText).toContain("4 canvas(es)");
+    expect(spoofDialogText).not.toContain("999 canvas(es)");
+    await page.getByRole("button", { name: "Keep drawings" }).click();
     const deleteArgs = { expectedCatalogRevision: duplicate.catalogRevision, idempotencyKey: "mcp-delete-workspace-e2e", workspaceId: created.activeWorkspaceId };
     const needsApproval = await result(await mcp.call("delete_workspace", deleteArgs));
     expect(needsApproval.status).toBe("NEEDS_CONFIRMATION");

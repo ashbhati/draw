@@ -50,9 +50,6 @@ type PendingConfirmation = {
   action: "open_document" | "delete_canvas" | "delete_workspace";
   filename?: string;
   targetId?: string;
-  targetName?: string;
-  workspaceName?: string;
-  canvasCount?: number;
   expectedCatalogRevision?: number;
   idempotencyKey?: string;
   fingerprint: string;
@@ -588,11 +585,9 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               if (typeof body.filename !== "string" || body.filename.length > 160 || body.filename.includes("/") || body.filename.includes("\\")) {
                 sendJson(response, 400, { error: "Confirmation filename must be a basename." }); return;
               }
-            } else if (typeof body.targetId !== "string" || body.targetId.length > 200 || typeof body.targetName !== "string" || body.targetName.length > 200
-              || typeof body.workspaceName !== "string" || body.workspaceName.length > 200
+            } else if (typeof body.targetId !== "string" || body.targetId.length > 200
               || !Number.isSafeInteger(body.expectedCatalogRevision) || (body.expectedCatalogRevision as number) < 0
-              || typeof body.idempotencyKey !== "string" || body.idempotencyKey.length < 1 || body.idempotencyKey.length > 200
-              || action === "delete_workspace" && (!Number.isSafeInteger(body.canvasCount) || (body.canvasCount as number) < 0)) {
+              || typeof body.idempotencyKey !== "string" || body.idempotencyKey.length < 1 || body.idempotencyKey.length > 200) {
               sendJson(response, 400, { error: "Workspace deletion confirmation is invalid." }); return;
             }
             const token = randomUUID();
@@ -601,8 +596,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               token, clientId: activeClientId, clientIdentity: authenticated.clientIdentity, documentId: document.document.id,
               expectedDocumentRevision: document.document.documentRevision, action,
               ...(action === "open_document" ? { filename: body.filename as string } : {
-                targetId: body.targetId as string, targetName: body.targetName as string, workspaceName: body.workspaceName as string,
-                ...(typeof body.canvasCount === "number" ? { canvasCount: body.canvasCount } : {}),
+                targetId: body.targetId as string,
                 expectedCatalogRevision: body.expectedCatalogRevision as number, idempotencyKey: body.idempotencyKey as string,
               }),
               fingerprint: body.fingerprint, expiresAt, decision: "pending",
@@ -610,8 +604,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
             server.ws.send("draw:confirmation-required", {
               token, clientId: activeClientId, clientIdentity: authenticated.clientIdentity, action, expiresAt,
               ...(action === "open_document" ? { filename: body.filename as string } : {
-                targetId: body.targetId as string, targetName: body.targetName as string, workspaceName: body.workspaceName as string,
-                ...(typeof body.canvasCount === "number" ? { canvasCount: body.canvasCount } : {}),
+                targetId: body.targetId as string, expectedCatalogRevision: body.expectedCatalogRevision as number,
               }),
             });
             sendJson(response, 202, { status: "NEEDS_CONFIRMATION", confirmationToken: token, expiresAt });

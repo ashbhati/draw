@@ -3,7 +3,7 @@ import { normalizeDrawImageAttributions } from "../document/attribution";
 import { compactOperationLedger, operationLedgerKey, OPERATION_SNAPSHOT_RETENTION_MS, OPERATION_TOMBSTONE_RETENTION_MS, sameSceneSnapshot, type DurableMcpOperation, type DurableMcpOperationResult, type DurableMcpRedo, type DurableMcpTombstone, type OperationLedgerEntry } from "../integrations/operation-ledger";
 
 const DATABASE_NAME = "draw-local";
-const DATABASE_VERSION = 7;
+const DATABASE_VERSION = 8;
 const DOCUMENTS_STORE = "documents";
 const MCP_OPERATIONS_STORE = "mcpOperations";
 const MCP_WORKSPACE_OPERATIONS_STORE = "mcpWorkspaceOperations";
@@ -24,6 +24,8 @@ const AUTOSAVE_SESSION_ID = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-
 let autosaveSequence = 0;
 const MCP_COMPACTION_INTERVAL = 32;
 const MAX_DOCUMENT_SNAPSHOTS = 100;
+export const MCP_WORKSPACE_RECEIPT_LIMIT = 1_000;
+const MCP_WORKSPACE_RECEIPT_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 
 type AutosaveOrder = { sessionId: string; sequence: number };
 
@@ -60,6 +62,17 @@ export interface McpWorkspaceOperationResult {
   canvas?: DrawCanvas;
   workspaces: DrawWorkspace[];
   canvases: DrawCanvas[];
+  operation?: { type: string; workspaceId?: string; canvasId?: string; committedCatalogRevision?: number };
+}
+
+interface McpWorkspaceOperationReceipt {
+  clientIdentity: string;
+  idempotencyKey: string;
+  payloadHash: string;
+  completedAt: number;
+  operation: { type: string; workspaceId?: string; canvasId?: string; committedCatalogRevision: number };
+  workspaceIds: string[];
+  canvasIds: string[];
 }
 
 export interface McpWorkspaceCatalog extends McpWorkspaceOperationResult {}
@@ -181,6 +194,43 @@ function openDatabase(): Promise<IDBDatabase> {
             };
           }
         };
+      }
+      if (event.oldVersion < 8) {
+        const receipts = request.transaction!.objectStore(MCP_WORKSPACE_OPERATIONS_STORE);
+        const keys = receipts.getAllKeys();
+        const values = receipts.getAll();
+        let pending = 2;
+        const compactLegacyReceipts = () => {
+          pending -= 1;
+          if (pending) return;
+          const rows = (values.result as Array<any>).map((row, index) => {
+            if (!row || typeof row !== "object" || typeof row.clientIdentity !== "string" || typeof row.idempotencyKey !== "string" || typeof row.payloadHash !== "string") return null;
+            const oldResult = row?.result;
+            const operation = oldResult?.operation;
+            const workspaceId = operation?.workspaceId ?? oldResult?.workspace?.id ?? oldResult?.activeWorkspaceId;
+            const canvasId = operation?.canvasId ?? oldResult?.canvas?.id ?? oldResult?.activeCanvasId;
+            const compact: McpWorkspaceOperationReceipt = {
+              clientIdentity: row.clientIdentity,
+              idempotencyKey: row.idempotencyKey,
+              payloadHash: row.payloadHash,
+              completedAt: Number.isFinite(row.completedAt) ? row.completedAt : Date.now(),
+              operation: {
+                type: typeof operation?.type === "string" ? operation.type : "legacy_workspace_operation",
+                ...(typeof workspaceId === "string" ? { workspaceId } : {}),
+                ...(typeof canvasId === "string" ? { canvasId } : {}),
+                committedCatalogRevision: Number.isSafeInteger(oldResult?.catalogRevision) ? oldResult.catalogRevision : 0,
+              },
+              workspaceIds: typeof workspaceId === "string" ? [workspaceId] : [],
+              canvasIds: typeof canvasId === "string" ? [canvasId] : [],
+            };
+            return { key: (keys.result as IDBValidKey[])[index], compact };
+          }).filter((entry): entry is { key: IDBValidKey; compact: McpWorkspaceOperationReceipt } => !!entry && entry.compact.completedAt >= Date.now() - MCP_WORKSPACE_RECEIPT_RETENTION_MS)
+            .sort((a, b) => b.compact.completedAt - a.compact.completedAt).slice(0, MCP_WORKSPACE_RECEIPT_LIMIT);
+          const retained = new Set(rows.map((entry) => JSON.stringify(entry.key)));
+          (keys.result as IDBValidKey[]).forEach((key) => { if (!retained.has(JSON.stringify(key))) receipts.delete(key); });
+          rows.forEach(({ key, compact }) => receipts.put(compact, key));
+        };
+        keys.onsuccess = values.onsuccess = compactLegacyReceipts;
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -434,15 +484,37 @@ export async function loadMcpWorkspaceOperationReceipt(
 ): Promise<McpWorkspaceOperationResult | null> {
   const db = await openDatabase();
   try {
-    const tx = db.transaction(MCP_WORKSPACE_OPERATIONS_STORE, "readonly");
+    const tx = db.transaction([MCP_WORKSPACE_OPERATIONS_STORE, WORKSPACES_STORE, CANVASES_STORE, WORKSPACE_META_STORE, DOCUMENTS_STORE], "readonly");
     const key = JSON.stringify([clientIdentity, idempotencyKey]);
-    const request = tx.objectStore(MCP_WORKSPACE_OPERATIONS_STORE).get(key);
-    const [receipt] = await Promise.all([requestValue<{ payloadHash?: string; result?: McpWorkspaceOperationResult } | undefined>(request), waitForTransaction(tx)]);
+    const receiptRequest = tx.objectStore(MCP_WORKSPACE_OPERATIONS_STORE).get(key);
+    const workspaceRequest = tx.objectStore(WORKSPACES_STORE).getAll();
+    const canvasRequest = tx.objectStore(CANVASES_STORE).getAll();
+    const pointerRequest = tx.objectStore(WORKSPACE_META_STORE).get(ACTIVE_POINTER_KEY);
+    const revisionRequest = tx.objectStore(WORKSPACE_META_STORE).get(WORKSPACE_CATALOG_REVISION_KEY);
+    const documentRequest = tx.objectStore(DOCUMENTS_STORE).get(CURRENT_DOCUMENT_KEY);
+    const [receipt, workspaces, canvases, pointer, revision, activeDocument] = await Promise.all([
+      requestValue<McpWorkspaceOperationReceipt | undefined>(receiptRequest), requestValue<DrawWorkspace[]>(workspaceRequest),
+      requestValue<DrawCanvas[]>(canvasRequest), requestValue<ActiveCanvasPointer | undefined>(pointerRequest),
+      requestValue<number | undefined>(revisionRequest), requestValue<DrawDocument | undefined>(documentRequest), waitForTransaction(tx),
+    ]).then(([a, b, c, d, e, f]) => [a, b, c, d, e, f] as const);
     if (!receipt) return null;
+    if (!Number.isFinite(receipt.completedAt) || receipt.completedAt < Date.now() - MCP_WORKSPACE_RECEIPT_RETENTION_MS) return null;
     if (receipt.payloadHash !== payloadHash) throw new Error("IDEMPOTENCY_KEY_REUSE: This key was already used with a different workspace payload.");
-    if (!receipt.result || !receipt.result.activeDocument) throw new Error("The workspace MCP receipt is malformed; refusing to replay it.");
-    validateDrawDocument(receipt.result.activeDocument);
-    return structuredClone(receipt.result);
+    if (!receipt.operation || !pointer || !activeDocument) throw new Error("The workspace MCP receipt or active catalog is malformed; refusing to replay it.");
+    validateDrawDocument(activeDocument);
+    const sortedWorkspaces = workspaces.sort((a, b) => a.createdAt - b.createdAt);
+    const sortedCanvases = canvases.sort((a, b) => a.createdAt - b.createdAt);
+    return {
+      catalogRevision: Number.isSafeInteger(revision) ? revision! : 0,
+      activeWorkspaceId: pointer.workspaceId,
+      activeCanvasId: pointer.canvasId,
+      activeDocument,
+      workspaces: sortedWorkspaces,
+      canvases: sortedCanvases,
+      ...(receipt.operation.workspaceId ? { workspace: sortedWorkspaces.find((item) => item.id === receipt.operation.workspaceId) } : {}),
+      ...(receipt.operation.canvasId ? { canvas: sortedCanvases.find((item) => item.id === receipt.operation.canvasId) } : {}),
+      operation: { ...receipt.operation },
+    };
   } finally { db.close(); }
 }
 
@@ -471,6 +543,7 @@ export async function commitMcpWorkspaceOperation(request: McpWorkspaceOperation
     let activePointer: ActiveCanvasPointer | undefined;
     let workspaces: DrawWorkspace[] = [];
     let canvases: DrawCanvas[] = [];
+    let originalCanvases: DrawCanvas[] = [];
     let currentRevision = 0;
     let processing = false;
     const abort = (error: unknown) => {
@@ -527,8 +600,40 @@ export async function commitMcpWorkspaceOperation(request: McpWorkspaceOperation
         ...(canvas ? { canvas } : {}),
         workspaces: structuredClone(workspaces),
         canvases: structuredClone(canvases),
+        operation: {
+          type: request.action.type,
+          ...(request.action.type !== "delete_workspace" && request.action.type !== "delete_canvas" && workspace ? { workspaceId: workspace.id } : {}),
+          ...(request.action.type !== "delete_workspace" && request.action.type !== "delete_canvas" && canvas ? { canvasId: canvas.id } : {}),
+          committedCatalogRevision: nextRevision,
+        },
       };
-      receipts.put({ clientIdentity: request.clientIdentity, idempotencyKey: request.idempotencyKey, payloadHash: request.payloadHash, completedAt: now(), result: structuredClone(result) }, receiptKey);
+      const receipt: McpWorkspaceOperationReceipt = {
+        clientIdentity: request.clientIdentity,
+        idempotencyKey: request.idempotencyKey,
+        payloadHash: request.payloadHash,
+        completedAt: now(),
+        operation: { ...result.operation!, committedCatalogRevision: nextRevision },
+        workspaceIds: result.operation?.workspaceId ? [result.operation.workspaceId] : [],
+        canvasIds: result.operation?.canvasId ? [result.operation.canvasId] : [],
+      };
+      receipts.put(receipt, receiptKey);
+      const keysRequest = receipts.getAllKeys();
+      const valuesRequest = receipts.getAll();
+      let pendingPruneReads = 2;
+      const pruneReceipts = () => {
+        pendingPruneReads -= 1;
+        if (pendingPruneReads) return;
+        const keys = keysRequest.result as IDBValidKey[];
+        const rows = valuesRequest.result as McpWorkspaceOperationReceipt[];
+        const cutoff = now() - MCP_WORKSPACE_RECEIPT_RETENTION_MS;
+        const keep = rows.map((row, index) => ({ row, key: keys[index] }))
+          .filter(({ row }) => row?.completedAt >= cutoff)
+          .sort((a, b) => (b.row.operation?.committedCatalogRevision ?? 0) - (a.row.operation?.committedCatalogRevision ?? 0))
+          .slice(0, MCP_WORKSPACE_RECEIPT_LIMIT);
+        const kept = new Set(keep.map(({ key }) => JSON.stringify(key)));
+        keys.forEach((key) => { if (!kept.has(JSON.stringify(key))) receipts.delete(key); });
+      };
+      keysRequest.onsuccess = valuesRequest.onsuccess = pruneReceipts;
     };
     const selectFirstCanvas = (workspace: DrawWorkspace, callback: (canvas: DrawCanvas, doc: DrawDocument) => void) => {
       const candidate = canvases.filter((item) => item.workspaceId === workspace.id).sort((a, b) => a.createdAt - b.createdAt)[0]
@@ -544,20 +649,36 @@ export async function commitMcpWorkspaceOperation(request: McpWorkspaceOperation
         // the mutation and receipt remain in this same transaction.
         receipt.onerror = () => abort(receipt.error ?? new Error("Could not read workspace MCP operation receipt."));
         receipt.onsuccess = () => {
-          const stored = receipt.result as { payloadHash?: string; result?: McpWorkspaceOperationResult } | undefined;
+          const findWorkspace = (id: string) => workspaces.find((item) => item.id === id);
+          const findCanvas = (id: string) => canvases.find((item) => item.id === id);
+          const stored = receipt.result as McpWorkspaceOperationReceipt | undefined;
           if (stored) {
+            if (!Number.isFinite(stored.completedAt) || stored.completedAt < now() - MCP_WORKSPACE_RECEIPT_RETENTION_MS) {
+              receipts.delete(receiptKey);
+            } else {
             if (stored.payloadHash !== request.payloadHash) { abort(new Error("IDEMPOTENCY_KEY_REUSE: This key was already used with a different workspace payload.")); return; }
-            if (!stored.result || !stored.result.activeDocument) { abort(new Error("The workspace MCP receipt is malformed; refusing to replay it.")); return; }
-            result = structuredClone(stored.result);
+            if (!stored.operation || !activePointer || !activeDocument) { abort(new Error("The workspace MCP receipt or active catalog is malformed; refusing to replay it.")); return; }
+            const operationWorkspace = stored.operation.workspaceId ? findWorkspace(stored.operation.workspaceId) : undefined;
+            const operationCanvas = stored.operation.canvasId ? findCanvas(stored.operation.canvasId) : undefined;
+            result = {
+              catalogRevision: currentRevision,
+              activeWorkspaceId: activePointer.workspaceId,
+              activeCanvasId: activePointer.canvasId,
+              activeDocument: structuredClone(activeDocument),
+              workspaces: structuredClone(workspaces),
+              canvases: structuredClone(canvases),
+              ...(operationWorkspace ? { workspace: structuredClone(operationWorkspace) } : {}),
+              ...(operationCanvas ? { canvas: structuredClone(operationCanvas) } : {}),
+              operation: { ...stored.operation },
+            };
             return;
+            }
           }
           if (currentRevision !== request.expectedCatalogRevision) {
             abort(new Error(`CONFLICT: Workspace catalog revision is ${currentRevision}, expected ${request.expectedCatalogRevision}. Read the workspace list and retry.`));
             return;
           }
           const action = request.action;
-          const findWorkspace = (id: string) => workspaces.find((item) => item.id === id);
-          const findCanvas = (id: string) => canvases.find((item) => item.id === id);
           switch (action.type) {
             case "create_workspace": {
               const timestamp = now();
@@ -666,7 +787,7 @@ export async function commitMcpWorkspaceOperation(request: McpWorkspaceOperation
     revisionRequest.onsuccess = () => { currentRevision = Number.isSafeInteger(revisionRequest.result) ? revisionRequest.result as number : 0; ready(); };
     pointerRequest.onsuccess = () => { activePointer = pointerRequest.result as ActiveCanvasPointer | undefined; ready(); };
     workspacesRequest.onsuccess = () => { workspaces = workspacesRequest.result as DrawWorkspace[]; ready(); };
-    canvasesRequest.onsuccess = () => { canvases = canvasesRequest.result as DrawCanvas[]; ready(); };
+    canvasesRequest.onsuccess = () => { canvases = canvasesRequest.result as DrawCanvas[]; originalCanvases = [...canvases]; ready(); };
     aliasRequest.onsuccess = () => { activeDocument = aliasRequest.result as DrawDocument | undefined; ready(); };
     tx.oncomplete = () => { db.close(); if (failure) reject(failure); else if (result) resolve(result); else reject(new Error("Workspace operation completed without a result.")); };
     tx.onerror = tx.onabort = () => { db.close(); reject(failure ?? tx.error ?? new Error("Workspace MCP operation was cancelled.")); };
@@ -681,13 +802,30 @@ export async function commitMcpWorkspaceOperation(request: McpWorkspaceOperation
         let left = 2;
         const prune = () => {
           left -= 1; if (left) return;
-          const ids = action.type === "delete_canvas"
-            ? new Set(canvases.filter((item) => item.id === action.canvasId).map((item) => item.documentId))
-            : new Set(canvases.filter((item) => item.workspaceId === action.workspaceId).map((item) => item.documentId));
+          const deletedCanvases = action.type === "delete_canvas"
+            ? originalCanvases.filter((item) => item.id === action.canvasId)
+            : originalCanvases.filter((item) => item.workspaceId === action.workspaceId);
+          const ids = new Set(deletedCanvases.map((item) => item.documentId));
           (valuesRequest.result as Array<{ documentId?: string }>).forEach((item, index) => {
             if (item?.documentId && ids.has(item.documentId)) tx.objectStore(MCP_OPERATIONS_STORE).delete((keysRequest.result as IDBValidKey[])[index]);
           });
-          apply();
+            const workspaceReceiptStore = tx.objectStore(MCP_WORKSPACE_OPERATIONS_STORE);
+            const receiptKeys = workspaceReceiptStore.getAllKeys();
+            const receiptValues = workspaceReceiptStore.getAll();
+            let receiptReads = 2;
+            const pruneWorkspaceReceipts = () => {
+              receiptReads -= 1; if (receiptReads) return;
+              const removedCanvasIds = new Set(deletedCanvases.map((item) => item.id));
+              const removedWorkspaceIds = action.type === "delete_workspace" ? new Set([action.workspaceId]) : new Set<string>();
+              (receiptValues.result as Array<Partial<McpWorkspaceOperationReceipt>>).forEach((receipt, index) => {
+                const refersToRemovedWorkspace = (receipt.workspaceIds ?? []).some((id) => removedWorkspaceIds.has(id));
+                const refersToRemovedCanvas = (receipt.canvasIds ?? []).some((id) => removedCanvasIds.has(id));
+                if (refersToRemovedWorkspace || refersToRemovedCanvas) workspaceReceiptStore.delete((receiptKeys.result as IDBValidKey[])[index]);
+              });
+              apply();
+            };
+            receiptKeys.onsuccess = receiptValues.onsuccess = pruneWorkspaceReceipts;
+            receiptKeys.onerror = receiptValues.onerror = () => abort(new Error("Could not inspect workspace MCP receipts before deletion."));
         };
         keysRequest.onsuccess = valuesRequest.onsuccess = prune;
         keysRequest.onerror = valuesRequest.onerror = () => abort(new Error("Could not inspect document history before deletion."));
@@ -881,7 +1019,7 @@ export async function duplicateCanvas(canvasId: string, name?: string): Promise<
 export async function deleteWorkspace(workspaceId: string): Promise<void> {
   const db = await openDatabase();
   try {
-    const tx = db.transaction([WORKSPACES_STORE, CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE], "readwrite");
+    const tx = db.transaction([WORKSPACES_STORE, CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE, MCP_WORKSPACE_OPERATIONS_STORE], "readwrite");
     const workspaces = tx.objectStore(WORKSPACES_STORE);
     const canvases = tx.objectStore(CANVASES_STORE);
     const documents = tx.objectStore(DOCUMENTS_STORE);
@@ -894,6 +1032,8 @@ export async function deleteWorkspace(workspaceId: string): Promise<void> {
       documents.get(CURRENT_DOCUMENT_KEY),
       tx.objectStore(MCP_OPERATIONS_STORE).getAllKeys(),
       tx.objectStore(MCP_OPERATIONS_STORE).getAll(),
+      tx.objectStore(MCP_WORKSPACE_OPERATIONS_STORE).getAllKeys(),
+      tx.objectStore(MCP_WORKSPACE_OPERATIONS_STORE).getAll(),
     ];
     let pending = requests.length;
     let failure: Error | undefined;
@@ -908,7 +1048,10 @@ export async function deleteWorkspace(workspaceId: string): Promise<void> {
       const alias = requests[4].result as DrawDocument | undefined;
       const operationKeys = requests[5].result as IDBValidKey[];
       const operations = requests[6].result as Array<{ documentId?: string }>;
+      const workspaceReceiptKeys = requests[7].result as IDBValidKey[];
+      const workspaceReceipts = requests[8].result as Array<Partial<McpWorkspaceOperationReceipt>>;
       const removedIds = new Set(removed.map((canvas) => canvas.documentId));
+      const removedCanvasIds = new Set(removed.map((canvas) => canvas.id));
       workspaces.delete(workspaceId);
       incrementWorkspaceCatalogRevision(meta);
       for (const canvas of removed) {
@@ -919,6 +1062,11 @@ export async function deleteWorkspace(workspaceId: string): Promise<void> {
         tx.objectStore(MCP_REDO_STORE).delete(canvas.documentId);
       }
       operations.forEach((operation, index) => { if (operation?.documentId && removedIds.has(operation.documentId)) tx.objectStore(MCP_OPERATIONS_STORE).delete(operationKeys[index]); });
+      workspaceReceipts.forEach((receipt, index) => {
+        if ((receipt.workspaceIds ?? []).includes(workspaceId) || (receipt.canvasIds ?? []).some((id) => removedCanvasIds.has(id))) {
+          tx.objectStore(MCP_WORKSPACE_OPERATIONS_STORE).delete(workspaceReceiptKeys[index]);
+        }
+      });
       if (!active || !removed.some((canvas) => canvas.id === active.canvasId)) return;
       const candidates = allCanvases.filter((canvas) => canvas.workspaceId !== workspaceId).sort((a, b) => a.createdAt - b.createdAt);
       let index = 0;
@@ -989,11 +1137,12 @@ export async function setActiveCanvas(canvasId: string): Promise<void> {
 export async function deleteCanvas(canvasId: string): Promise<void> {
   const db = await openDatabase();
   try {
-    const tx = db.transaction([CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE], "readwrite");
+    const tx = db.transaction([CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE, MCP_OPERATIONS_STORE, MCP_UNDO_STORE, MCP_REDO_STORE, MCP_WORKSPACE_OPERATIONS_STORE], "readwrite");
     const canvases = tx.objectStore(CANVASES_STORE); const req = canvases.get(canvasId); const meta = tx.objectStore(WORKSPACE_META_STORE);
     const activeRequest = meta.get(ACTIVE_POINTER_KEY);
     const aliasRequest = tx.objectStore(DOCUMENTS_STORE).get(CURRENT_DOCUMENT_KEY);
     let reads = 3;
+    let failure: Error | undefined;
     let canvas: DrawCanvas | undefined;
     let active: ActiveCanvasPointer | undefined;
     let alias: DrawDocument | undefined;
@@ -1012,6 +1161,19 @@ export async function deleteCanvas(canvasId: string): Promise<void> {
       documents.delete(CURRENT_WRITE_ORDER_KEY);
       tx.objectStore(MCP_UNDO_STORE).delete(canvas.documentId);
       tx.objectStore(MCP_REDO_STORE).delete(canvas.documentId);
+      const workspaceReceiptStore = tx.objectStore(MCP_WORKSPACE_OPERATIONS_STORE);
+      const workspaceReceiptKeys = workspaceReceiptStore.getAllKeys();
+      const workspaceReceiptValues = workspaceReceiptStore.getAll();
+      let workspaceReceiptReads = 2;
+      const pruneWorkspaceReceipts = () => {
+        workspaceReceiptReads -= 1;
+        if (workspaceReceiptReads) return;
+        (workspaceReceiptValues.result as Array<Partial<McpWorkspaceOperationReceipt>>).forEach((receipt, index) => {
+          if ((receipt.canvasIds ?? []).includes(canvas!.id)) workspaceReceiptStore.delete((workspaceReceiptKeys.result as IDBValidKey[])[index]);
+        });
+      };
+      workspaceReceiptKeys.onsuccess = workspaceReceiptValues.onsuccess = pruneWorkspaceReceipts;
+      workspaceReceiptKeys.onerror = workspaceReceiptValues.onerror = () => { failure = new Error("Could not clean workspace MCP receipts before canvas deletion."); tx.abort(); };
       const operationStore = tx.objectStore(MCP_OPERATIONS_STORE);
       const operationKeys = operationStore.getAllKeys();
       const operationValues = operationStore.getAll();
@@ -1056,7 +1218,7 @@ export async function deleteCanvas(canvasId: string): Promise<void> {
     req.onsuccess = finish;
     activeRequest.onsuccess = finish;
     aliasRequest.onsuccess = finish;
-    await waitForTransaction(tx);
+    try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
   } finally { db.close(); }
 }
 

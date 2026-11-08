@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import "fake-indexeddb/auto";
 import { createEmptyDocument, parseDrawFile, serializeDrawFile } from "../document/document";
-import { commitMcpOperation, commitMcpWorkspaceOperation, createCanvas, createWorkspace, deleteCanvas, deleteWorkspace, duplicateCanvas, DrawStorageRecoveryError, getMcpWorkspaceCatalog, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadMcpOperation, loadMcpWorkspaceOperationReceipt, renameCanvas, renameWorkspace, restoreMcpCommandSnapshot, saveCurrentDocument, setActiveCanvas } from "./storage";
+import { commitMcpOperation, commitMcpWorkspaceOperation, createCanvas, createWorkspace, deleteCanvas, deleteWorkspace, duplicateCanvas, DrawStorageRecoveryError, getMcpWorkspaceCatalog, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadMcpOperation, loadMcpWorkspaceOperationReceipt, MCP_WORKSPACE_RECEIPT_LIMIT, renameCanvas, renameWorkspace, restoreMcpCommandSnapshot, saveCurrentDocument, setActiveCanvas } from "./storage";
 import { canRedoMcpOperation, canUndoMcpOperation, OPERATION_RESULT_RETENTION_MS, OPERATION_SNAPSHOT_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "../integrations/operation-ledger";
 
 describe("local Draw autosave", () => {
@@ -13,6 +13,22 @@ describe("local Draw autosave", () => {
       request.onblocked = () => resolve();
     });
   });
+
+  async function getWorkspaceReceipts(): Promise<any[]> {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("draw-local");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      const tx = database.transaction("mcpWorkspaceOperations", "readonly");
+      const request = tx.objectStore("mcpWorkspaceOperations").getAll();
+      return await new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result as any[]);
+        request.onerror = () => reject(request.error);
+      });
+    } finally { database.close(); }
+  }
 
   it("saves and restores an editable Draw document without flattening it", async () => {
     const doc = createEmptyDocument("Research map");
@@ -118,8 +134,10 @@ describe("local Draw autosave", () => {
     const created = await commitMcpWorkspaceOperation(request);
     const replay = await commitMcpWorkspaceOperation(request);
 
-    expect(replay).toEqual(created);
-    expect(await loadMcpWorkspaceOperationReceipt("agent-one", "create-platform", "payload-create-platform")).toEqual(created);
+    expect(replay.activeWorkspaceId).toBe(created.activeWorkspaceId);
+    expect(replay.activeCanvasId).toBe(created.activeCanvasId);
+    expect(replay.operation).toMatchObject({ type: "create_workspace", workspaceId: created.workspace?.id, canvasId: created.canvas?.id });
+    expect(await loadMcpWorkspaceOperationReceipt("agent-one", "create-platform", "payload-create-platform")).toMatchObject({ activeWorkspaceId: created.activeWorkspaceId, activeCanvasId: created.activeCanvasId });
     expect(created.workspace).toMatchObject({ name: "Platform" });
     expect(created.canvas).toMatchObject({ workspaceId: created.workspace?.id, name: "Untitled drawing" });
     expect(created.activeWorkspaceId).toBe(created.workspace?.id);
@@ -128,6 +146,98 @@ describe("local Draw autosave", () => {
     expect(created.catalogRevision).toBe(before.catalogRevision + 1);
     expect((await listWorkspaces()).filter((item) => item.name === "Platform")).toHaveLength(1);
     expect((await listCanvases(created.workspace!.id))).toHaveLength(1);
+  });
+
+  it("replays only compact operation metadata and rebuilds current active document and catalog", async () => {
+    await saveCurrentDocument(createEmptyDocument("Before"));
+    const initial = await getMcpWorkspaceCatalog();
+    const request = {
+      clientIdentity: "agent-one", idempotencyKey: "stable-create", payloadHash: "stable-create-payload",
+      expectedCatalogRevision: initial.catalogRevision, action: { type: "create_workspace" as const, name: "Agent workspace" },
+    };
+    const applied = await commitMcpWorkspaceOperation(request);
+    const humanWorkspace = await createWorkspace("Human workspace");
+    const humanCanvas = await createCanvas(humanWorkspace.id, "Human edit");
+    await setActiveCanvas(humanCanvas.id);
+    const catalogAfterHumanSwitch = await getMcpWorkspaceCatalog();
+    await commitMcpWorkspaceOperation({
+      clientIdentity: "human-editor", idempotencyKey: "human-rename-canvas", payloadHash: "human-rename-canvas-payload",
+      expectedCatalogRevision: catalogAfterHumanSwitch.catalogRevision,
+      action: { type: "rename_canvas", canvasId: humanCanvas.id, name: "Human edit after agent" },
+    });
+    expect((await getMcpWorkspaceCatalog()).activeCanvasId).toBe(humanCanvas.id);
+    const replay = await loadMcpWorkspaceOperationReceipt("agent-one", "stable-create", "stable-create-payload");
+    const commitReplay = await commitMcpWorkspaceOperation(request);
+    expect(replay?.catalogRevision).toBeGreaterThan(applied.catalogRevision);
+    expect(replay?.activeWorkspaceId).toBe(humanWorkspace.id);
+    expect(replay?.activeCanvasId).toBe(humanCanvas.id);
+    expect(replay?.activeDocument.document.title).toBe("Human edit after agent");
+    expect(replay?.operation).toMatchObject({ type: "create_workspace", workspaceId: applied.workspace?.id, canvasId: applied.canvas?.id });
+    expect(commitReplay.activeCanvasId).toBe(humanCanvas.id);
+    expect(commitReplay.activeDocument.document.title).toBe("Human edit after agent");
+    const receipts = await getWorkspaceReceipts();
+    const receiptJson = JSON.stringify(receipts);
+    expect(receiptJson).not.toContain("activeDocument");
+    expect(receiptJson).not.toContain("human-only-element");
+  });
+
+  it("removes workspace receipts that refer to deleted local drawings and bounds receipt retention", async () => {
+    await saveCurrentDocument(createEmptyDocument("Root"));
+    const initial = await getMcpWorkspaceCatalog();
+    const workspace = await commitMcpWorkspaceOperation({
+      clientIdentity: "agent-one", idempotencyKey: "private-create", payloadHash: "private-create-payload",
+      expectedCatalogRevision: initial.catalogRevision, action: { type: "create_workspace", name: "Private workspace" },
+    });
+    const privateDoc = structuredClone(workspace.activeDocument);
+    privateDoc.document.assets.privateImage = { id: "privateImage", dataURL: "data:image/png;base64,PRIVATE_IMAGE_BYTES" };
+    privateDoc.document.elements.push({ id: "private-element", type: "image", fileId: "privateImage" });
+    await saveCurrentDocument(privateDoc);
+    const deleted = await commitMcpWorkspaceOperation({
+      clientIdentity: "agent-one", idempotencyKey: "delete-private", payloadHash: "delete-private-payload",
+      expectedCatalogRevision: (await getMcpWorkspaceCatalog()).catalogRevision, action: { type: "delete_workspace", workspaceId: workspace.activeWorkspaceId },
+    });
+    expect(deleted.workspaces.some((item) => item.id === workspace.activeWorkspaceId)).toBe(false);
+    let receipts = await getWorkspaceReceipts();
+    expect(receipts.every((receipt) => !JSON.stringify(receipt).includes(workspace.activeWorkspaceId))).toBe(true);
+    expect(receipts.every((receipt) => !JSON.stringify(receipt).includes(workspace.activeCanvasId))).toBe(true);
+    expect(receipts.every((receipt) => !JSON.stringify(receipt).includes("PRIVATE_IMAGE_BYTES"))).toBe(true);
+    expect(receipts.every((receipt) => !JSON.stringify(receipt).includes("private-element"))).toBe(true);
+
+    let revision = deleted.catalogRevision;
+    const current = (await getMcpWorkspaceCatalog()).activeWorkspaceId;
+    for (let index = 0; index < MCP_WORKSPACE_RECEIPT_LIMIT + 1; index += 1) {
+      const result = await commitMcpWorkspaceOperation({
+        clientIdentity: "agent-one", idempotencyKey: `bounded-${index}`, payloadHash: `bounded-payload-${index}`,
+        expectedCatalogRevision: revision, action: { type: "rename_workspace", workspaceId: current, name: `Workspace ${index}` },
+      });
+      revision = result.catalogRevision;
+    }
+    receipts = await getWorkspaceReceipts();
+    expect(receipts.length).toBeLessThanOrEqual(MCP_WORKSPACE_RECEIPT_LIMIT);
+    expect(receipts.some((receipt) => receipt.idempotencyKey === "bounded-0")).toBe(false);
+    expect(receipts.some((receipt) => receipt.idempotencyKey === `bounded-${MCP_WORKSPACE_RECEIPT_LIMIT}`)).toBe(true);
+  });
+
+  it("cleans up compact MCP receipt references for canvases and workspaces deleted in Draw", async () => {
+    await saveCurrentDocument(createEmptyDocument("Root"));
+    let catalog = await getMcpWorkspaceCatalog();
+    const createdWorkspace = await commitMcpWorkspaceOperation({
+      clientIdentity: "agent-one", idempotencyKey: "ui-delete-workspace", payloadHash: "ui-delete-workspace-payload",
+      expectedCatalogRevision: catalog.catalogRevision, action: { type: "create_workspace", name: "UI cleanup" },
+    });
+    catalog = await getMcpWorkspaceCatalog();
+    const createdCanvas = await commitMcpWorkspaceOperation({
+      clientIdentity: "agent-one", idempotencyKey: "ui-delete-canvas", payloadHash: "ui-delete-canvas-payload",
+      expectedCatalogRevision: catalog.catalogRevision,
+      action: { type: "create_canvas", workspaceId: createdWorkspace.activeWorkspaceId, name: "Temporary canvas" },
+    });
+    const deletedCanvasId = createdCanvas.canvas!.id;
+    await deleteCanvas(deletedCanvasId);
+    let receipts = await getWorkspaceReceipts();
+    expect(receipts.every((receipt) => !(receipt.canvasIds ?? []).includes(deletedCanvasId))).toBe(true);
+    await deleteWorkspace(createdWorkspace.activeWorkspaceId);
+    receipts = await getWorkspaceReceipts();
+    expect(receipts.every((receipt) => !(receipt.workspaceIds ?? []).includes(createdWorkspace.activeWorkspaceId))).toBe(true);
   });
 
   it("keeps workspace receipts scoped to the authenticated caller", async () => {
@@ -139,7 +249,10 @@ describe("local Draw autosave", () => {
       action: { type: "create_workspace", name: "One" },
     });
     await expect(loadMcpWorkspaceOperationReceipt("agent-two", "same-key", "same-payload")).resolves.toBeNull();
-    expect(await loadMcpWorkspaceOperationReceipt("agent-one", "same-key", "same-payload")).toEqual(result);
+    expect(await loadMcpWorkspaceOperationReceipt("agent-one", "same-key", "same-payload")).toMatchObject({
+      activeWorkspaceId: result.activeWorkspaceId, activeCanvasId: result.activeCanvasId,
+      operation: { type: "create_workspace", workspaceId: result.workspace?.id, canvasId: result.canvas?.id },
+    });
   });
 
   it("atomically applies MCP canvas rename, duplicate, select, and confirmation-approved delete targets", async () => {

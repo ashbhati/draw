@@ -145,16 +145,14 @@ function registerWorkspaceTool(server: McpServer, toolName: string, action: stri
           action, documentId: activeDocument.document.id,
           expectedDocumentRevision: activeDocument.document.documentRevision,
           expectedCatalogRevision: workspaceInput.expectedCatalogRevision,
-          targetId, targetName: action === "delete_canvas" ? targetCanvas.name : targetWorkspace.name,
-          workspaceName: targetWorkspace.name,
-          canvasCount: action === "delete_workspace" ? catalog.canvases.filter((item: any) => item.workspaceId === targetId).length : undefined,
+          targetId,
           idempotencyKey: workspaceInput.idempotencyKey,
         };
         const fingerprint = createHash("sha256").update(JSON.stringify(confirmationPayload)).digest("hex");
         const confirmation = await bridgeRequest("/__draw/api/confirmations", {
           method: "POST", body: JSON.stringify({ ...confirmationPayload, fingerprint }),
         });
-        return textResult({ status: "NEEDS_CONFIRMATION", action, targetId, targetName: confirmationPayload.targetName, confirmationToken: confirmation.confirmationToken, expiresAt: confirmation.expiresAt });
+        return textResult({ status: "NEEDS_CONFIRMATION", action, targetId, targetName: action === "delete_canvas" ? targetCanvas.name : targetWorkspace.name, confirmationToken: confirmation.confirmationToken, expiresAt: confirmation.expiresAt });
       }
     }
     let document: unknown;

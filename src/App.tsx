@@ -34,7 +34,7 @@ type BridgeCommand = { id: string; clientId: string; clientIdentity: string; ope
 type BridgeFlush = { id: string; clientId: string; clientIdentity: string };
 type BridgeConfirmation = {
   token: string; clientId: string; clientIdentity: string; action: "open_document" | "delete_canvas" | "delete_workspace";
-  filename?: string; targetId?: string; targetName?: string; workspaceName?: string; canvasCount?: number; expiresAt: number;
+  filename?: string; targetId?: string; targetName?: string; workspaceName?: string; canvasCount?: number; expectedCatalogRevision?: number; expiresAt: number;
 };
 type McpPairingRequest = { requestId: string; clientId: string; name: string; fingerprint: string; expiresAt: number; replacesName?: string };
 type McpClientRevokedEvent = { clientIdentity: string };
@@ -956,15 +956,10 @@ export default function App() {
       const payloadHash = await hashMcpOperation("workspace_action", payload);
       const replay = await loadMcpWorkspaceOperationReceipt(event.clientIdentity, input.idempotencyKey, payloadHash);
       if (replay) {
-        setWorkspaces(replay.workspaces);
-        setActiveWorkspaceId(replay.activeWorkspaceId);
-        setCanvases(replay.canvases.filter((canvas) => canvas.workspaceId === replay.activeWorkspaceId));
-        setActiveCanvasId(replay.activeCanvasId);
-        setDocument(replay.activeDocument);
-        if (replay.activeDocument.document.id !== current.document.id) setEditorKey((key) => key + 1);
-        await syncBridgeDocument(replay.activeDocument);
-        setStatus("saved");
-        await acknowledge(replay.activeDocument, replay as unknown as Record<string, unknown>);
+        // Receipt replay reports the operation's stable IDs alongside the
+        // latest stored catalog/document. Never restore an old active-document
+        // snapshot from an idempotency receipt into the editor or bridge.
+        await acknowledge(replay.activeDocument, { ...replay, replayed: true } as unknown as Record<string, unknown>);
         return;
       }
       if (input.expectedCatalogRevision !== catalog.catalogRevision) {
@@ -1608,7 +1603,30 @@ export default function App() {
 
   const handleBridgeConfirmation = useCallback((event: BridgeConfirmation) => {
     if (event.clientId !== clientId.current || !writerOwned.current || !editorSecret.current) return;
-    setConfirmation(event);
+    if (event.action === "open_document") { setConfirmation(event); return; }
+    void (async () => {
+      try {
+        const catalog = await getMcpWorkspaceCatalog();
+        if (catalog.catalogRevision !== event.expectedCatalogRevision) throw new Error("The workspace catalog changed. The agent must list workspaces and request deletion again.");
+        const canvas = event.action === "delete_canvas" ? catalog.canvases.find((item) => item.id === event.targetId) : undefined;
+        const workspace = event.action === "delete_workspace"
+          ? catalog.workspaces.find((item) => item.id === event.targetId)
+          : catalog.workspaces.find((item) => item.id === canvas?.workspaceId);
+        if (!workspace || event.action === "delete_canvas" && !canvas) throw new Error("The requested workspace or canvas no longer exists; no deletion was approved.");
+        setConfirmation({
+          ...event,
+          targetName: event.action === "delete_canvas" ? canvas!.name : workspace.name,
+          workspaceName: workspace.name,
+          ...(event.action === "delete_workspace" ? { canvasCount: catalog.canvases.filter((item) => item.workspaceId === workspace.id).length } : {}),
+        });
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : "Could not verify the requested deletion target.");
+        await fetch(`/__draw/api/confirmations/${encodeURIComponent(event.token)}/respond`, {
+          method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
+          body: JSON.stringify({ clientId: clientId.current, approved: false }),
+        }).catch(() => undefined);
+      }
+    })();
   }, []);
 
   const handleMcpPairingRequest = useCallback((event: McpPairingRequest) => {

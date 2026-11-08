@@ -280,9 +280,11 @@ describe("Draw MCP Vite bridge", () => {
     };
     const challenge = await bridge.mcpRequest("workspace-agent", capability, "POST", "/__draw/api/confirmations", request);
     expect(challenge.status).toBe(202);
-    expect(bridge.events.find(({ event }) => event === "draw:confirmation-required")?.data).toMatchObject({
-      action: "delete_workspace", targetId: "workspace-42", targetName: "Research", canvasCount: 2,
-    });
+    const confirmationEvent = bridge.events.find(({ event }) => event === "draw:confirmation-required")?.data;
+    expect(confirmationEvent).toMatchObject({ action: "delete_workspace", targetId: "workspace-42", expectedCatalogRevision: 3 });
+    expect(confirmationEvent).not.toHaveProperty("targetName");
+    expect(confirmationEvent).not.toHaveProperty("workspaceName");
+    expect(confirmationEvent).not.toHaveProperty("canvasCount");
     expect((await bridge.editorRequest("editor-tab", "POST", `/__draw/api/confirmations/${challenge.body.confirmationToken}/respond`, {
       clientId: "editor-tab", approved: true,
     })).body.status).toBe("APPROVED");

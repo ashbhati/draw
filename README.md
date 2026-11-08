@@ -121,7 +121,7 @@ Available tools:
 
 Every scene mutation should include `documentId` and the latest `expectedDocumentRevision` from `get_current_canvas`. Viewport commands use `expectedViewRevision`. This detects stale agent context before changing the active document.
 
-Workspace mutations instead use `expectedCatalogRevision` from `list_workspaces` and a stable `idempotencyKey`. A successful workspace result returns the updated catalog plus active IDs/document. Receipts are local to this browser profile and are not included in exported `.draw` files.
+Workspace mutations instead use `expectedCatalogRevision` from `list_workspaces` and a stable `idempotencyKey`. A successful workspace result returns the updated catalog plus active IDs/document. Exact retries return the current catalog/document plus compact operation IDs, never an old scene snapshot. Local receipts expire after 30 days, are capped at 1,000 entries, and are removed when their referenced canvas/workspace is deleted. Approval dialogs display workspace/canvas names and workspace canvas counts read from Draw's local catalog; MCP-supplied display text is ignored. Receipts are local to this browser profile and are not included in exported `.draw` files.
 
 `create_diagram` returns `nodes`, mapping each caller-provided node ID to its Draw element ID; `nodeLabels` maps those node IDs to their bound text IDs. `edges` contains each created arrow's `elementId`, optional `labelElementId`, and input index. The result also includes `addedElementIds` and, when supplied, `titleElementId`. Use these returned IDs with `update_elements`.
 
