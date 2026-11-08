@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import "fake-indexeddb/auto";
 import { createEmptyDocument, parseDrawFile, serializeDrawFile } from "../document/document";
-import { addWorkspaceLibraryItem, commitMcpOperation, commitMcpWorkspaceOperation, createCanvas, createWorkspace, deleteCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, duplicateCanvas, DrawStorageRecoveryError, getMcpWorkspaceCatalog, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadMcpOperation, loadMcpWorkspaceOperationReceipt, loadWorkspaceLibrary, MCP_WORKSPACE_RECEIPT_LIMIT, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, restoreMcpCommandSnapshot, saveCurrentDocument, saveWorkspaceLibrary, setActiveCanvas, WorkspaceLibraryConflictError } from "./storage";
+import { addWorkspaceLibraryItem, commitMcpOperation, commitMcpWorkspaceOperation, createCanvas, createWorkspace, deleteCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, duplicateCanvas, DrawStorageRecoveryError, getMcpWorkspaceCatalog, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadMcpOperation, loadMcpWorkspaceOperationReceipt, loadWorkspaceLibrary, loadWorkspaceLibraryState, MCP_WORKSPACE_RECEIPT_LIMIT, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, restoreMcpCommandSnapshot, saveCurrentDocument, saveWorkspaceLibrary, setActiveCanvas, WorkspaceLibraryConflictError } from "./storage";
 import { canRedoMcpOperation, canUndoMcpOperation, OPERATION_RESULT_RETENTION_MS, OPERATION_SNAPSHOT_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "../integrations/operation-ledger";
 
 describe("local Draw autosave", () => {
@@ -412,18 +412,55 @@ describe("local Draw autosave", () => {
       elements: [{ id: "node", type: "image", fileId: "asset-1", x: 12, y: 24, width: 80, height: 50 }],
       assets: { "asset-1": { id: "asset-1", dataURL: "data:image/png;base64,AA==", mimeType: "image/png" } },
     };
-    await saveWorkspaceLibrary(first.id, [item]);
+    await saveWorkspaceLibrary(first.id, [item], 0);
     expect(await loadWorkspaceLibrary(first.id)).toEqual([item]);
     expect(await loadWorkspaceLibrary(second.id)).toEqual([]);
-    await renameWorkspaceLibraryItem(first.id, item.id, "Named flow");
+    await renameWorkspaceLibraryItem(first.id, item.id, "Named flow", { clientIdentity: "human", idempotencyKey: "rename-flow", payloadHash: "rename-flow-payload", expectedRevision: 1 });
     expect(await loadWorkspaceLibrary(first.id)).toMatchObject([{ id: item.id, name: "Named flow" }]);
-    await deleteWorkspaceLibraryItem(first.id, item.id);
+    await deleteWorkspaceLibraryItem(first.id, item.id, { clientIdentity: "human", idempotencyKey: "delete-flow", payloadHash: "delete-flow-payload", expectedRevision: 2 });
     expect(await loadWorkspaceLibrary(first.id)).toEqual([]);
+  });
+
+  it("does not let a stale library snapshot overwrite newer item-level changes", async () => {
+    const workspace = await createWorkspace("Library race");
+    const stale = await loadWorkspaceLibraryState(workspace.id);
+    const item = { id: "fresh-item", created: 1, elements: [{ id: "shape", type: "rectangle" }], assets: {} } as any;
+    await addWorkspaceLibraryItem(workspace.id, item, {
+      clientIdentity: "client-a", idempotencyKey: "add-fresh", payloadHash: "hash-add-fresh", expectedRevision: stale.revision,
+    });
+
+    await expect(saveWorkspaceLibrary(workspace.id, stale.items, stale.revision)).rejects.toBeInstanceOf(WorkspaceLibraryConflictError);
+    await expect(loadWorkspaceLibrary(workspace.id)).resolves.toMatchObject([{ id: "fresh-item" }]);
+  });
+
+  it("replays durable library mutation results and rejects reused keys with changed payloads", async () => {
+    const workspace = await createWorkspace("Library idempotency");
+    const item = { id: "receipt-item", created: 1, name: "Original", elements: [{ id: "shape", type: "rectangle" }], assets: {} } as any;
+    const context = { clientIdentity: "mcp-client-1", idempotencyKey: "add-1", payloadHash: "payload-a", expectedRevision: 0 };
+    const first = await addWorkspaceLibraryItem(workspace.id, item, context);
+    const retry = await addWorkspaceLibraryItem(workspace.id, item, context);
+    expect(first.revision).toBe(1);
+    expect(retry).toMatchObject({ result: first.result, revision: first.revision, replayed: true });
+    await expect(addWorkspaceLibraryItem(workspace.id, { ...item, name: "Changed" }, { ...context, payloadHash: "payload-b" }))
+      .rejects.toMatchObject({ code: "IDEMPOTENCY_KEY_REUSE" });
+  });
+
+  it("uses a library revision compare-and-swap so concurrent stale renames conflict", async () => {
+    const workspace = await createWorkspace("Library CAS");
+    const item = { id: "cas-item", created: 1, name: "Original", elements: [{ id: "shape", type: "rectangle" }], assets: {} } as any;
+    await saveWorkspaceLibrary(workspace.id, [item], 0);
+    const outcomes = await Promise.allSettled([
+      renameWorkspaceLibraryItem(workspace.id, item.id, "First", { clientIdentity: "client-a", idempotencyKey: "rename-a", payloadHash: "hash-a", expectedRevision: 1 }),
+      renameWorkspaceLibraryItem(workspace.id, item.id, "Second", { clientIdentity: "client-b", idempotencyKey: "rename-b", payloadHash: "hash-b", expectedRevision: 1 }),
+    ]);
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome.status === "rejected" && outcome.reason instanceof WorkspaceLibraryConflictError)).toHaveLength(1);
+    expect((await loadWorkspaceLibraryState(workspace.id)).revision).toBe(2);
   });
 
   it("removes workspace library data atomically when deleting its workspace", async () => {
     const workspace = await createWorkspace("Temporary project");
-    await saveWorkspaceLibrary(workspace.id, [{ id: "temporary-item", created: 1, elements: [{ id: "temporary-shape", type: "rectangle" }], assets: {} } as any]);
+    await saveWorkspaceLibrary(workspace.id, [{ id: "temporary-item", created: 1, elements: [{ id: "temporary-shape", type: "rectangle" }], assets: {} } as any], 0);
     await deleteWorkspace(workspace.id);
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open("draw-local");

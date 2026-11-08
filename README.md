@@ -120,7 +120,9 @@ Available tools:
 - `import_draw_file_as_canvas`: validate a `.draw` file from `DRAW_MCP_DOCUMENT_DIR` and create a new canvas with an independent document ID. The existing active canvas and source file remain intact.
 - `delete_canvas` and `delete_workspace`: first call returns `NEEDS_CONFIRMATION`; approve or deny in Draw, then retry with the same key and returned `confirmationToken`. A denial, stale request, or expired token leaves saved drawings intact.
 - `pair_mcp_client`: pair the local MCP host after the human copies Draw's one-time secret into protected host configuration. The tool accepts no pairing code and does not return the capability to the model.
-- `list_workspace_library`, `read_workspace_library_item`, `add_selection_to_workspace_library`, `insert_workspace_library_item`, `rename_workspace_library_item`, and `delete_workspace_library_item`: manage library items in the active workspace. Add accepts the current editor selection or stable `elementIds`. Insertion returns new editable IDs and is revision-guarded/idempotent. Deletion requires one-use owner approval in Draw.
+- `list_workspace_library` and `read_workspace_library_item`: inspect workspace library items and their current `libraryRevision`.
+- `add_selection_to_workspace_library`, `rename_workspace_library_item`, and `delete_workspace_library_item`: mutate library items using `expectedLibraryRevision` and `idempotencyKey`. Same-key/same-payload retries return the stored result; a changed payload conflicts. Delete requires one-use owner approval in Draw, and an approved retry returns its stored result.
+- `insert_workspace_library_item`: insert a fresh editable copy using the document revision and idempotency key.
 
 Every scene mutation should include `documentId` and the latest `expectedDocumentRevision` from `get_current_canvas`. Viewport commands use `expectedViewRevision`. This detects stale agent context before changing the active document.
 

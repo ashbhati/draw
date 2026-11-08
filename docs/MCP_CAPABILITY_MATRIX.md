@@ -20,7 +20,11 @@ Workspace and canvas lifecycle is exposed to paired MCP clients through `list_wo
 
 Import accepts only a plain `.draw` filename inside `DRAW_MCP_DOCUMENT_DIR`, validates it, and creates a separate canvas with a new document ID while preserving the scene and assets. It does not call `open_document` or replace the active canvas. Deleting a canvas or workspace requires one-use human approval in the active Draw tab, bound to the target, catalog revision, active document/revision, and idempotency key. The editor derives the displayed target names and canvas count from its local catalog; request-supplied display strings are ignored. Denied, stale, or expired approvals do not delete data. MCP receipts remain local IndexedDB state and are not embedded in `.draw` files.
 
-Status labels below are deliberate: **Available (V1)** describes V1 behavior; **Unsupported (V1)** means no V1 MCP operation exists; **Proposed (V2)** means planned rather than implemented. The #31/#33 editing rows remain a historical map of the initial phase; see issue delivery sections above for later implementations.
+## V2 issue #11 reusable library delivery status
+
+Reusable items and their embedded assets are workspace-scoped in IndexedDB and are not embedded in `.draw` files. The library record carries a monotonic `libraryRevision` and bounded receipts for authenticated `(workspaceId, clientIdentity, idempotencyKey)` mutations. Add, rename, and delete validate `expectedLibraryRevision` and canonical payload hash atomically; exact retries return the original result, while a changed payload or stale revision conflicts. Approved delete retries may reuse the exact same caller-bound confirmation fingerprint only to reach that durable receipt; a different operation still requires fresh human approval. Library snapshots from Excalidraw's callback are ignored in read-only tabs, skipped when semantically unchanged, and compare-and-swap saved against their loaded library revision. UI and MCP add/rename/delete use item-level mutations against the latest stored record.
+
+Status labels below distinguish implemented behavior from proposed capability. The #31/#33 rows remain a historical map of the initial phase; see the delivery sections above for the later #11 and #52 implementations.
 
 ## Current MCP contract (V1)
 

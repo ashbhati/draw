@@ -27,6 +27,7 @@ const MCP_COMPACTION_INTERVAL = 32;
 const MAX_DOCUMENT_SNAPSHOTS = 100;
 export const MCP_WORKSPACE_RECEIPT_LIMIT = 1_000;
 const MCP_WORKSPACE_RECEIPT_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+const MAX_LIBRARY_OPERATION_RECEIPTS = 10_000;
 
 type AutosaveOrder = { sessionId: string; sequence: number };
 
@@ -40,6 +41,19 @@ export interface DrawLibraryItem {
   elements: DrawDocument["document"]["elements"];
   assets: Record<string, DrawDocument["document"]["assets"][string]>;
 }
+export interface WorkspaceLibraryState { items: DrawLibraryItem[]; revision: number }
+export interface WorkspaceLibraryMutationContext {
+  clientIdentity: string;
+  idempotencyKey: string;
+  payloadHash: string;
+  expectedRevision: number;
+}
+export interface WorkspaceLibraryMutationResult<T = Record<string, unknown>> extends WorkspaceLibraryState {
+  result: T;
+  replayed: boolean;
+}
+interface WorkspaceLibraryReceipt { clientIdentity: string; idempotencyKey: string; payloadHash: string; result: Record<string, unknown>; revision: number; completedAt: number }
+interface StoredWorkspaceLibrary extends WorkspaceLibraryState { receipts: Record<string, WorkspaceLibraryReceipt> }
 interface ActiveCanvasPointer { workspaceId: string; canvasId: string }
 
 export type McpWorkspaceAction =
@@ -88,6 +102,13 @@ export interface McpWorkspaceCatalog extends McpWorkspaceOperationResult {}
 
 export class DrawStorageRecoveryError extends Error {
   constructor(message: string) { super(message); this.name = "DrawStorageRecoveryError"; }
+}
+
+export class WorkspaceLibraryConflictError extends Error {
+  constructor(message: string, readonly code: "LIBRARY_REVISION_CONFLICT" | "IDEMPOTENCY_KEY_REUSE") {
+    super(message);
+    this.name = "WorkspaceLibraryConflictError";
+  }
 }
 
 function documentKey(id: string): IDBValidKey { return ["draw-document", id]; }
@@ -850,25 +871,25 @@ export async function commitMcpWorkspaceOperation(request: McpWorkspaceOperation
   });
 }
 
-/** Load the reusable element library scoped to one project workspace. */
-export async function loadWorkspaceLibrary(workspaceId: string): Promise<DrawLibraryItem[]> {
-  const db = await openDatabase();
-  try {
-    const tx = db.transaction([WORKSPACES_STORE, WORKSPACE_LIBRARY_STORE], "readonly");
-    const workspaceRequest = tx.objectStore(WORKSPACES_STORE).get(workspaceId);
-    const itemsRequest = tx.objectStore(WORKSPACE_LIBRARY_STORE).get(workspaceId);
-    const [workspace, items] = await Promise.all([
-      requestValue<DrawWorkspace | undefined>(workspaceRequest),
-      requestValue<DrawLibraryItem[] | undefined>(itemsRequest),
-      waitForTransaction(tx),
-    ]);
-    if (!workspace) throw new Error("Workspace does not exist.");
-    return structuredClone(items ?? []);
-  } finally { db.close(); }
+function libraryReceiptKey(clientIdentity: string, idempotencyKey: string): string {
+  return JSON.stringify([clientIdentity, idempotencyKey]);
 }
 
-/** Replace the workspace library snapshot after the editor library changes. */
-export async function saveWorkspaceLibrary(workspaceId: string, items: readonly DrawLibraryItem[]): Promise<void> {
+function readStoredWorkspaceLibrary(value: unknown): StoredWorkspaceLibrary {
+  if (Array.isArray(value)) return { items: structuredClone(value as DrawLibraryItem[]), revision: 0, receipts: {} };
+  if (!value || typeof value !== "object") return { items: [], revision: 0, receipts: {} };
+  const record = value as Partial<StoredWorkspaceLibrary>;
+  if (!Array.isArray(record.items) || !Number.isSafeInteger(record.revision) || (record.revision as number) < 0) {
+    throw new DrawStorageRecoveryError("The workspace library record is damaged.");
+  }
+  return {
+    items: structuredClone(record.items),
+    revision: record.revision as number,
+    receipts: record.receipts && typeof record.receipts === "object" ? structuredClone(record.receipts) : {},
+  };
+}
+
+function normalizeLibraryItems(items: readonly DrawLibraryItem[]): DrawLibraryItem[] {
   const normalized = items.map((item) => {
     if (!item || typeof item.id !== "string" || !item.id || !Array.isArray(item.elements) || !Number.isFinite(item.created)) {
       throw new Error("The Draw library item is invalid.");
@@ -880,33 +901,102 @@ export async function saveWorkspaceLibrary(workspaceId: string, items: readonly 
     if (ids.has(item.id)) throw new Error("Draw library item IDs must be unique within a workspace.");
     ids.add(item.id);
   }
+  return normalized;
+}
+
+/** Load the reusable element library and compare-and-swap revision for a workspace. */
+export async function loadWorkspaceLibraryState(workspaceId: string): Promise<WorkspaceLibraryState> {
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction([WORKSPACES_STORE, WORKSPACE_LIBRARY_STORE], "readonly");
+    const workspaceRequest = tx.objectStore(WORKSPACES_STORE).get(workspaceId);
+    const libraryRequest = tx.objectStore(WORKSPACE_LIBRARY_STORE).get(workspaceId);
+    const [workspace, value] = await Promise.all([
+      requestValue<DrawWorkspace | undefined>(workspaceRequest),
+      requestValue<unknown>(libraryRequest),
+      waitForTransaction(tx),
+    ]);
+    if (!workspace) throw new Error("Workspace does not exist.");
+    const state = readStoredWorkspaceLibrary(value);
+    return { items: state.items, revision: state.revision };
+  } finally { db.close(); }
+}
+
+export async function loadWorkspaceLibrary(workspaceId: string): Promise<DrawLibraryItem[]> {
+  return (await loadWorkspaceLibraryState(workspaceId)).items;
+}
+
+/** Replace a legacy/editor library snapshot only if its caller holds the current revision. */
+export async function saveWorkspaceLibrary(workspaceId: string, items: readonly DrawLibraryItem[], expectedRevision: number): Promise<WorkspaceLibraryState> {
+  const normalized = normalizeLibraryItems(items);
   const db = await openDatabase();
   try {
     const tx = db.transaction([WORKSPACES_STORE, WORKSPACE_LIBRARY_STORE], "readwrite");
     const workspaceRequest = tx.objectStore(WORKSPACES_STORE).get(workspaceId);
+    const libraryRequest = tx.objectStore(WORKSPACE_LIBRARY_STORE).get(workspaceId);
     let failure: Error | undefined;
-    workspaceRequest.onsuccess = () => {
-      if (!workspaceRequest.result) { failure = new Error("Workspace does not exist."); tx.abort(); return; }
-      tx.objectStore(WORKSPACE_LIBRARY_STORE).put(normalized, workspaceId);
+    let reads = 2;
+    let workspaceExists = false;
+    let current: StoredWorkspaceLibrary = { items: [], revision: 0, receipts: {} };
+    let result: WorkspaceLibraryState | undefined;
+    const finish = () => {
+      reads -= 1;
+      if (reads) return;
+      if (!workspaceExists) { failure = new Error("Workspace does not exist."); tx.abort(); return; }
+      try {
+        if (current.revision !== expectedRevision) throw new WorkspaceLibraryConflictError("The workspace library changed. Reload it and retry.", "LIBRARY_REVISION_CONFLICT");
+        if (JSON.stringify(current.items) !== JSON.stringify(normalized)) {
+          current = { ...current, items: normalized, revision: current.revision + 1 };
+          tx.objectStore(WORKSPACE_LIBRARY_STORE).put(current, workspaceId);
+        }
+        result = { items: current.items, revision: current.revision };
+      } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); tx.abort(); }
     };
+    workspaceRequest.onsuccess = () => { workspaceExists = Boolean(workspaceRequest.result); finish(); };
+    libraryRequest.onsuccess = () => { current = readStoredWorkspaceLibrary(libraryRequest.result); finish(); };
+    workspaceRequest.onerror = libraryRequest.onerror = () => { failure = new Error("Could not read the workspace library."); tx.abort(); };
     try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
+    if (!result) throw new Error("Could not save the workspace library.");
+    return result;
   } finally { db.close(); }
 }
 
-export async function renameWorkspaceLibraryItem(workspaceId: string, itemId: string, name: string): Promise<void> {
-  await mutateWorkspaceLibrary(workspaceId, (items) => {
-    const index = items.findIndex((item) => item.id === itemId);
-    if (index < 0) throw new Error("Library item does not exist.");
-    items[index] = { ...items[index], name: name.trim() || "Untitled library item" };
-    return items;
+export async function addWorkspaceLibraryItem(workspaceId: string, item: DrawLibraryItem | (() => DrawLibraryItem), context: WorkspaceLibraryMutationContext): Promise<WorkspaceLibraryMutationResult> {
+  return mutateWorkspaceLibrary(workspaceId, context, (items) => {
+    const normalized = normalizeLibraryItems([typeof item === "function" ? item() : item])[0];
+    const existing = items.find((saved) => saved.id === normalized.id);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(normalized)) throw new WorkspaceLibraryConflictError("A library item with this ID already exists.", "LIBRARY_REVISION_CONFLICT");
+    return { items: existing ? items : [normalized, ...items], result: { item: existing ?? normalized, alreadyAdded: Boolean(existing) }, changed: !existing };
   });
 }
 
-export async function deleteWorkspaceLibraryItem(workspaceId: string, itemId: string): Promise<void> {
-  await mutateWorkspaceLibrary(workspaceId, (items) => items.filter((item) => item.id !== itemId));
+export async function renameWorkspaceLibraryItem(workspaceId: string, itemId: string, name: string, context: WorkspaceLibraryMutationContext): Promise<WorkspaceLibraryMutationResult> {
+  return mutateWorkspaceLibrary(workspaceId, context, (items) => {
+    const index = items.findIndex((item) => item.id === itemId);
+    if (index < 0) throw new Error("Library item does not exist.");
+    const previousName = items[index].name;
+    const normalizedName = name.trim() || "Untitled library item";
+    const renamed = { ...items[index], name: normalizedName };
+    items[index] = renamed;
+    return { items, result: { item: renamed, renamed: true }, changed: previousName !== normalizedName };
+  });
 }
 
-async function mutateWorkspaceLibrary(workspaceId: string, mutate: (items: DrawLibraryItem[]) => DrawLibraryItem[]): Promise<void> {
+export async function deleteWorkspaceLibraryItem(workspaceId: string, itemId: string, context: WorkspaceLibraryMutationContext): Promise<WorkspaceLibraryMutationResult> {
+  return mutateWorkspaceLibrary(workspaceId, context, (items) => {
+    const remaining = items.filter((item) => item.id !== itemId);
+    return { items: remaining, result: { itemId, deleted: remaining.length !== items.length }, changed: remaining.length !== items.length };
+  });
+}
+
+async function mutateWorkspaceLibrary(
+  workspaceId: string,
+  context: WorkspaceLibraryMutationContext,
+  mutate: (items: DrawLibraryItem[]) => { items: DrawLibraryItem[]; result: Record<string, unknown>; changed: boolean },
+): Promise<WorkspaceLibraryMutationResult> {
+  if (!context.clientIdentity || !context.idempotencyKey || !context.payloadHash || !Number.isSafeInteger(context.expectedRevision) || context.expectedRevision < 0) {
+    throw new Error("Workspace library mutation context is invalid.");
+  }
   const db = await openDatabase();
   try {
     const tx = db.transaction([WORKSPACES_STORE, WORKSPACE_LIBRARY_STORE], "readwrite");
@@ -915,18 +1005,42 @@ async function mutateWorkspaceLibrary(workspaceId: string, mutate: (items: DrawL
     let reads = 2;
     let failure: Error | undefined;
     let workspaceExists = false;
-    let items: DrawLibraryItem[] = [];
+    let current: StoredWorkspaceLibrary = { items: [], revision: 0, receipts: {} };
+    let result: WorkspaceLibraryMutationResult | undefined;
     const finish = () => {
       reads -= 1;
       if (reads) return;
       if (!workspaceExists) { failure = new Error("Workspace does not exist."); tx.abort(); return; }
-      try { tx.objectStore(WORKSPACE_LIBRARY_STORE).put(mutate(structuredClone(items)), workspaceId); }
-      catch (error) { failure = error instanceof Error ? error : new Error(String(error)); tx.abort(); }
+      try {
+        const key = libraryReceiptKey(context.clientIdentity, context.idempotencyKey);
+        const receipt = current.receipts[key];
+        if (receipt) {
+          if (receipt.payloadHash !== context.payloadHash) throw new WorkspaceLibraryConflictError("This idempotency key was already used with a different library operation.", "IDEMPOTENCY_KEY_REUSE");
+          result = { items: current.items, revision: current.revision, result: structuredClone(receipt.result), replayed: true };
+          return;
+        }
+        if (current.revision !== context.expectedRevision) throw new WorkspaceLibraryConflictError("The workspace library changed. Read its latest revision and retry.", "LIBRARY_REVISION_CONFLICT");
+        const mutation = mutate(structuredClone(current.items));
+        const nextRevision = mutation.changed ? current.revision + 1 : current.revision;
+        const nextResult = structuredClone({ ...mutation.result, libraryRevision: nextRevision });
+        const receipts = {
+          ...current.receipts,
+          [key]: { clientIdentity: context.clientIdentity, idempotencyKey: context.idempotencyKey, payloadHash: context.payloadHash, result: nextResult, revision: nextRevision, completedAt: Date.now() },
+        };
+        const boundedReceipts = Object.fromEntries(Object.entries(receipts)
+          .sort(([, left], [, right]) => left.completedAt - right.completedAt)
+          .slice(-MAX_LIBRARY_OPERATION_RECEIPTS));
+        current = { items: normalizeLibraryItems(mutation.items), revision: nextRevision, receipts: boundedReceipts };
+        tx.objectStore(WORKSPACE_LIBRARY_STORE).put(current, workspaceId);
+        result = { items: current.items, revision: nextRevision, result: nextResult, replayed: false };
+      } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); tx.abort(); }
     };
     workspaceRequest.onsuccess = () => { workspaceExists = Boolean(workspaceRequest.result); finish(); };
-    libraryRequest.onsuccess = () => { items = (libraryRequest.result as DrawLibraryItem[] | undefined) ?? []; finish(); };
+    libraryRequest.onsuccess = () => { current = readStoredWorkspaceLibrary(libraryRequest.result); finish(); };
     workspaceRequest.onerror = libraryRequest.onerror = () => { failure = new Error("Could not read the workspace library."); tx.abort(); };
     try { await waitForTransaction(tx); } catch (error) { throw failure ?? error; }
+    if (!result) throw new Error("Could not commit the workspace library mutation.");
+    return result;
   } finally { db.close(); }
 }
 

@@ -131,7 +131,7 @@ export type McpWorkspaceAction =
 
 export type WorkspaceMutationContext = { expectedCatalogRevision: number; idempotencyKey: string };
 export type WorkspaceLibraryContext = { documentId: string };
-export type WorkspaceLibraryMutation = WorkspaceLibraryContext & { expectedDocumentRevision: number; idempotencyKey: string };
+export type WorkspaceLibraryMutation = WorkspaceLibraryContext & { expectedDocumentRevision: number; expectedLibraryRevision: number; idempotencyKey: string };
 
 export type McpCommand =
   | { operation: "create_diagram"; input: CreateDiagramInput }
@@ -155,7 +155,7 @@ export type McpCommand =
   | { operation: "add_selection_to_workspace_library"; input: WorkspaceLibraryMutation & { itemId: string; elementIds?: string[]; name?: string } }
   | { operation: "rename_workspace_library_item"; input: WorkspaceLibraryMutation & { itemId: string; name: string } }
   | { operation: "delete_workspace_library_item"; input: WorkspaceLibraryMutation & { itemId: string; confirmationToken?: string } }
-  | { operation: "insert_workspace_library_item"; input: WorkspaceLibraryMutation & { itemId: string } };
+  | { operation: "insert_workspace_library_item"; input: WorkspaceLibraryContext & { expectedDocumentRevision: number; idempotencyKey: string; itemId: string } };
 
 // Workspace operations are delivered to the active authenticated editor, which owns local IndexedDB.
 export type WorkspaceActionCommand = { operation: "workspace_action"; input: McpWorkspaceAction; document?: DrawDocument };
@@ -682,12 +682,15 @@ export function parseMcpToolInput(
     const input = requireRecord(value, `${name} input`);
     if (!Number.isSafeInteger(input.expectedDocumentRevision) || (input.expectedDocumentRevision as number) < 0) throw new McpValidationError(`${name}.expectedDocumentRevision must be a non-negative integer.`);
     const common = { documentId: requireString(input.documentId, `${name}.documentId`, 200), expectedDocumentRevision: input.expectedDocumentRevision as number, idempotencyKey: requireIdempotencyKey(input, name), itemId: requireString(input.itemId, `${name}.itemId`, 200) };
+    if (name === "insert_workspace_library_item") return { operation: name, input: common };
+    if (!Number.isSafeInteger(input.expectedLibraryRevision) || (input.expectedLibraryRevision as number) < 0) throw new McpValidationError(`${name}.expectedLibraryRevision must be a non-negative integer.`);
+    const mutation = { ...common, expectedLibraryRevision: input.expectedLibraryRevision as number };
     if (name === "add_selection_to_workspace_library") {
       if (input.elementIds !== undefined && (!Array.isArray(input.elementIds) || input.elementIds.length < 1 || input.elementIds.length > 100 || input.elementIds.some((id) => typeof id !== "string" || !id.trim() || id.length > 200))) throw new McpValidationError(`${name}.elementIds must contain between 1 and 100 stable element IDs.`);
-      return { operation: name, input: { ...common, ...(Array.isArray(input.elementIds) ? { elementIds: input.elementIds as string[] } : {}), ...(input.name !== undefined ? { name: requireString(input.name, `${name}.name`, 160) } : {}) } };
+      return { operation: name, input: { ...mutation, ...(Array.isArray(input.elementIds) ? { elementIds: input.elementIds as string[] } : {}), ...(input.name !== undefined ? { name: requireString(input.name, `${name}.name`, 160) } : {}) } };
     }
-    if (name === "rename_workspace_library_item") return { operation: name, input: { ...common, name: requireString(input.name, `${name}.name`, 160) } };
-    return { operation: name as "delete_workspace_library_item" | "insert_workspace_library_item", input: { ...common, ...(name === "delete_workspace_library_item" && input.confirmationToken !== undefined ? { confirmationToken: requireString(input.confirmationToken, `${name}.confirmationToken`, 200) } : {}) } };
+    if (name === "rename_workspace_library_item") return { operation: name, input: { ...mutation, name: requireString(input.name, `${name}.name`, 160) } };
+    return { operation: "delete_workspace_library_item", input: { ...mutation, ...(input.confirmationToken !== undefined ? { confirmationToken: requireString(input.confirmationToken, `${name}.confirmationToken`, 200) } : {}) } };
   }
   if (name === "create_diagram") {
     return { operation: "create_diagram", input: parseCreateDiagram(value) };

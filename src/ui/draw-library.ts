@@ -33,6 +33,37 @@ export function collectReferencedLibraryAssets(
   return Object.fromEntries([...referenced].flatMap((id) => assets[id] ? [[id, structuredClone(assets[id])]] : []));
 }
 
+type LibraryPersistenceItem = {
+  id: string;
+  name?: string;
+  elements: unknown;
+  assets?: Record<string, unknown>;
+  /** Excalidraw library lifecycle metadata is not persisted by Draw. */
+  created?: unknown;
+  status?: unknown;
+};
+
+export function libraryItemsEquivalentForPersistence(
+  left: readonly LibraryPersistenceItem[],
+  right: readonly LibraryPersistenceItem[],
+): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((item, index) => {
+    const other = right[index];
+    return Boolean(other && item.id === other.id && item.name === other.name
+      && JSON.stringify(item.elements) === JSON.stringify(other.elements)
+      && JSON.stringify(item.assets ?? {}) === JSON.stringify(other.assets ?? {}));
+  });
+}
+
+export function shouldPersistLibraryChange(
+  writerOwned: boolean,
+  previous: readonly LibraryPersistenceItem[],
+  next: readonly LibraryPersistenceItem[],
+): boolean {
+  return writerOwned && !libraryItemsEquivalentForPersistence(previous, next);
+}
+
 export function cloneLibraryElements<T extends DrawElement>(elements: readonly T[], createId: () => string, offset = 24): T[] {
   const idMap = new Map(elements.map((element) => [element.id, createId()]));
   const groupMap = new Map<string, string>();

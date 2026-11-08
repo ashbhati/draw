@@ -102,9 +102,9 @@ describe("Draw MCP Vite bridge", () => {
     const document = createEmptyDocument("Library confirmation");
     await bridge.registerClient("tab-library");
     await bridge.editorRequest("tab-library", "PUT", "/__draw/api/document", { clientId: "tab-library", document });
-    const fingerprint = createHash("sha256").update(`${document.document.id}:0:item-1`).digest("hex");
+    const fingerprint = createHash("sha256").update(`${document.document.id}:0:0:delete-library-1:item-1`).digest("hex");
     const input = { action: "delete_library_item", documentId: document.document.id, expectedDocumentRevision: 0, filename: "item-1", fingerprint };
-    const command = { operation: "delete_workspace_library_item", input: { documentId: document.document.id, expectedDocumentRevision: 0, idempotencyKey: "delete-library-1", itemId: "item-1" } };
+    const command = { operation: "delete_workspace_library_item", input: { documentId: document.document.id, expectedDocumentRevision: 0, expectedLibraryRevision: 0, idempotencyKey: "delete-library-1", itemId: "item-1" } };
     expect((await bridge.request("POST", "/__draw/api/commands", command)).status).toBe(403);
     const challenge = await bridge.request("POST", "/__draw/api/confirmations", input);
     expect(challenge.status).toBe(202);
@@ -118,6 +118,12 @@ describe("Draw MCP Vite bridge", () => {
     expect(queued?.operation).toBe("delete_workspace_library_item");
     expect((await bridge.editorRequest("tab-library", "POST", `/__draw/api/commands/${queued.id}/ack`, { id: queued.id, clientId: "tab-library", clientIdentity: "test-mcp-client", document, result: { deleted: true } })).status).toBe(200);
     expect((await commandPromise).status).toBe(200);
+    const replayPromise = bridge.request("POST", "/__draw/api/commands", { ...command, input: { ...command.input, confirmationToken: token } });
+    await new Promise((resolve) => setImmediate(resolve));
+    const replayEvent = bridge.events.filter(({ event }) => event === "draw:mcp-command").at(-1)?.data;
+    expect(replayEvent?.operation).toBe("delete_workspace_library_item");
+    expect((await bridge.editorRequest("tab-library", "POST", `/__draw/api/commands/${replayEvent.id}/ack`, { id: replayEvent.id, clientId: "tab-library", clientIdentity: "test-mcp-client", document, result: { deleted: true, replayed: true } })).status).toBe(200);
+    expect((await replayPromise).status).toBe(200);
     expect((await bridge.request("POST", "/__draw/api/commands", { ...command, input: { ...command.input, confirmationToken: token, idempotencyKey: "delete-library-2" } })).status).toBe(403);
   });
   it("rejects unpaired local processes on document, confirmation, and command routes", async () => {

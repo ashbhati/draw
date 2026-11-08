@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DrawAsset, DrawElement } from "../document/document";
-import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets } from "./draw-library";
+import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, shouldPersistLibraryChange } from "./draw-library";
 
 describe("Draw reusable library items", () => {
   it("captures selected elements with bound labels and preserves element relationships", () => {
@@ -23,6 +23,21 @@ describe("Draw reusable library items", () => {
       unused: { id: "unused", dataURL: "data:image/png;base64,BB==" },
     } satisfies Record<string, DrawAsset>;
     expect(collectReferencedLibraryAssets(elements, assets)).toEqual({ used: assets.used });
+  });
+
+  it("ignores Excalidraw library bookkeeping but detects content and order changes", () => {
+    const saved = [{ id: "item", name: "Saved", created: 1, status: "unpublished", elements: [{ id: "shape", type: "rectangle" }], assets: {} }];
+    expect(libraryItemsEquivalentForPersistence(saved, [{ ...saved[0], created: 9, status: "published" }])).toBe(true);
+    expect(libraryItemsEquivalentForPersistence(saved, [{ ...saved[0], name: "Renamed" }])).toBe(false);
+    expect(libraryItemsEquivalentForPersistence(saved, [{ ...saved[0], elements: [{ id: "other", type: "rectangle" }] }])).toBe(false);
+  });
+
+  it("never persists a stale tab snapshot without the writer lock", () => {
+    const stale = [{ id: "old", name: "Old snapshot", elements: [{ id: "old-shape" }], assets: {} }];
+    const saved = [...stale, { id: "new", name: "Newer item", elements: [{ id: "new-shape" }], assets: {} }];
+    expect(shouldPersistLibraryChange(false, stale, saved)).toBe(false);
+    expect(shouldPersistLibraryChange(true, saved, saved)).toBe(false);
+    expect(shouldPersistLibraryChange(true, stale, saved)).toBe(true);
   });
 
   it("inserts independent copies with fresh IDs and remapped labels, bindings, and groups", () => {
