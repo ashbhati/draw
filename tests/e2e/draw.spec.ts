@@ -88,6 +88,51 @@ async function freshBridgeDocument(page: Page) {
   return response.json();
 }
 
+async function waitForImageToSettle(page: Page, expectedNaturalSize: { width: number; height: number }) {
+  await expect.poll(async () => {
+    const snapshot = await freshBridgeDocument(page);
+    const image = snapshot.document.elements.find((element: any) => element.type === "image" && element.isDeleted !== true);
+    const asset = image && snapshot.document.assets?.[image.fileId];
+    if (!image || !asset?.dataURL || image.status !== "saved") return null;
+    const naturalSize = await page.evaluate((dataURL) => new Promise<{ width: number; height: number } | null>((resolve) => {
+      const decoded = new Image();
+      decoded.onload = () => resolve({ width: decoded.naturalWidth, height: decoded.naturalHeight });
+      decoded.onerror = () => resolve(null);
+      decoded.src = dataURL;
+      if (decoded.complete && decoded.naturalWidth > 0) resolve({ width: decoded.naturalWidth, height: decoded.naturalHeight });
+    }), asset.dataURL);
+    if (!naturalSize) return null;
+    return {
+      status: image.status,
+      width: image.width,
+      height: image.height,
+      naturalWidth: naturalSize.width,
+      naturalHeight: naturalSize.height,
+    };
+  }, { timeout: 10_000 }).toMatchObject({
+    status: "saved",
+    width: expectedNaturalSize.width,
+    height: expectedNaturalSize.height,
+    naturalWidth: expectedNaturalSize.width,
+    naturalHeight: expectedNaturalSize.height,
+  });
+  return freshBridgeDocument(page);
+}
+
+function expectedSceneExportSize(elements: any[], padding = 32) {
+  const visible = elements.filter((element) => element.isDeleted !== true);
+  const left = Math.min(...visible.map((element) => element.x));
+  const top = Math.min(...visible.map((element) => element.y));
+  const right = Math.max(...visible.map((element) => element.x + element.width));
+  const bottom = Math.max(...visible.map((element) => element.y + element.height));
+  return { width: Math.ceil(right - left + padding * 2), height: Math.ceil(bottom - top + padding * 2) };
+}
+
+function expectExportSizeMatchesScene(actual: { width: number; height: number }, expected: { width: number; height: number }) {
+  expect(Math.abs(actual.width - expected.width), "bitmap width must equal scene bounds plus 32px padding on both sides").toBeLessThanOrEqual(1);
+  expect(Math.abs(actual.height - expected.height), "bitmap height must equal scene bounds plus 32px padding on both sides").toBeLessThanOrEqual(1);
+}
+
 function contrastRatio(foreground: string, background: string): number {
   const luminance = (hex: string) => {
     const channels = hex.match(/[\da-f]{2}/gi)!.map((channel) => parseInt(channel, 16) / 255).map((value) =>
@@ -408,7 +453,13 @@ test.beforeEach(async ({ page }) => {
     const createObjectURL = URL.createObjectURL.bind(URL);
     URL.createObjectURL = ((object: Blob | MediaSource) => {
       if (object instanceof Blob && object.type.includes("image/svg+xml")) {
-        void object.text().then((svg) => { (window as any).__drawLastExportSvg = svg; });
+        const current = window as any;
+        const sequence = (current.__drawExportSvgSequence ?? 0) + 1;
+        current.__drawExportSvgSequence = sequence;
+        void object.text().then((svg) => {
+          current.__drawLastExportSvg = svg;
+          current.__drawLastExportSvgSequence = sequence;
+        });
       }
       return createObjectURL(object);
     }) as typeof URL.createObjectURL;
@@ -1590,20 +1641,28 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
       current.document.elements.filter((element: any) => element.type === "rectangle").length >= 2 &&
       current.document.elements.some((element: any) => element.type === "arrow");
   }).toBe(true);
+  const settledScene = await waitForImageToSettle(page, { width: 48, height: 48 });
 
   // The image drop leaves an object selected, matching the reported workflow.
   // Export must still be a shareable image of the whole drawing, rather than a
   // crop containing only the current selection.
   await expect.poll(async () => Object.keys((await freshBridgeDocument(page)).document.appState.selectedElementIds ?? {}).length).toBeGreaterThan(0);
-  const exportScene = await freshBridgeDocument(page);
+  const exportScene = settledScene;
   const liveElements = exportScene.document.elements.filter((element: any) => element.isDeleted !== true);
   // Excalidraw normalizes its SVG viewBox to (0, 0), so use the scene's
   // minimum element coordinates only to map the semantic pixel samples.
   // Export dimensions are validated independently against that SVG viewBox.
-  const exportOrigin = {
-    x: Math.min(...liveElements.map((element: any) => element.x)) - 32,
-    y: Math.min(...liveElements.map((element: any) => element.y)) - 32,
+  const bounds = {
+    left: Math.min(...liveElements.map((element: any) => element.x)),
+    top: Math.min(...liveElements.map((element: any) => element.y)),
+    right: Math.max(...liveElements.map((element: any) => element.x + element.width)),
+    bottom: Math.max(...liveElements.map((element: any) => element.y + element.height)),
   };
+  const exportOrigin = { x: bounds.left - 32, y: bounds.top - 32 };
+  const expectedSize = expectedSceneExportSize(liveElements);
+  // Prove that the independent scene-bounds oracle rejects an intentionally
+  // wrong export size/padding before it is used to validate real exports.
+  expect(() => expectExportSizeMatchesScene({ width: expectedSize.width + 32, height: expectedSize.height - 32 }, expectedSize)).toThrow();
   const nodeLabels = ["First node", "Second node"].map((label) => {
     const element = liveElements.find((candidate: any) => candidate.type === "text" && candidate.text?.includes(label));
     if (!element) throw new Error(`Could not find editable ${label} text in the exported scene.`);
@@ -1628,13 +1687,25 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
     for (const mime of ["image/png", "image/jpeg"] as const) {
       const formatControl = page.getByLabel("Image export format");
       const downloadWait = page.waitForEvent("download");
-      if (await formatControl.inputValue() === mime) await page.getByRole("button", { name: "Export" }).click();
-      else await formatControl.selectOption(mime);
+      await formatControl.selectOption(mime);
+      const sequenceBeforeExport = await page.evaluate(() => {
+        const current = window as any;
+        const previous = current.__drawExportSvgSequence ?? 0;
+        current.__drawLastExportSvg = undefined;
+        current.__drawLastExportSvgSequence = undefined;
+        return previous;
+      });
+      await page.getByRole("button", { name: "Export" }).click();
       const image = await readFile(await (await downloadWait).path());
       const sample = await inspectImagePixels(page, image, mime);
-      const svgViewport = await page.evaluate(() => {
-        const svg = (window as any).__drawLastExportSvg as string | undefined;
-        if (!svg) throw new Error("The export SVG was not captured before rasterization.");
+      const svgViewport = await page.evaluate(async (startingSequence) => {
+        const current = window as any;
+        const deadline = Date.now() + 10_000;
+        while ((current.__drawLastExportSvgSequence ?? 0) <= startingSequence || typeof current.__drawLastExportSvg !== "string") {
+          if (Date.now() > deadline) throw new Error("Timed out waiting for the SVG from this export.");
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        const svg = current.__drawLastExportSvg as string;
         const document = new DOMParser().parseFromString(svg, "image/svg+xml");
         const root = document.documentElement;
         const viewBox = root.getAttribute("viewBox")?.trim().split(/[ ,]+/).map(Number);
@@ -1644,11 +1715,12 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
           throw new Error("The export SVG has no finite intrinsic dimensions and viewBox.");
         }
         return { x: viewBox[0], y: viewBox[1], viewWidth: viewBox[2], viewHeight: viewBox[3], width, height };
-      });
+      }, sequenceBeforeExport);
       expect(Math.abs(sample.width - svgViewport.width), `${mime} bitmap width should match its exact SVG export input`).toBeLessThanOrEqual(1);
       expect(Math.abs(sample.height - svgViewport.height), `${mime} bitmap height should match its exact SVG export input`).toBeLessThanOrEqual(1);
       expect(Math.abs(svgViewport.viewWidth - svgViewport.width), "SVG viewBox width should map one scene unit to one export pixel").toBeLessThanOrEqual(1);
       expect(Math.abs(svgViewport.viewHeight - svgViewport.height), "SVG viewBox height should map one scene unit to one export pixel").toBeLessThanOrEqual(1);
+      expectExportSizeMatchesScene(sample, expectedSize);
       const corner = await sampleImagePatch(page, image, { x: 0.025, y: 0.025 }, mime);
       expect(sample.greenAssetPixels, `${mime} should preserve the embedded image`).toBeGreaterThan(50);
       if (preset === "blackboard") {
