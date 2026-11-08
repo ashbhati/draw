@@ -3,8 +3,24 @@ import { createServer } from "node:net";
 import { isAbsolute, relative } from "node:path";
 import { tmpdir } from "node:os";
 import { createE2EServerConfig, isBundledFontURL, isSameOriginURL, resolveAndStoreE2EBaseURL, resolveE2EBaseURL } from "./config";
+import { buildPackagePtyArgs } from "./package-pty";
 
 describe("Playwright E2E server configuration", () => {
+  it("builds BSD script arguments for macOS package E2E", () => {
+    expect(buildPackagePtyArgs("/opt/node", ["/tmp/draw/bin/draw.js", "start", "--port", "4173"], "darwin"))
+      .toEqual(["-q", "/dev/null", "/opt/node", "/tmp/draw/bin/draw.js", "start", "--port", "4173"]);
+  });
+
+  it("uses util-linux script -c and shell-quotes paths on Linux", () => {
+    expect(buildPackagePtyArgs("/usr/bin/node", ["/tmp/draw app/bin/draw.js", "start", "--port", "4173"], "linux"))
+      .toEqual(["-q", "-c", "'/usr/bin/node' '/tmp/draw app/bin/draw.js' 'start' '--port' '4173'", "/dev/null"]);
+    expect(buildPackagePtyArgs("node's path", ["draw"], "linux")[2]).toContain("'\\''");
+  });
+
+  it("keeps the package PTY test explicit about its supported platforms", () => {
+    expect(() => buildPackagePtyArgs("node", [], "win32")).toThrow(/supports macOS and Linux/i);
+  });
+
   it("chooses an ephemeral default URL and accepts an explicit per-run loopback URL", async () => {
     const dynamicUrl = await resolveE2EBaseURL(undefined);
     expect(new URL(dynamicUrl).hostname).toBe("127.0.0.1");

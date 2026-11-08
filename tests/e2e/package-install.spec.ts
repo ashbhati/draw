@@ -4,6 +4,7 @@ import { createServer } from "node:net";
 import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildPackagePtyArgs } from "./package-pty";
 
 async function unusedPort(): Promise<number> {
   const probe = createServer();
@@ -111,7 +112,7 @@ test("installed npm package serves the production app and MCP edits it over loca
     expect(help.output).toContain("draw start");
     // `script` gives the installed CLI a real terminal so launch-code display
     // follows the same trusted-terminal path users receive.
-    runtimeProcess = spawn("script", ["-q", "/dev/null", bin, "start", "--port", String(port), "--no-open"], {
+    runtimeProcess = spawn("script", buildPackagePtyArgs(bin, ["start", "--port", String(port), "--no-open"]), {
       cwd: neutralCwd,
       env: { ...process.env, DRAW_RUNTIME_DIR: join(root, "run") },
       stdio: ["ignore", "pipe", "pipe"],
