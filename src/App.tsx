@@ -152,6 +152,7 @@ export default function App() {
   const [exportScope, setExportScope] = useState<"canvas" | "selection">("canvas");
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
   const docRef = useRef<DrawDocument | null>(null);
+  const activeDocumentIdRef = useRef<string | null>(null);
   const clientId = useRef(randomId());
   const revokedMcpCommandIds = useRef(new Set<string>());
   const completedMcpCommandIds = useRef(new Set<string>());
@@ -216,6 +217,7 @@ export default function App() {
 
   const setDocument = useCallback((next: DrawDocument) => {
     docRef.current = next;
+    activeDocumentIdRef.current = next.document.id;
     setDoc(next);
   }, []);
 
@@ -230,8 +232,12 @@ export default function App() {
     if (!writerOwned.current) return;
     const outcome = await saveCurrentDocument(value);
     if (outcome.saved) setStatus("saved");
-    // A canvas switch or deletion can race with an already-running save. The
-    // storage layer safely rejects that stale write; it is not a user error.
+    else if (activeDocumentIdRef.current === value.document.id) {
+      // A rejected write is actionable only while the submitted document is
+      // still active. A switched or deleted canvas is expected to be stale.
+      setStatus("error");
+      setMessage("A newer saved scene or app state was kept; reload the page to continue from it.");
+    }
   }, 350, (error) => {
     setStatus("error");
     setMessage(`Autosave failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -694,6 +700,7 @@ export default function App() {
       await settleEditorBeforeSwitch();
       autosave.cancelPending(); bridgeAutosave.cancelPending();
       await deleteCanvas(target.id);
+      activeDocumentIdRef.current = null;
       const next = await loadCurrentDocument();
       let updated = await listCanvases(activeWorkspaceId);
       if (!updated.length) { const fresh = await createCanvas(activeWorkspaceId, "Untitled drawing"); updated = [fresh]; await setActiveCanvas(fresh.id); }
@@ -701,6 +708,7 @@ export default function App() {
       const activeDocument = next?.document.id === active.documentId ? next : await loadCanvasDocument(active.id);
       if (activeDocument) { await setActiveCanvas(active.id); setDocument(activeDocument); setEditorKey((key) => key + 1); }
       await refreshWorkspaceList(activeWorkspaceId, active.id);
+      setStatus("saved"); setMessage("");
     } catch (error) { setMessage(`Could not delete canvas: ${error instanceof Error ? error.message : String(error)}`); }
   };
 
@@ -711,6 +719,7 @@ export default function App() {
       await settleEditorBeforeSwitch();
       autosave.cancelPending(); bridgeAutosave.cancelPending();
       await deleteWorkspace(workspace.id);
+      activeDocumentIdRef.current = null;
       let remaining = await listWorkspaces();
       if (!remaining.length) remaining = [await createWorkspace("My workspace")];
       const nextWorkspace = remaining[0];
@@ -722,6 +731,7 @@ export default function App() {
       if (!next) throw new Error("The replacement canvas could not be loaded.");
       setDocument(next); setEditorKey((key) => key + 1);
       await refreshWorkspaceList(nextWorkspace.id, nextCanvas.id);
+      setStatus("saved"); setMessage("");
     } catch (error) { setMessage(`Could not delete workspace: ${error instanceof Error ? error.message : String(error)}`); }
   };
 

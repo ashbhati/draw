@@ -2430,7 +2430,7 @@ test("workspaces and canvases create, switch, rename, duplicate, delete, and sur
   const undoBounds = await undoCanvas.boundingBox();
   if (!undoBounds || !lastShape) throw new Error("The renamed scene is unavailable.");
   await page.mouse.click(undoBounds.x + lastShape.x + lastShape.width / 2, undoBounds.y + lastShape.y + lastShape.height / 2);
-  await page.keyboard.press("Meta+z");
+  await page.keyboard.press("ControlOrMeta+z");
   await expect.poll(async () => (await readLocalDocument(page))?.document.elements.filter((element: any) => !element.isDeleted).length).toBe(1);
   await page.getByRole("button", { name: "Duplicate canvas" }).click();
   await expect(canvasPicker.locator("option")).toHaveCount(3);
@@ -2459,6 +2459,7 @@ test("pending autosave is discarded safely when switching or deleting a canvas",
   await page.getByRole("button", { name: "New canvas" }).click();
   await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
   const canvas = page.locator(".excalidraw canvas").last();
+  await expect(canvas).toBeVisible();
   await expect.poll(() => canvas.boundingBox()).not.toBeNull();
   const box = await canvas.boundingBox();
   if (!box) throw new Error("The drawing canvas is unavailable.");
@@ -2477,6 +2478,52 @@ test("pending autosave is discarded safely when switching or deleting a canvas",
   await expect(canvasPicker.locator("option")).toHaveCount(1);
   await expect(page.getByText("Saved on this device")).toBeVisible();
   await expect(page.getByText(/reload the page to continue/i)).toHaveCount(0);
+});
+
+test("same-canvas save conflicts show an error, then deleting canvas or workspace resets status", async ({ page }) => {
+  const createSameCanvasSaveConflict = async (title: string) => {
+    await expect(page.getByText("Saved on this device")).toBeVisible();
+    // Let a just-created workspace/canvas finish its initial debounced write
+    // before installing the competing revision used by this fixture.
+    await page.waitForTimeout(450);
+    const current = await readLocalDocument(page);
+    const newerSaved = structuredClone(current);
+    newerSaved.document.documentRevision += 1_000_000;
+    await page.evaluate((document) => new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open("draw-local");
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const db = request.result;
+        const tx = db.transaction("documents", "readwrite");
+        tx.objectStore("documents").put(document, ["draw-document", document.document.id]);
+        tx.objectStore("documents").put(document, "current");
+        tx.oncomplete = () => { db.close(); resolve(); };
+        tx.onerror = () => { db.close(); reject(tx.error); };
+        tx.onabort = () => { db.close(); reject(tx.error); };
+      };
+    }), newerSaved);
+    await expect.poll(async () => (await readLocalDocument(page))?.document.documentRevision)
+      .toBe(newerSaved.document.documentRevision);
+    await page.getByLabel("Drawing title").fill(title);
+    await expect(page.getByText("Save issue")).toBeVisible();
+    await expect(page.getByText(/newer saved scene/i)).toBeVisible();
+  };
+
+  const canvasPicker = page.locator('nav select[aria-label="Canvas"]');
+  await createSameCanvasSaveConflict("Canvas conflict");
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete canvas" }).click();
+  await expect(canvasPicker.locator("option")).toHaveCount(1);
+  await expect(page.getByText("Saved on this device")).toBeVisible();
+  await expect(page.getByText(/newer saved scene/i)).toHaveCount(0);
+
+  await page.getByRole("button", { name: "New workspace" }).click();
+  await createSameCanvasSaveConflict("Workspace conflict");
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete workspace" }).click();
+  await expect(page.locator('select[aria-label="Workspace"] option')).toHaveCount(1);
+  await expect(page.getByText("Saved on this device")).toBeVisible();
+  await expect(page.getByText(/newer saved scene/i)).toHaveCount(0);
 });
 
 test("a read-only tab does not bootstrap a fresh workspace or active canvas pointer", async ({ browser, baseURL }) => {
