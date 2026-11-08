@@ -52,7 +52,7 @@ export async function createDrawRuntimeServer(options: DrawRuntimeServerOptions)
   const distInfo = await stat(distDirectory).catch(() => null);
   if (!distInfo?.isDirectory()) throw new Error(`Draw production files were not found at ${distDirectory}. Run npm run build first.`);
 
-  const eventStreams = new Set<ServerResponse>();
+  const eventStreams = new Map<ServerResponse, string>();
   let bridgeMiddleware: ((request: IncomingMessage, response: ServerResponse, next: (error?: unknown) => void) => void) | null = null;
   const config = { mode: "production", isProduction: true, server: { host: "127.0.0.1", port: options.port ?? 0 }, logger: { warn: () => undefined } };
   const httpServer = createServer((request, response) => {
@@ -64,9 +64,18 @@ export async function createDrawRuntimeServer(options: DrawRuntimeServerOptions)
     middlewares: { use: (middleware: typeof bridgeMiddleware) => { bridgeMiddleware = middleware; } },
     ws: {
       send: (event: string, data: unknown) => {
-        for (const response of eventStreams) {
+        const targetClientId = data && typeof data === "object" && "clientId" in data && typeof data.clientId === "string"
+          ? data.clientId
+          : null;
+        for (const [response, clientId] of eventStreams) {
           if (response.destroyed || response.writableEnded) eventStreams.delete(response);
-          else sendSse(response, event, data);
+          else if (targetClientId === null || targetClientId === clientId) {
+            sendSse(response, event, data);
+            if (event === "draw:editor-lease-revoked" && targetClientId === clientId) {
+              response.end();
+              eventStreams.delete(response);
+            }
+          }
         }
       },
     },
@@ -119,7 +128,8 @@ export async function createDrawRuntimeServer(options: DrawRuntimeServerOptions)
       if (path === "/__draw/api/events" && request.method === "GET") {
         const originalWrite = response.write.bind(response);
         response.write = ((chunk: any, ...args: any[]) => {
-          if (response.statusCode === 200) eventStreams.add(response);
+          const clientId = (response as ServerResponse & { drawClientId?: string }).drawClientId;
+          if (response.statusCode === 200 && clientId) eventStreams.set(response, clientId);
           return originalWrite(chunk, ...args);
         }) as typeof response.write;
         response.once("close", () => eventStreams.delete(response));
@@ -164,7 +174,7 @@ export async function createDrawRuntimeServer(options: DrawRuntimeServerOptions)
     close: async () => {
       if (closed) return;
       closed = true;
-      for (const response of eventStreams) response.end();
+      for (const response of eventStreams.keys()) response.end();
       eventStreams.clear();
       await ipc.close();
       await new Promise<void>((resolveClose, reject) => httpServer.close((error) => error ? reject(error) : resolveClose()));

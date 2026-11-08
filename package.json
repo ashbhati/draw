@@ -40,8 +40,10 @@
     "mcp": "tsx src/integrations/mcp-server.ts",
     "test:e2e:production": "npm run build && playwright test --config playwright.production.config.ts",
     "test:e2e:package": "playwright test --config playwright.package.config.ts",
+    "test:package:installed": "node scripts/test-packaged-runtime.mjs",
     "prepack": "npm run build",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:release": "npm test && npm run build && npm run test:e2e && npm run test:e2e:production && npm run test:package:installed"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.4.0",

@@ -2,6 +2,7 @@ import { chmod, lstat, mkdir, rm } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { validateUnixSocketPath } from "./ipc-path";
 
 export type DrawIpcHandler = (request: IncomingMessage, response: ServerResponse) => void;
 
@@ -25,6 +26,8 @@ export function getDefaultDrawRuntimeDirectory(env: NodeJS.ProcessEnv = process.
 export async function createPrivateIpcServer(runtimeDirectory: string, handler: DrawIpcHandler): Promise<PrivateIpcServer> {
   if (runtimeDirectory.includes("\0")) throw new Error("Invalid Draw runtime directory.");
   const absoluteRuntimeDirectory = resolve(runtimeDirectory);
+  const socketPath = join(absoluteRuntimeDirectory, "bridge.sock");
+  validateUnixSocketPath(socketPath);
   await mkdir(absoluteRuntimeDirectory, { recursive: true, mode: 0o700 });
   const directoryInfo = await lstat(absoluteRuntimeDirectory);
   if (directoryInfo.isSymbolicLink()) throw new Error("Draw runtime directory must not be a symlink.");
@@ -34,7 +37,6 @@ export async function createPrivateIpcServer(runtimeDirectory: string, handler: 
   }
   await chmod(absoluteRuntimeDirectory, 0o700);
 
-  const socketPath = join(absoluteRuntimeDirectory, "bridge.sock");
   const existingSocket = await lstat(socketPath).catch((error) => error?.code === "ENOENT" ? null : Promise.reject(error));
   if (existingSocket) {
     if (existingSocket.isSymbolicLink() || !existingSocket.isSocket()) throw new Error("Draw IPC socket path is occupied by a non-socket file.");

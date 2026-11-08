@@ -32,22 +32,23 @@ Starting Draw opens the local URL from an interactive terminal; `draw start --no
 
 ## Package validation and release gate
 
-Validate a local tarball before publication:
+Run the complete release gate before publishing or cutting a release:
 
 ```sh
-npm test
-npm run build
-npm pack --dry-run
-npm pack
+npm ci
+npx playwright install chromium
+npm run test:release
 ```
 
-Install the generated tarball into a clean test prefix, then run the packaged Chrome flow against its installed CLI:
+`test:release` runs unit/config tests, the production build, the Chrome browser suite, production MCP round-trip, and a real `npm pack` + clean-prefix install followed by the packaged Chrome/MCP round-trip. The packaged CLI tests run from an empty temporary working directory with no `node_modules`, covering `draw help`, `draw start`, and `draw mcp`. GitHub Actions runs this release gate on Node 20 and 22 for pull requests and main-branch pushes.
+
+To run only the packaged browser check against an already installed tarball:
 
 ```sh
 DRAW_PACKAGE_BIN=/absolute/path/to/test-prefix/node_modules/@ashbhati/draw/bin/draw.js npm run test:e2e:package
 ```
 
-This flow starts `draw start` in a trusted pseudo-terminal, connects the production UI in Chrome, pairs a local stdio MCP host through `draw mcp`, rejects unpaired HTTP reads, and creates and verifies an editable diagram through IPC. The end-user manual acceptance flow should also save and reopen a `.draw` file and export PNG/JPEG. Verify that the socket directory and socket have modes 0700 and 0600.
+This flow starts `draw start` in a trusted pseudo-terminal, connects the production UI in Chrome, pairs a local stdio MCP host through `draw mcp`, rejects unpaired HTTP reads, and creates and verifies an editable diagram through IPC. Before transmitting a paired capability, the MCP client verifies that the socket and parent directory are owned by its OS user, are not symlinks, and have private permissions. Overlong socket paths fail with guidance to set `DRAW_RUNTIME_DIR` to a shorter per-user path. The end-user manual acceptance flow should also save and reopen a `.draw` file and export PNG/JPEG.
 
 **Publishing is gated on the owner selecting and adding a root project license.** This PR intentionally adds no license file or SPDX identifier and does not publish the package. Once the owner selects the project license, add it at the repository root, set the package's `license` field to the matching SPDX identifier, choose a release version, and publish with `npm publish --access public` from the reviewed release tag.
 

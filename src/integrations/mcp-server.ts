@@ -10,6 +10,7 @@ import { shouldRequireOpenConfirmation } from "../document/open-safety";
 import { serializeDrawFile } from "../document/document";
 import { readConfiguredPairingSecret } from "./mcp-pairing-config";
 import { requestDrawIpc } from "../runtime/ipc-client";
+import { drawStartRequiredError } from "./mcp-transport-error";
 
 const defaultBaseUrl = "http://127.0.0.1:5173";
 const requestTimeoutMs = 25_000;
@@ -164,6 +165,8 @@ async function bridgeRequest(path: string, init?: RequestInit, options: { pairin
     if (error instanceof Error && error.name === "AbortError") {
       throw new Error("Timed out waiting for the Draw canvas. Keep the local Draw app open and try again.");
     }
+    const unavailable = drawStartRequiredError(error, Boolean(ipcSocketPath), ipcSocketPath ? undefined : baseUrl.origin);
+    if (unavailable) throw unavailable;
     if (error instanceof TypeError) {
       throw new Error(ipcSocketPath
         ? "Cannot reach the Draw runtime over local IPC. Start Draw, then retry."

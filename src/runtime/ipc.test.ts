@@ -4,6 +4,7 @@ import { chmod, lstat, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPrivateIpcServer } from "./ipc";
+import { validateUnixSocketPath } from "./ipc-path";
 
 describe("Draw production MCP IPC", () => {
   const directories: string[] = [];
@@ -58,5 +59,11 @@ describe("Draw production MCP IPC", () => {
     await symlink(target, link);
 
     await expect(createPrivateIpcServer(link, () => undefined)).rejects.toThrow(/symlink/i);
+  });
+
+  it("rejects socket paths beyond the platform limit with runtime directory guidance", () => {
+    const longPath = `/tmp/${"d".repeat(140)}/bridge.sock`;
+    expect(() => validateUnixSocketPath(longPath, "darwin")).toThrow(/too long.*DRAW_RUNTIME_DIR/i);
+    expect(() => validateUnixSocketPath(longPath, "linux")).toThrow(/too long.*DRAW_RUNTIME_DIR/i);
   });
 });

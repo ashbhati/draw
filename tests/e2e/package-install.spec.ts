@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,8 +18,9 @@ async function unusedPort(): Promise<number> {
   return port;
 }
 
-async function startInstalledMcp(bin: string, runtimeDirectory: string, configHome: string, pairingSecret: string) {
+async function startInstalledMcp(bin: string, runtimeDirectory: string, configHome: string, pairingSecret: string, cwd: string) {
   const child = spawn(process.execPath, [bin, "mcp"], {
+    cwd,
     env: {
       ...process.env,
       DRAW_RUNTIME_DIR: runtimeDirectory,
@@ -77,6 +78,17 @@ async function startInstalledMcp(bin: string, runtimeDirectory: string, configHo
   };
 }
 
+async function runInstalledCommand(bin: string, args: string[], cwd: string): Promise<{ code: number | null; output: string }> {
+  const child = spawn(process.execPath, [bin, ...args], { cwd, stdio: ["ignore", "pipe", "pipe"] });
+  let output = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk: string) => { output += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk: string) => { output += chunk; });
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code) => resolve({ code, output }));
+  });
+}
+
 test("installed npm package serves the production app and MCP edits it over local IPC", async ({ page }) => {
   test.setTimeout(60_000);
   const bin = process.env.DRAW_PACKAGE_BIN;
@@ -85,15 +97,22 @@ test("installed npm package serves the production app and MCP edits it over loca
 
   const root = await mkdtemp(join("/tmp", "draw-pkg-"));
   const configHome = await mkdtemp(join(tmpdir(), "draw-pkg-config-"));
+  const neutralCwd = join(root, "neutral-cwd");
+  await mkdir(neutralCwd);
+  await expect(access(join(neutralCwd, "node_modules"))).rejects.toThrow();
   const port = await unusedPort();
   const url = `http://127.0.0.1:${port}/`;
   let output = "";
   let runtimeProcess: ChildProcessWithoutNullStreams | undefined;
   let mcp: Awaited<ReturnType<typeof startInstalledMcp>> | undefined;
   try {
+    const help = await runInstalledCommand(bin, ["help"], neutralCwd);
+    expect(help.code, help.output).toBe(0);
+    expect(help.output).toContain("draw start");
     // `script` gives the installed CLI a real terminal so launch-code display
     // follows the same trusted-terminal path users receive.
     runtimeProcess = spawn("script", ["-q", "/dev/null", bin, "start", "--port", String(port), "--no-open"], {
+      cwd: neutralCwd,
       env: { ...process.env, DRAW_RUNTIME_DIR: join(root, "run") },
       stdio: ["ignore", "pipe", "pipe"],
     }) as ChildProcessWithoutNullStreams;
@@ -117,7 +136,7 @@ test("installed npm package serves the production app and MCP edits it over loca
     await page.getByRole("button", { name: "MCP clients" }).click();
     const pairingSecret = await page.locator(".mcp-pairing-secret code").innerText();
     expect(pairingSecret).toMatch(/^[a-f\d]{64}$/i);
-    mcp = await startInstalledMcp(bin, join(root, "run"), configHome, pairingSecret);
+    mcp = await startInstalledMcp(bin, join(root, "run"), configHome, pairingSecret, neutralCwd);
     const pairing = mcp.tool("pair_mcp_client", {});
     await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
     await page.getByRole("button", { name: "Approve client" }).click();
@@ -136,6 +155,17 @@ test("installed npm package serves the production app and MCP edits it over loca
     expect(changed.result.isError).not.toBe(true);
     const verified = JSON.parse((await mcp.tool("get_current_canvas", {})).result.content[0].text);
     expect(JSON.stringify(verified)).toContain("Created by installed Draw CLI");
+
+    runtimeProcess.kill("SIGTERM");
+    await new Promise<void>((resolve) => {
+      if (!runtimeProcess || runtimeProcess.exitCode !== null) { resolve(); return; }
+      const timer = setTimeout(() => { runtimeProcess?.kill("SIGKILL"); resolve(); }, 3_000);
+      runtimeProcess.once("exit", () => { clearTimeout(timer); resolve(); });
+    });
+    runtimeProcess = undefined;
+    const unavailable = await mcp.tool("get_current_canvas", {});
+    expect(unavailable.result.isError).toBe(true);
+    expect(JSON.stringify(unavailable.result.content)).toMatch(/Cannot reach Draw over local IPC.*Start Draw.*retry/i);
   } finally {
     await mcp?.close();
     runtimeProcess?.kill("SIGTERM");

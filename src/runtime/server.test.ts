@@ -87,4 +87,49 @@ describe("production Draw runtime", () => {
     });
     expect(editorResponse.status).toBe(403);
   });
+
+  it("closes a superseded editor's production event stream after its lease is revoked", async () => {
+    const launchCodes = ["AAAAAAAAAAAA", "BBBBBBBBBBBB"];
+    let generatedSecrets = 0;
+    const server = await startRuntime({
+      editorAuthForTests: {
+        displayLaunchCode: () => true,
+        generateLaunchCode: () => launchCodes.shift() ?? "CCCCCCCCCCCC",
+        generateSecret: () => `${++generatedSecrets}`.padStart(64, "a"),
+        store: { load: async () => ({ failedAttempts: 0, lockedUntil: 0 }), save: async () => undefined },
+      },
+    });
+    const origin = new URL(server.url).origin;
+    const authenticate = async (clientId: string, launchCode: string) => {
+      const response = await fetch(new URL("/__draw/api/editor/bootstrap", server.url), {
+        method: "POST",
+        headers: { origin, "content-type": "application/json" },
+        body: JSON.stringify({ clientId, launchCode }),
+      });
+      expect(response.status).toBe(200);
+      return response.json() as Promise<{ editorSecret: string }>;
+    };
+    const first = await authenticate("editor-one", "AAAAAAAAAAAA");
+    const ticketResponse = await fetch(new URL("/__draw/api/events/ticket", server.url), {
+      method: "POST",
+      headers: { origin, "content-type": "application/json", "x-draw-editor-secret": first.editorSecret },
+      body: "{}",
+    });
+    const { ticket } = await ticketResponse.json() as { ticket: string };
+    const streamResponse = await fetch(new URL(`/__draw/api/events?ticket=${encodeURIComponent(ticket)}`, server.url), { headers: { origin } });
+    expect(streamResponse.status).toBe(200);
+    const reader = streamResponse.body!.getReader();
+    const decoder = new TextDecoder();
+    expect(decoder.decode((await reader.read()).value)).toContain(": connected");
+
+    await authenticate("editor-two", "BBBBBBBBBBBB");
+    const revoked = await reader.read();
+    expect(revoked.done).toBe(false);
+    expect(decoder.decode(revoked.value)).toContain("draw:editor-lease-revoked");
+    const closed = await new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Superseded editor stream stayed open.")), 1_000);
+      reader.read().then((result) => { clearTimeout(timeout); resolve(result); }, reject);
+    });
+    expect(closed.done).toBe(true);
+  });
 });

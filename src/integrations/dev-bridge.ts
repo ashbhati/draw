@@ -354,6 +354,7 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
               sendJson(response, 401, { error: "The Draw event ticket is missing, expired, or already used." });
               return;
             }
+            (response as ServerResponse & { drawClientId?: string }).drawClientId = grant.clientId;
             response.statusCode = 200;
             response.setHeader("content-type", "text/event-stream; charset=utf-8");
             response.setHeader("cache-control", "no-store");
