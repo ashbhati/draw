@@ -296,7 +296,7 @@ function createServer() {
       if (confirmation.status !== "APPROVED") return textResult({ status: confirmation.status, opened: false, documentId: current.document.id });
     }
     const result = await bridgeRequest("/__draw/api/commands", { method: "POST", body: JSON.stringify({ ...command, document }) });
-    return textResult({ ...result.result, documentId: document.document.id, title: document.document.title, documentRevision: document.document.documentRevision });
+    return textResult({ ...result.result });
   });
 
   server.registerTool("save_document", {

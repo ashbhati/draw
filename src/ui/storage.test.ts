@@ -171,6 +171,8 @@ describe("local Draw autosave", () => {
 
   it("replaces content without changing canvas identity or colliding with sibling IDs", async () => {
     const initial = createEmptyDocument("Original");
+    initial.document.documentRevision = 9;
+    initial.document.viewRevision = 4;
     await saveCurrentDocument(initial);
     const workspace = (await listWorkspaces())[0];
     const canvasA = (await listCanvases(workspace.id))[0];
@@ -186,7 +188,8 @@ describe("local Draw autosave", () => {
     const outcome = await saveCurrentDocument(incoming, { replaceDocument: true });
     expect(outcome.saved).toBe(true);
     expect(outcome.document?.document.id).not.toBe(siblingDocument.document.id);
-    expect(outcome.document?.document.documentRevision).toBe(0);
+    expect(outcome.document?.document.documentRevision).toBe(10);
+    expect(outcome.document?.document.viewRevision).toBeGreaterThan(4);
     expect((await listCanvases(workspace.id)).find((canvas) => canvas.id === canvasA.id)).toMatchObject({
       id: canvasA.id,
       documentId: outcome.document!.document.id,
@@ -207,6 +210,49 @@ describe("local Draw autosave", () => {
     expect(undo).toBeUndefined();
     expect(redo).toBeUndefined();
     expect(operations).toBeUndefined();
+  });
+
+  it("drops an autosave for the old document after a replacement without throwing", async () => {
+    const original = createEmptyDocument("Before replacement");
+    await saveCurrentDocument(original);
+    const imported = createEmptyDocument("Imported replacement");
+    const replacement = await saveCurrentDocument(imported, { replaceDocument: true });
+    expect(replacement.saved).toBe(true);
+    await expect(saveCurrentDocument(original)).resolves.toEqual({ saved: false });
+    expect(await loadCurrentDocument()).toEqual(replacement.document);
+  });
+
+  it("invalidates old MCP replay and rejects the pre-open revision after replacement", async () => {
+    const before = createEmptyDocument("MCP before open");
+    await saveCurrentDocument(before);
+    const after = structuredClone(before);
+    after.document.documentRevision = 1;
+    const operation: DurableMcpOperation = {
+      documentId: before.document.id, clientIdentity: "open-test-client", idempotencyKey: "pre-open", payloadHash: "pre-open-hash",
+      operationId: "pre-open-operation", actor: "open-test-client", baseRevision: 0, resultingRevision: 1,
+      result: { operationId: "pre-open-operation" }, beforeDocument: before, afterDocument: after, undoEligible: true, completedAt: Date.now(),
+    };
+    await commitMcpOperation(after, operation);
+    const replacement = await saveCurrentDocument(createEmptyDocument("MCP after open"), { replaceDocument: true });
+    expect(replacement.document?.document.documentRevision).toBe(2);
+    expect(await loadMcpOperation(before.document.id, operation.clientIdentity, operation.idempotencyKey)).toBeNull();
+    const stale = structuredClone(after);
+    stale.document.documentRevision = 2;
+    await expect(commitMcpOperation(stale, {
+      ...operation, idempotencyKey: "stale-after-open", operationId: "stale-after-open", baseRevision: 1, resultingRevision: 2,
+      beforeDocument: after, afterDocument: stale,
+    })).rejects.toThrow(/CONFLICT/i);
+  });
+
+  it("serializes an autosave racing a replacement without surfacing a recovery error", async () => {
+    const original = createEmptyDocument("Original for race");
+    await saveCurrentDocument(original);
+    const imported = createEmptyDocument("Replacement for race");
+    const staleSave = saveCurrentDocument(original);
+    const replacementSave = saveCurrentDocument(imported, { replaceDocument: true });
+    const results = await Promise.all([staleSave, replacementSave]);
+    expect(results[1].saved).toBe(true);
+    expect(await loadCurrentDocument()).toMatchObject({ document: { title: "Replacement for race" } });
   });
 
   it("quarantines malformed V1 autosave and keeps the upgraded database usable", async () => {
@@ -479,6 +525,7 @@ describe("local Draw autosave", () => {
 
   it("does not let a delayed autosave from a previous document replace the active document", async () => {
     const active = createEmptyDocument("Active document");
+    active.document.documentRevision = 9;
     await saveCurrentDocument(active);
     const staleOtherDocument = createEmptyDocument("Stale previous document");
     await saveCurrentDocument(staleOtherDocument);
@@ -488,6 +535,7 @@ describe("local Draw autosave", () => {
     const replaced = await loadCurrentDocument();
     expect(replaced?.document.id).not.toBe(staleOtherDocument.document.id);
     expect(replaced?.document.title).toBe(staleOtherDocument.document.title);
+    expect(replaced?.document.documentRevision).toBe(10);
   });
 
   it("durably replays viewport mutations and CAS-checks their view revision", async () => {

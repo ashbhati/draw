@@ -197,8 +197,8 @@ export async function saveCurrentDocument(document: DrawDocument, options: { rep
   const writeOrder = options.writeToken ?? { sessionId: AUTOSAVE_SESSION_ID, sequence: ++autosaveSequence };
   const database = await openDatabase();
   try {
-    let activeCanvas = await resolveActiveCanvas(database);
-    if (!activeCanvas) {
+    const resolvedCanvas = await resolveActiveCanvas(database);
+    if (!resolvedCanvas) {
       const metaTx = database.transaction(WORKSPACE_META_STORE, "readonly");
       const hasCanvasHistory = await requestValue<boolean | undefined>(metaTx.objectStore(WORKSPACE_META_STORE).get(INITIALIZED_KEY));
       await waitForTransaction(metaTx);
@@ -209,8 +209,8 @@ export async function saveCurrentDocument(document: DrawDocument, options: { rep
       const tx = database.transaction([DOCUMENTS_STORE, WORKSPACES_STORE, CANVASES_STORE, WORKSPACE_META_STORE], "readwrite");
       tx.objectStore(DOCUMENTS_STORE).put(document, documentKey(document.document.id));
       tx.objectStore(WORKSPACES_STORE).put({ id: workspaceId, name: "My workspace", createdAt: now, updatedAt: now } satisfies DrawWorkspace, workspaceId);
-      activeCanvas = { id: canvasId, workspaceId, name: document.document.title, documentId: document.document.id, createdAt: now, updatedAt: now };
-      tx.objectStore(CANVASES_STORE).put(activeCanvas, canvasId);
+      const initialCanvas = { id: canvasId, workspaceId, name: document.document.title, documentId: document.document.id, createdAt: now, updatedAt: now } satisfies DrawCanvas;
+      tx.objectStore(CANVASES_STORE).put(initialCanvas, canvasId);
       tx.objectStore(WORKSPACE_META_STORE).put({ workspaceId, canvasId } satisfies ActiveCanvasPointer, ACTIVE_POINTER_KEY);
       tx.objectStore(WORKSPACE_META_STORE).put(true, INITIALIZED_KEY);
       tx.objectStore(DOCUMENTS_STORE).put(document, CURRENT_DOCUMENT_KEY);
@@ -226,22 +226,19 @@ export async function saveCurrentDocument(document: DrawDocument, options: { rep
     const undo = transaction.objectStore(MCP_UNDO_STORE);
     const redo = transaction.objectStore(MCP_REDO_STORE);
     const activePointerRequest = meta.get(ACTIVE_POINTER_KEY);
-    const activeCanvasRequest = canvases.get(activeCanvas.id);
-    const currentRequest = documents.get(documentKey(activeCanvas.documentId));
-    const orderRequest = documents.get(writeOrderKey(activeCanvas.documentId));
-    let readsRemaining = 4;
+    let activeCanvas: DrawCanvas | undefined;
+    let current: DrawDocument | undefined;
+    let previousOrder: AutosaveOrder | undefined;
+    let readsRemaining = 0;
     let savedDocument: DrawDocument | undefined;
     let saveError: Error | undefined;
     const finishSave = () => {
       const pointer = activePointerRequest.result as ActiveCanvasPointer | undefined;
-      const canvas = activeCanvasRequest.result as DrawCanvas | undefined;
-      const current = currentRequest.result as DrawDocument | undefined;
-      const previousOrder = orderRequest.result as AutosaveOrder | undefined;
-      if (!pointer || pointer.canvasId !== activeCanvas!.id || !canvas || canvas.documentId !== activeCanvas!.documentId) {
-        saveError = new DrawStorageRecoveryError("The active Draw canvas changed or became damaged before this save completed. Reload the canvas and retry.");
-        transaction.abort();
-        return;
-      }
+      const canvas = activeCanvas;
+      // A switch or replacement between the preflight recovery and this
+      // transaction is an ordinary stale autosave. The pointer, canvas, doc,
+      // and write all belong to this transaction, so it cannot cross canvases.
+      if (!pointer || !canvas || pointer.canvasId !== canvas.id) return;
       if (!current) {
         saveError = new DrawStorageRecoveryError("The active Draw canvas is damaged: its editable document is missing.");
         transaction.abort();
@@ -263,8 +260,8 @@ export async function saveCurrentDocument(document: DrawDocument, options: { rep
       const next = structuredClone(document);
       if (options.replaceDocument) {
         next.document.id = crypto.randomUUID();
-        next.document.documentRevision = 0;
-        next.document.viewRevision = 0;
+        next.document.documentRevision = Math.max(document.document.documentRevision, current.document.documentRevision + 1);
+        next.document.viewRevision = Math.max(document.document.viewRevision, current.document.viewRevision + 1);
       }
       const oldDocumentId = canvas.documentId;
       const nextCanvas = { ...canvas, documentId: next.document.id, name: next.document.title, updatedAt: Date.now() };
@@ -298,11 +295,28 @@ export async function saveCurrentDocument(document: DrawDocument, options: { rep
         savedDocument = next;
       }
     };
-    const maybeFinish = () => { readsRemaining -= 1; if (readsRemaining === 0) finishSave(); };
-    activePointerRequest.onsuccess = maybeFinish;
-    activeCanvasRequest.onsuccess = maybeFinish;
-    currentRequest.onsuccess = maybeFinish;
-    orderRequest.onsuccess = maybeFinish;
+    activePointerRequest.onsuccess = () => {
+      const pointer = activePointerRequest.result as ActiveCanvasPointer | undefined;
+      if (!pointer) return;
+      const activeCanvasRequest = canvases.get(pointer.canvasId);
+      activeCanvasRequest.onsuccess = () => {
+        activeCanvas = activeCanvasRequest.result as DrawCanvas | undefined;
+        if (!activeCanvas) {
+          saveError = new DrawStorageRecoveryError("The active Draw canvas pointer is damaged; no canvas row exists for it.");
+          transaction.abort();
+          return;
+        }
+        const currentRequest = documents.get(documentKey(activeCanvas.documentId));
+        const orderRequest = documents.get(writeOrderKey(activeCanvas.documentId));
+        readsRemaining = 2;
+        const maybeFinish = () => { readsRemaining -= 1; if (readsRemaining === 0) finishSave(); };
+        currentRequest.onsuccess = () => { current = currentRequest.result as DrawDocument | undefined; maybeFinish(); };
+        orderRequest.onsuccess = () => { previousOrder = orderRequest.result as AutosaveOrder | undefined; maybeFinish(); };
+        currentRequest.onerror = orderRequest.onerror = () => { saveError = new Error("Could not inspect the active Draw document before saving."); transaction.abort(); };
+      };
+      activeCanvasRequest.onerror = () => { saveError = activeCanvasRequest.error ?? new Error("Could not inspect the active Draw canvas."); transaction.abort(); };
+    };
+    activePointerRequest.onerror = () => { saveError = activePointerRequest.error ?? new Error("Could not inspect the active Draw canvas selection."); transaction.abort(); };
     try { await waitForTransaction(transaction); } catch (error) { throw saveError ?? error; }
     if (saveError) throw saveError;
     return savedDocument ? { saved: true, document: savedDocument } : { saved: false };

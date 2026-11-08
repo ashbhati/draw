@@ -2258,10 +2258,13 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
     await page.getByRole("button", { name: "Approve opening" }).click();
     const openResponse = await mcp.call("open_document", { path: "stdio-roundtrip.draw", documentId: current.documentId, expectedDocumentRevision: current.documentRevision, confirmationToken: approvedChallenge.confirmationToken });
     expect(openResponse.error).toBeUndefined();
-    expect(JSON.parse(openResponse.result.content[0].text).opened).toBe(true);
+    const openResult = JSON.parse(openResponse.result.content[0].text);
+    expect(openResult.opened).toBe(true);
     await expect.poll(async () => (await (await page.request.get("/__draw/api/document?flush=1", { headers: mcpAuthHeaders() })).json()).document.elements.some((element: any) => element.id === created.nodes.first)).toBe(true);
     const reopened = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
     expect(reopened.documentRevision).toBeGreaterThan(current.documentRevision);
+    expect(openResult.documentId).toBe(reopened.documentId);
+    expect(openResult.documentRevision).toBe(reopened.documentRevision);
     const reusedToken = await mcp.call("open_document", { path: "stdio-roundtrip.draw", documentId: reopened.documentId, expectedDocumentRevision: reopened.documentRevision, confirmationToken: approvedChallenge.confirmationToken });
     expect(JSON.parse(reusedToken.result.content[0].text).status).toBe("EXPIRED");
     const unsafe = await mcp.call("open_document", { path: "../outside.draw", documentId: current.documentId, expectedDocumentRevision: current.documentRevision });
