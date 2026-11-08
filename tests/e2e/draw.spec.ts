@@ -404,6 +404,15 @@ async function countInkInSceneRegion(
 }
 
 test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => {
+    const createObjectURL = URL.createObjectURL.bind(URL);
+    URL.createObjectURL = ((object: Blob | MediaSource) => {
+      if (object instanceof Blob && object.type.includes("image/svg+xml")) {
+        void object.text().then((svg) => { (window as any).__drawLastExportSvg = svg; });
+      }
+      return createObjectURL(object);
+    }) as typeof URL.createObjectURL;
+  });
   await waitForBridge(page);
   await page.locator(".excalidraw canvas").first().waitFor();
   await expect(page.getByRole("button", { name: "Blackboard", exact: true })).toBeEnabled();
@@ -1588,14 +1597,13 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
   await expect.poll(async () => Object.keys((await freshBridgeDocument(page)).document.appState.selectedElementIds ?? {}).length).toBeGreaterThan(0);
   const exportScene = await freshBridgeDocument(page);
   const liveElements = exportScene.document.elements.filter((element: any) => element.isDeleted !== true);
-  const sceneBounds = await page.evaluate(async (elements) => {
-    // Use Excalidraw's renderer bounds so curved paths, line caps and
-    // arrowheads match the same geometry used by exportToSvg.
-    const { getCommonBounds } = await import("/node_modules/.vite/deps/@excalidraw_excalidraw.js");
-    const [left, top, right, bottom] = getCommonBounds(elements as any);
-    return { left, top, right, bottom };
-  }, liveElements);
-  const exportOrigin = { x: sceneBounds.left - 32, y: sceneBounds.top - 32 };
+  // Excalidraw normalizes its SVG viewBox to (0, 0), so use the scene's
+  // minimum element coordinates only to map the semantic pixel samples.
+  // Export dimensions are validated independently against that SVG viewBox.
+  const exportOrigin = {
+    x: Math.min(...liveElements.map((element: any) => element.x)) - 32,
+    y: Math.min(...liveElements.map((element: any) => element.y)) - 32,
+  };
   const nodeLabels = ["First node", "Second node"].map((label) => {
     const element = liveElements.find((candidate: any) => candidate.type === "text" && candidate.text?.includes(label));
     if (!element) throw new Error(`Could not find editable ${label} text in the exported scene.`);
@@ -1624,6 +1632,23 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
       else await formatControl.selectOption(mime);
       const image = await readFile(await (await downloadWait).path());
       const sample = await inspectImagePixels(page, image, mime);
+      const svgViewport = await page.evaluate(() => {
+        const svg = (window as any).__drawLastExportSvg as string | undefined;
+        if (!svg) throw new Error("The export SVG was not captured before rasterization.");
+        const document = new DOMParser().parseFromString(svg, "image/svg+xml");
+        const root = document.documentElement;
+        const viewBox = root.getAttribute("viewBox")?.trim().split(/[ ,]+/).map(Number);
+        const width = Number.parseFloat(root.getAttribute("width") ?? "");
+        const height = Number.parseFloat(root.getAttribute("height") ?? "");
+        if (!viewBox || viewBox.length !== 4 || viewBox.some((value) => !Number.isFinite(value)) || !Number.isFinite(width) || !Number.isFinite(height)) {
+          throw new Error("The export SVG has no finite intrinsic dimensions and viewBox.");
+        }
+        return { x: viewBox[0], y: viewBox[1], viewWidth: viewBox[2], viewHeight: viewBox[3], width, height };
+      });
+      expect(Math.abs(sample.width - svgViewport.width), `${mime} bitmap width should match its exact SVG export input`).toBeLessThanOrEqual(1);
+      expect(Math.abs(sample.height - svgViewport.height), `${mime} bitmap height should match its exact SVG export input`).toBeLessThanOrEqual(1);
+      expect(Math.abs(svgViewport.viewWidth - svgViewport.width), "SVG viewBox width should map one scene unit to one export pixel").toBeLessThanOrEqual(1);
+      expect(Math.abs(svgViewport.viewHeight - svgViewport.height), "SVG viewBox height should map one scene unit to one export pixel").toBeLessThanOrEqual(1);
       const corner = await sampleImagePatch(page, image, { x: 0.025, y: 0.025 }, mime);
       expect(sample.greenAssetPixels, `${mime} should preserve the embedded image`).toBeGreaterThan(50);
       if (preset === "blackboard") {
@@ -1643,8 +1668,6 @@ test("PNG and JPEG exports keep the complete editable scene even when an object 
         }
         expect(await countInkInSceneRegion(page, image, mime, arrowRegion, exportOrigin, "whiteboard-mark"), `${mime} should render its arrow on Whiteboard`).toBeGreaterThan(0);
       }
-      expect(Math.abs(sample.width - (sceneBounds.right - sceneBounds.left + 64)), `${mime} width should equal scene bounds plus 32px padding on each side`).toBeLessThanOrEqual(3);
-      expect(Math.abs(sample.height - (sceneBounds.bottom - sceneBounds.top + 64)), `${mime} height should equal renderer scene bounds plus 32px padding on each side`).toBeLessThanOrEqual(3);
     }
   }
 
