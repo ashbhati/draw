@@ -1,8 +1,36 @@
 {
-  "name": "draw",
+  "name": "@ashbhati/draw",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
+  "bin": {
+    "draw": "bin/draw.js"
+  },
+  "files": [
+    "bin/",
+    "src/runtime/",
+    "src/integrations/",
+    "src/document/",
+    "src/export/",
+    "src/ui/storage.ts",
+    "src/ui/autosave.ts",
+    "dist/",
+    "README.md",
+    "PLAN.md",
+    "docs/PACKAGING.md",
+    "docs/ASSET_ATTRIBUTION.md",
+    "!src/**/*.test.ts"
+  ],
+  "engines": {
+    "node": ">=20.19.0 <21 || >=22.12.0"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build && node scripts/check-production-bundle.mjs",
@@ -10,16 +38,18 @@
     "test": "vitest run src tests/e2e/config.test.ts",
     "test:watch": "vitest",
     "mcp": "tsx src/integrations/mcp-server.ts",
+    "test:e2e:production": "npm run build && playwright test --config playwright.production.config.ts",
+    "test:e2e:package": "playwright test --config playwright.package.config.ts",
+    "prepack": "npm run build",
     "test:e2e": "playwright test"
   },
   "dependencies": {
-    "@excalidraw/excalidraw": "^0.18.1",
     "@modelcontextprotocol/server": "^2.4.0",
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0",
+    "tsx": "^4.20.0",
     "zod": "^4.1.12"
   },
   "devDependencies": {
+    "@excalidraw/excalidraw": "^0.18.1",
     "@playwright/test": "^1.64.1",
     "@types/node": "^24.10.0",
     "@types/react": "^19.2.0",
@@ -27,7 +57,8 @@
     "@vitejs/plugin-react": "^5.0.0",
     "fake-indexeddb": "^6.2.4",
     "jsdom": "^27.1.0",
-    "tsx": "^4.20.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
     "typescript": "^5.9.3",
     "vite": "^7.1.12",
     "vitest": "^3.2.4"

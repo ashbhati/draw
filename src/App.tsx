@@ -184,16 +184,12 @@ export default function App() {
     };
   }, []);
 
-  useEffect(() => {
-    const revokeEditorLease = (detail: { clientId?: string }) => {
-      if (detail?.clientId !== clientId.current) return;
-      editorSecret.current = null;
-      setEditorConnected(false);
-      setConfirmation(null);
-      setConnectError("This editor session was replaced. Reconnect using the launch code in the trusted terminal.");
-    };
-    import.meta.hot?.on("draw:editor-lease-revoked", revokeEditorLease);
-    return () => import.meta.hot?.off("draw:editor-lease-revoked", revokeEditorLease);
+  const revokeEditorLease = useCallback((detail: { clientId?: string }) => {
+    if (detail?.clientId !== clientId.current) return;
+    editorSecret.current = null;
+    setEditorConnected(false);
+    setConfirmation(null);
+    setConnectError("This editor session was replaced. Reconnect using the launch code in the trusted terminal.");
   }, []);
 
   useEffect(() => () => {
@@ -233,7 +229,6 @@ export default function App() {
   }), []);
 
   const syncBridgeDocument = useCallback(async (value: DrawDocument) => {
-    if (!import.meta.env.DEV) return;
     if (!editorSecret.current) return;
     if (!writerOwned.current) throw new Error("This tab does not own the active Draw canvas.");
     try {
@@ -376,7 +371,7 @@ export default function App() {
   }, [autosave, autosaveBlocked, bridgeAutosave, setDocument]);
 
   useEffect(() => {
-    if (!doc || !canWrite || !editorConnected || !import.meta.env.DEV) return;
+    if (!doc || !canWrite || !editorConnected) return;
     bridgeAutosave.schedule(doc);
   }, [bridgeAutosave, canWrite, editorConnected, doc?.document.id, doc ? editorKey : -1]);
 
@@ -432,7 +427,7 @@ export default function App() {
   }, [autosave, bridgeAutosave, setDocument, syncBridgeDocument]);
 
   const connectEditorToMcp = useCallback(async () => {
-    if (!import.meta.env.DEV || !canWrite) return;
+    if (!canWrite) return;
     setConnectError("");
     try {
       const response = await fetch("/__draw/api/editor/bootstrap", {
@@ -1220,24 +1215,54 @@ export default function App() {
   }, [confirmation]);
 
   useEffect(() => {
-    if (!import.meta.hot) return;
-    import.meta.hot.on("draw:mcp-command", handleMcpCommand);
-    import.meta.hot.on("draw:flush-document", handleBridgeFlush);
-    import.meta.hot.on("draw:confirmation-required", handleBridgeConfirmation);
-    import.meta.hot.on("draw:mcp-pairing-required", handleMcpPairingRequest);
-    import.meta.hot.on("draw:mcp-client-revoked", handleMcpClientRevoked);
-    import.meta.hot.on("draw:confirmation-revoked", handleMcpConfirmationRevoked);
-    import.meta.hot.on("draw:mcp-command-revoked", handleMcpCommandRevoked);
-    return () => {
-      import.meta.hot?.off("draw:mcp-command", handleMcpCommand);
-      import.meta.hot?.off("draw:flush-document", handleBridgeFlush);
-      import.meta.hot?.off("draw:confirmation-required", handleBridgeConfirmation);
-      import.meta.hot?.off("draw:mcp-pairing-required", handleMcpPairingRequest);
-      import.meta.hot?.off("draw:mcp-client-revoked", handleMcpClientRevoked);
-      import.meta.hot?.off("draw:confirmation-revoked", handleMcpConfirmationRevoked);
-      import.meta.hot?.off("draw:mcp-command-revoked", handleMcpCommandRevoked);
+    const handlers: Record<string, (detail: any) => void> = {
+      "draw:editor-lease-revoked": revokeEditorLease,
+      "draw:mcp-command": handleMcpCommand,
+      "draw:flush-document": handleBridgeFlush,
+      "draw:confirmation-required": handleBridgeConfirmation,
+      "draw:mcp-pairing-required": handleMcpPairingRequest,
+      "draw:mcp-client-revoked": handleMcpClientRevoked,
+      "draw:confirmation-revoked": handleMcpConfirmationRevoked,
+      "draw:mcp-command-revoked": handleMcpCommandRevoked,
     };
-  }, [handleBridgeConfirmation, handleBridgeFlush, handleMcpCommand, handleMcpPairingRequest, handleMcpClientRevoked, handleMcpConfirmationRevoked, handleMcpCommandRevoked]);
+    if (import.meta.hot) {
+      const hot = import.meta.hot;
+      for (const [event, handler] of Object.entries(handlers)) hot.on(event, handler);
+      return () => { for (const [event, handler] of Object.entries(handlers)) import.meta.hot?.off(event, handler); };
+    }
+    if (!editorConnected || !editorSecret.current) return;
+    let cancelled = false;
+    let source: EventSource | null = null;
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const ticketResponse = await fetch("/__draw/api/events/ticket", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current! },
+          body: "{}",
+          signal: controller.signal,
+          cache: "no-store",
+        });
+        const ticketResult = await ticketResponse.json().catch(() => ({}));
+        if (!ticketResponse.ok || typeof ticketResult.ticket !== "string") throw new Error("Could not authenticate the Draw event stream.");
+        if (cancelled) return;
+        source = new EventSource(`/__draw/api/events?ticket=${encodeURIComponent(ticketResult.ticket)}`);
+        for (const [event, handler] of Object.entries(handlers)) {
+          source.addEventListener(event, ((message: MessageEvent<string>) => {
+            try { handler(JSON.parse(message.data)); } catch { setMessage("Draw received an invalid MCP bridge event."); }
+          }) as EventListener);
+        }
+        source.onerror = () => setMessage("The Draw MCP event stream disconnected. Reconnect this editor before using MCP.");
+      } catch (error) {
+        if (!cancelled && !controller.signal.aborted) setMessage(error instanceof Error ? error.message : "Could not connect to the Draw MCP event stream.");
+      }
+    })();
+    return () => {
+      cancelled = true;
+      controller.abort();
+      source?.close();
+    };
+  }, [editorConnected, handleBridgeConfirmation, handleBridgeFlush, handleMcpCommand, handleMcpPairingRequest, handleMcpClientRevoked, handleMcpConfirmationRevoked, handleMcpCommandRevoked, revokeEditorLease]);
 
   const initialData = useMemo(() => {
     if (!doc) return undefined;
@@ -1267,8 +1292,8 @@ export default function App() {
       }} /></span></div>
       <div className="toolbar-actions">
         <span className={`save-indicator ${status}`}><i />{statusText}</span>
-        {import.meta.env.DEV && <button className="button button-quiet" disabled={!canWrite} onClick={() => { setConnectError(""); setConnectOpen(true); }} title="Pair this editor with the local MCP bridge">{editorConnected ? "MCP connected" : "Connect MCP"}</button>}
-        {import.meta.env.DEV && <button className="button button-quiet" disabled={!canWrite} onClick={() => void openMcpManagement()} title="Pair or revoke local MCP clients">MCP clients</button>}
+        <button className="button button-quiet" disabled={!canWrite} onClick={() => { setConnectError(""); setConnectOpen(true); }} title="Pair this editor with the local MCP bridge">{editorConnected ? "MCP connected" : "Connect MCP"}</button>
+        <button className="button button-quiet" disabled={!canWrite} onClick={() => void openMcpManagement()} title="Pair or revoke local MCP clients">MCP clients</button>
         <button className="button button-quiet" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open an editable Draw document" : "Close the other Draw tab to open files here"}>Open .draw</button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
         <button className="button button-primary" onClick={saveFile} title="Save the complete editable Draw file"><span className="button-icon">↓</span>Save .draw</button>

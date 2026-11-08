@@ -5,7 +5,7 @@ const baseURL = await resolveAndStoreE2EBaseURL();
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  testIgnore: "**/*.test.ts",
+  testIgnore: ["**/*.test.ts", "**/production-runtime.spec.ts", "**/package-install.spec.ts"],
   fullyParallel: false,
   retries: 0,
   reporter: "list",
