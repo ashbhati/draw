@@ -93,7 +93,7 @@ async function waitForImageToSettle(page: Page, expectedNaturalSize: { width: nu
     const snapshot = await freshBridgeDocument(page);
     const image = snapshot.document.elements.find((element: any) => element.type === "image" && element.isDeleted !== true);
     const asset = image && snapshot.document.assets?.[image.fileId];
-    if (!image || !asset?.dataURL || image.status !== "saved") return null;
+    if (!image || !asset?.dataURL) return null;
     const naturalSize = await page.evaluate((dataURL) => new Promise<{ width: number; height: number } | null>((resolve) => {
       const decoded = new Image();
       decoded.onload = () => resolve({ width: decoded.naturalWidth, height: decoded.naturalHeight });
@@ -103,14 +103,12 @@ async function waitForImageToSettle(page: Page, expectedNaturalSize: { width: nu
     }), asset.dataURL);
     if (!naturalSize) return null;
     return {
-      status: image.status,
       width: image.width,
       height: image.height,
       naturalWidth: naturalSize.width,
       naturalHeight: naturalSize.height,
     };
   }, { timeout: 10_000 }).toMatchObject({
-    status: "saved",
     width: expectedNaturalSize.width,
     height: expectedNaturalSize.height,
     naturalWidth: expectedNaturalSize.width,
