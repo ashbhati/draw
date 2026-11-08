@@ -595,7 +595,7 @@ function parseSceneTool(name: string, value: unknown): McpCommand | null {
   return null;
 }
 
-function parseEmbeddedImage(value: unknown): McpCommand {
+function parseEmbeddedImage(value: unknown, verifiedOpenverseFetch = false): McpCommand {
   const input = requireRecord(value, "insert_image input");
   const allowedFields = new Set(["documentId", "expectedDocumentRevision", "idempotencyKey", "x", "y", "width", "height", "mimeType", "dataURL", "attribution", "idempotencyPayload"]);
   for (const field of Object.keys(input)) if (!allowedFields.has(field)) throw new McpValidationError(`insert_image has unsupported field "${field}"; remote image URLs are not accepted.`);
@@ -612,7 +612,7 @@ function parseEmbeddedImage(value: unknown): McpCommand {
   const raw = requireRecord(input.attribution, "insert_image.attribution");
   const attributionFields = new Set(["provider", "providerId", "title", "creator", "creatorUrl", "sourceUrl", "license", "licenseVersion", "licenseUrl", "attribution", "source", "capturedAt", "verification"]);
   for (const field of Object.keys(raw)) if (!attributionFields.has(field)) throw new McpValidationError(`insert_image.attribution has unsupported field "${field}".`);
-  const normalizedAttribution = normalizeImageAttribution(raw, "openverse-index", true);
+  const normalizedAttribution = normalizeImageAttribution(raw, verifiedOpenverseFetch ? "openverse-index" : "unverified", true);
   if (!normalizedAttribution) throw new McpValidationError("insert_image.attribution must contain a valid Openverse ID, title, supported license, capture date, and safe optional metadata.");
   let idempotencyPayload: InsertImageInput["idempotencyPayload"];
   if (input.idempotencyPayload !== undefined) {
@@ -651,6 +651,7 @@ export function parseMcpToolInput(
     return { operation: "create_elements", input: parseCreateElements(input) };
   }
   if (name === "insert_image") return parseEmbeddedImage(input);
+  if (name === "insert_openverse_image") return parseEmbeddedImage(input, true);
   if (name === "update_elements") {
     return { operation: "update_elements", input: parseUpdateElements(input) };
   }

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import "fake-indexeddb/auto";
-import { createEmptyDocument } from "../document/document";
+import { createEmptyDocument, parseDrawFile, serializeDrawFile } from "../document/document";
 import { commitMcpOperation, createCanvas, createWorkspace, deleteCanvas, deleteWorkspace, duplicateCanvas, DrawStorageRecoveryError, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadMcpOperation, renameCanvas, renameWorkspace, restoreMcpCommandSnapshot, saveCurrentDocument, setActiveCanvas } from "./storage";
 import { canRedoMcpOperation, canUndoMcpOperation, OPERATION_RESULT_RETENTION_MS, OPERATION_SNAPSHOT_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "../integrations/operation-ledger";
 
@@ -34,6 +34,24 @@ describe("local Draw autosave", () => {
     expect(restored).toEqual(doc);
     expect(restored?.document.elements[0]).toMatchObject({ id: "card-1", type: "rectangle" });
     expect(restored?.document.canvas.background.preset).toBe("white");
+  });
+
+  it("preserves trusted Openverse attribution in local storage but downgrades portable imports", async () => {
+    const doc = createEmptyDocument("Openverse attribution");
+    const attribution = {
+      provider: "Openverse", providerId: "123e4567-e89b-12d3-a456-426614174000", title: "Chalk arrows",
+      creator: "Artist", sourceUrl: "https://example.test/source", license: "by", licenseVersion: "4.0",
+      licenseUrl: "https://creativecommons.org/licenses/by/4.0/", capturedAt: "2026-01-01T00:00:00.000Z",
+      verification: "openverse-index",
+    };
+    doc.document.elements.push({ id: "image-1", type: "image", x: 10, y: 20, width: 1, height: 1, fileId: "image-1", customData: { drawAttribution: attribution } });
+    doc.document.assets["image-1"] = { id: "image-1", dataURL: "data:image/png;base64,AA==", attribution };
+
+    await saveCurrentDocument(doc);
+    expect((await loadCurrentDocument())?.document.assets["image-1"]?.attribution).toMatchObject({ verification: "openverse-index" });
+    const canvas = (await listCanvases((await listWorkspaces())[0].id))[0];
+    expect((await loadCanvasDocument(canvas.id))?.document.assets["image-1"]?.attribution).toMatchObject({ verification: "openverse-index" });
+    expect(parseDrawFile(serializeDrawFile(doc)).document.assets["image-1"]?.attribution).toMatchObject({ verification: "unverified" });
   });
 
   it("returns null before the first autosave", async () => {

@@ -230,7 +230,13 @@ describe("MCP tool input contract", () => {
       documentId: "doc-1", expectedDocumentRevision: 2, idempotencyKey: "image-1", x: 10, y: 20,
       dataURL: `data:image/png;base64,${"A".repeat(64)}`, mimeType: "image/png", width: 320, height: 180, attribution,
       idempotencyPayload: { imageId: attribution.providerId, x: 10, y: 20, width: 320, height: 180 },
-    })).toMatchObject({ operation: "insert_image", input: { documentId: "doc-1", expectedDocumentRevision: 2, x: 10, y: 20, mimeType: "image/png", idempotencyPayload: { imageId: attribution.providerId, x: 10 }, attribution: { providerId: attribution.providerId, license: "by" } } });
+    })).toMatchObject({ operation: "insert_image", input: { documentId: "doc-1", expectedDocumentRevision: 2, x: 10, y: 20, mimeType: "image/png", idempotencyPayload: { imageId: attribution.providerId, x: 10 }, attribution: { providerId: attribution.providerId, license: "by", verification: "unverified" } } });
+    expect(parseMcpToolInputImpl("insert_openverse_image", {
+      documentId: "doc-1", expectedDocumentRevision: 2, idempotencyKey: "verified-image-1", x: 10, y: 20,
+      dataURL: `data:image/png;base64,${"A".repeat(64)}`, mimeType: "image/png", width: 320, height: 180,
+      attribution: { ...attribution, verification: "unverified" },
+      idempotencyPayload: { imageId: attribution.providerId, x: 10, y: 20, width: 320, height: 180 },
+    })).toMatchObject({ operation: "insert_image", input: { attribution: { providerId: attribution.providerId, verification: "openverse-index" } } });
     expect(() => parseMcpToolInputImpl("insert_image", {
       documentId: "doc-1", expectedDocumentRevision: 2, idempotencyKey: "image-2", x: 10, y: 20,
       url: "https://evil.example/image.png", mimeType: "image/png", dataURL: "data:image/png;base64,AA==", attribution,

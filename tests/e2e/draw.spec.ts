@@ -1669,6 +1669,13 @@ test("Openverse picker previews license metadata and embeds an offline-editable 
   const drawDownload = await drawWait;
   const drawFile = JSON.parse(await readFile(await drawDownload.path(), "utf8"));
   expect(drawFile.document.assets[imageElement.fileId].attribution.providerId).toBe(id);
+  await page.reload();
+  await waitForBridge(page);
+  await expect.poll(async () => (await readLocalDocument(page))?.document.assets[imageElement.fileId]?.attribution?.verification).toBe("openverse-index");
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.locator('input[type="file"][accept^=".draw"]').setInputFiles({ name: "genuine-openverse.draw", mimeType: "application/vnd.draw+json", buffer: Buffer.from(JSON.stringify(drawFile)) });
+  await expect.poll(async () => (await readLocalDocument(page))?.document.assets[imageElement.fileId]?.attribution?.verification).toBe("unverified");
+
   const hostileAttribution = {
     ...drawFile.document.assets[imageElement.fileId].attribution,
     title: "Untrusted file claim", license: "cc0", verification: "verified",
@@ -1694,6 +1701,27 @@ test("Openverse picker previews license metadata and embeds an offline-editable 
   await expect(page.getByRole("link", { name: "Creator" })).toHaveCount(0);
   await expect(page.getByRole("link", { name: "License" })).toHaveCount(0);
 
+});
+
+test("paired MCP insert_image cannot mark caller supplied attribution as Openverse verified", async ({ page }) => {
+  const current = await freshBridgeDocument(page);
+  const id = "123e4567-e89b-12d3-a456-426614174000";
+  const png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jJ5sAAAAASUVORK5CYII=";
+  const response = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
+    operation: "insert_image",
+    input: {
+      documentId: current.document.id, expectedDocumentRevision: current.document.documentRevision, idempotencyKey: "forged-openverse-attribution",
+      x: 100, y: 100, width: 24, height: 24, mimeType: "image/png", dataURL: png,
+      attribution: { provider: "Openverse", providerId: id, title: "Forged verified claim", creator: "Caller", license: "by", licenseVersion: "4.0", capturedAt: "2026-01-01T00:00:00.000Z", verification: "openverse-index" },
+      idempotencyPayload: { imageId: id, x: 100, y: 100, width: 24, height: 24 },
+    },
+  } });
+  expect(response.ok(), await response.text()).toBeTruthy();
+  await expect.poll(async () => {
+    const document = await freshBridgeDocument(page);
+    const image = document.document.elements.find((element: any) => element.type === "image");
+    return image && document.document.assets[image.fileId]?.attribution?.verification;
+  }).toBe("unverified");
 });
 
 test("stdio MCP searches Openverse, inserts by provider ID, and saves a reopenable attributed Draw document", async ({ page, baseURL }) => {
@@ -1732,7 +1760,7 @@ test("stdio MCP searches Openverse, inserts by provider ID, and saves a reopenab
     expect(changed.document.elements.filter((element: any) => element.type === "image")).toHaveLength(1);
     const imageElement = changed.document.elements.find((element: any) => element.type === "image");
     expect(imageElement).toBeTruthy();
-    expect(changed.document.assets[imageElement.fileId]).toMatchObject({ attribution: { providerId: searchResult.results[0].id, license: "by", sourceUrl: "https://source.example/chalk-arrow" }, dataURL: expect.stringMatching(/^data:image\/png;base64,/) });
+    expect(changed.document.assets[imageElement.fileId]).toMatchObject({ attribution: { providerId: searchResult.results[0].id, license: "by", sourceUrl: "https://source.example/chalk-arrow", verification: "openverse-index" }, dataURL: expect.stringMatching(/^data:image\/png;base64,/) });
 
     const latestCanvas = await mcp.call("get_current_canvas", {});
     expect(latestCanvas.error).toBeUndefined();

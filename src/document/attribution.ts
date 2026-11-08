@@ -66,7 +66,7 @@ export function normalizeImageAttribution(
 }
 
 /** Remove malformed claims and synchronize valid claims between the image and its embedded asset. */
-export function normalizeDrawImageAttributions(document: any, verification: DrawImageAttribution["verification"] = "unverified"): void {
+export function normalizeDrawImageAttributions(document: any, verification: DrawImageAttribution["verification"] | "trusted-storage" = "unverified"): void {
   const assets = document?.document?.assets;
   const elements = document?.document?.elements;
   if (!assets || typeof assets !== "object" || !Array.isArray(elements)) return;
@@ -75,9 +75,11 @@ export function normalizeDrawImageAttributions(document: any, verification: Draw
     const asset = assets[element.fileId];
     const customData = isRecord(element.customData) ? { ...element.customData } : undefined;
     const source = customData?.drawAttribution ?? asset?.attribution;
-    const itemVerification = verification === "openverse-index" && isRecord(source) && source.verification === "unverified"
-      ? "unverified"
-      : verification;
+    const itemVerification = verification === "trusted-storage"
+      ? isRecord(source) && source.verification === "openverse-index" ? "openverse-index" : "unverified"
+      : verification === "openverse-index" && isRecord(source) && source.verification === "unverified"
+        ? "unverified"
+        : verification;
     const normalized = normalizeImageAttribution(source, itemVerification);
     if (!normalized) {
       if (customData) {
