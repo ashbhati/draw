@@ -1826,7 +1826,7 @@ export default function App() {
 
   const handleBridgeConfirmation = useCallback((event: BridgeConfirmation) => {
     if (event.clientId !== clientId.current || !writerOwned.current || !editorSecret.current) return;
-    if (event.action === "open_document") { setConfirmation(event); return; }
+    if (event.action === "open_document" || event.action === "delete_library_item") { setConfirmation(event); return; }
     void (async () => {
       try {
         const catalog = await getMcpWorkspaceCatalog();
