@@ -411,14 +411,18 @@ export default function App() {
     const opened = rebaseOpenedDocument(docRef.current ?? next, next);
     lastMcpOperation.current = null;
     lastUndoneOperation.current = null;
-    setDocument(opened);
-    setStatus("ready"); setMessage(""); setEditorKey((key) => key + 1);
+    setStatus("ready"); setMessage("");
     setAutosaveBlocked(false);
     try {
-      await saveCurrentDocument(opened, { replaceDocument: true });
+      const replacement = await saveCurrentDocument(opened, { replaceDocument: true });
+      if (!replacement.saved || !replacement.document) throw new Error("The active canvas did not accept the replacement document.");
+      setDocument(replacement.document);
+      setEditorKey((key) => key + 1);
       setStatus("saved");
-      await syncBridgeDocument(opened);
+      await syncBridgeDocument(replacement.document);
     } catch (error) {
+      setDocument(opened);
+      setEditorKey((key) => key + 1);
       setAutosaveBlocked(true);
       setStatus("error");
       setMessage(`The file opened, but local autosave failed: ${error instanceof Error ? error.message : String(error)}. Use Save .draw to preserve it.`);
