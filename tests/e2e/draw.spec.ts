@@ -2881,6 +2881,7 @@ test("stdio MCP manages stable workspaces and canvases with durable replay, safe
     const duplicate = await result(await mcp.call("duplicate_canvas", { expectedCatalogRevision: imported.catalogRevision, idempotencyKey: "mcp-duplicate-canvas-e2e", canvasId: imported.activeCanvasId, name: "Editable duplicate" }));
     expect(duplicate.activeCanvasId).not.toBe(imported.activeCanvasId);
     expect(duplicate.activeDocument.document.elements.some((element: any) => element.id === "agent-import-node")).toBe(true);
+    await expect.poll(async () => (await readLocalDocument(page))?.document.id).toBe(duplicate.activeDocument.document.id);
     const confirmationCatalog = await result(await mcp.call("list_workspaces", {}));
     const spoofedConfirmation = await page.request.post("/__draw/api/confirmations", { headers: mcpAuthHeaders(), data: {
       action: "delete_workspace", documentId: confirmationCatalog.activeDocument.document.id,
