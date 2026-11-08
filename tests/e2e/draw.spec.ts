@@ -1558,7 +1558,8 @@ test("the supplied reference fixture keeps chalk, layout, and editable nodes aft
   const reopened = await freshBridgeDocument(page);
   expect(reopened.document.canvas.background.preset).toBe("blackboard");
   for (const node of nodes) {
-    const canvas = page.locator(".excalidraw canvas").last();
+    const canvas = page.locator(".excalidraw canvas:visible").last();
+    await expect(canvas).toBeVisible();
     const bounds = await canvas.boundingBox();
     if (!bounds) throw new Error("Could not locate the drawing canvas.");
     await page.mouse.click(bounds.x + node.x + node.width / 2, bounds.y + node.y + node.height / 2);
