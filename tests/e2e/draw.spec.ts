@@ -2516,6 +2516,9 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
     expect(snapshot.documentId).toBeTruthy();
     expect(snapshot.elements.some((element: any) => element.id === created.nodes.first)).toBe(true);
 
+    const staleSelection = await mcp.call("set_selection", { documentId: snapshot.documentId, expectedDocumentRevision: snapshot.documentRevision - 1, idempotencyKey: "stale-selection", ids: [created.nodes.first] });
+    expect(staleSelection.result.isError).toBe(true);
+    expect(staleSelection.result.content[0].text).toContain("CONFLICT");
     const selectResponse = await mcp.call("set_selection", { documentId: snapshot.documentId, expectedDocumentRevision: snapshot.documentRevision, idempotencyKey: "stdio-library-select", ids: [created.nodes.first, created.nodes.second] });
     expect(selectResponse.error).toBeUndefined();
     const emptyLibrary = JSON.parse((await mcp.call("list_workspace_library", { documentId: snapshot.documentId })).result.content[0].text);
