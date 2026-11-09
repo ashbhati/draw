@@ -139,7 +139,7 @@ export type McpCommand =
   | { operation: "update_elements"; input: UpdateElementsInput }
   | { operation: "delete_elements"; input: SceneIdsInput }
   | { operation: "duplicate_elements"; input: SceneIdsInput & { offsetX?: number; offsetY?: number } }
-  | { operation: "set_selection"; input: { documentId: string; ids: string[] } }
+  | { operation: "set_selection"; input: SceneIdsInput }
   | { operation: "group_elements"; input: SceneIdsInput }
   | { operation: "ungroup_elements"; input: SceneIdsInput }
   | { operation: "arrange_elements"; input: ArrangeElementsInput }
@@ -509,7 +509,7 @@ function parseSceneTool(name: string, value: unknown): McpCommand | null {
   }
   if (name === "set_selection") {
     const input = parseSceneIds(value, name, true);
-    return { operation: "set_selection", input: { documentId: input.documentId, ids: input.ids } };
+    return { operation: "set_selection", input };
   }
   if (name === "arrange_elements") {
     const base = parseSceneIds(value, name);

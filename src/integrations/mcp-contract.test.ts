@@ -7,6 +7,10 @@ function parseMcpToolInput(name: string, input: any) {
 }
 
 describe("MCP tool input contract", () => {
+  it("preserves selection revision and request identity for the editor conflict check", () => {
+    const input = { documentId: "doc-1", expectedDocumentRevision: 7, idempotencyKey: "select-7", ids: ["shape-1"] };
+    expect(parseMcpToolInputImpl("set_selection", input)).toEqual({ operation: "set_selection", input });
+  });
   it("validates workspace library queries and mutations with active document context", () => {
     expect(parseMcpToolInput("list_workspace_library", { documentId: "doc-1" })).toEqual({ operation: "list_workspace_library", input: { documentId: "doc-1" } });
     expect(parseMcpToolInput("read_workspace_library_item", { documentId: "doc-1", itemId: "item-1" })).toEqual({ operation: "read_workspace_library_item", input: { documentId: "doc-1", itemId: "item-1" } });
