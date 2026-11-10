@@ -7,6 +7,11 @@ function parseMcpToolInput(name: string, input: any) {
 }
 
 describe("MCP tool input contract", () => {
+  it("rejects legacy board deletion before requesting project deletion approval", () => {
+    expect(() => parseMcpToolInputImpl("workspace_action", {
+      action: "delete_canvas", canvasId: "board-1", expectedCatalogRevision: 1, idempotencyKey: "old-delete",
+    })).toThrow(/delete_workspace/);
+  });
   it("preserves selection revision and request identity for the editor conflict check", () => {
     const input = { documentId: "doc-1", expectedDocumentRevision: 7, idempotencyKey: "select-7", ids: ["shape-1"] };
     expect(parseMcpToolInputImpl("set_selection", input)).toEqual({ operation: "set_selection", input });

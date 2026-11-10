@@ -13,7 +13,7 @@ import {
 import { isSafeHttpsUrl } from "./document/attribution";
 import { composeBackgroundSvg, hasSelectedExportElements, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorForBackgroundPreset } from "./export/background-recolor";
-import { createFreshWorkspaceFromRecovery, exportLegacyDocumentRecovery, loadLegacyDocumentRecovery, addWorkspaceLibraryItem, saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createCanvas, duplicateCanvas, deleteCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, listCanvases, listWorkspaces, loadCanvasDocument, loadWorkspaceLibrary, loadWorkspaceLibraryState, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, saveWorkspaceLibrary, setActiveCanvas, type DrawCanvas, type DrawLibraryItem, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
+import { listWorkspaceLibraryRecoveries, exportWorkspaceLibraryRecovery, createFreshWorkspaceFromRecovery, exportLegacyDocumentRecovery, loadLegacyDocumentRecovery, addWorkspaceLibraryItem, saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createWorkspaceWithCanvas, createCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, listCanvases, listWorkspaces, loadCanvasDocument, loadWorkspaceLibrary, loadWorkspaceLibraryState, renameWorkspace, renameWorkspaceLibraryItem, saveWorkspaceLibrary, setActiveCanvas, type DrawCanvas, type DrawLibraryItem, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
 import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, reloadLibraryAfterConflict, resolveLibraryWorkspaceFromCatalog, shouldPersistLibraryChange } from "./ui/draw-library";
 import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
@@ -137,6 +137,12 @@ export default function App() {
   const [workspaces, setWorkspaces] = useState<DrawWorkspace[]>([]);
   const [canvases, setCanvases] = useState<DrawCanvas[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState("");
+  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
+  const workspaceMenuTriggerRef = useRef<HTMLButtonElement>(null);
+  const workspaceSelectorRef = useRef<HTMLDivElement>(null);
+  const workspaceMenuRef = useRef<HTMLDivElement>(null);
+  const workspaceMenuWasOpen = useRef(false);
+  const workspaceMenuRestoreFocus = useRef(false);
   const [activeCanvasId, setActiveCanvasId] = useState("");
   const [libraryItems, setLibraryItems] = useState<DrawLibraryItem[]>([]);
   const [libraryManagerOpen, setLibraryManagerOpen] = useState(false);
@@ -145,6 +151,8 @@ export default function App() {
   const [recoveryAvailable, setRecoveryAvailable] = useState(false);
   const [recoveryDataAvailable, setRecoveryDataAvailable] = useState(false);
   const [recoveryBusy, setRecoveryBusy] = useState(false);
+  const [libraryRecoveries, setLibraryRecoveries] = useState<Array<{ workspaceId: string; reason: string }>>([]);
+  const [libraryRecoveryOpen, setLibraryRecoveryOpen] = useState(false);
   const [confirmation, setConfirmation] = useState<BridgeConfirmation | null>(null);
   const [editorConnected, setEditorConnected] = useState(false);
   const [connectOpen, setConnectOpen] = useState(false);
@@ -189,16 +197,7 @@ export default function App() {
   const lastMcpOperation = useRef<{ id: string; revision: number } | null>(null);
   const lastUndoneOperation = useRef<{ id: string; revision: number } | null>(null);
   const viewRevisionTimer = useRef<number | null>(null);
-  const onEditorReady = useCallback((api: ExcalidrawImperativeAPI) => {
-    apiRef.current = api;
-    const viewport = docRef.current?.document.canvas.viewport;
-    if (viewport) {
-      api.updateScene({
-        appState: { scrollX: viewport.x, scrollY: viewport.y, zoom: { value: viewport.zoom as any } },
-        captureUpdate: CaptureUpdateAction.NEVER,
-      });
-    }
-  }, []);
+
 
   useEffect(() => {
     const invalidateMcpHistoryOnHumanAction = (event: Event) => {
@@ -488,11 +487,14 @@ export default function App() {
           let workspaceItems = await listWorkspaces();
           if (!workspaceItems.length) {
             if (lock.acquired) {
-              const workspace = await createWorkspace("My workspace");
-              const canvas = await createCanvas(workspace.id, stored?.document.title ?? "Untitled drawing", stored ?? undefined);
-              await setActiveCanvas(canvas.id);
-              stored = await loadCanvasDocument(canvas.id);
-              workspaceItems = [workspace];
+              if (stored) {
+                const created = await createWorkspaceWithCanvas("My workspace", stored.document.title || "Untitled drawing", stored);
+                await setActiveCanvas(created.canvas.id);
+                stored = created.document;
+                workspaceItems = [created.workspace];
+              } else {
+                workspaceItems = [await createWorkspace("My workspace")];
+              }
             }
           }
           let workspaceId = "";
@@ -549,6 +551,13 @@ export default function App() {
             const recovery = await loadLegacyDocumentRecovery();
             if (live) setRecoveryDataAvailable(Boolean(recovery));
           } catch { /* a recovery backup error must not block a valid workspace */ }
+          try {
+            const recoveries = await listWorkspaceLibraryRecoveries();
+            if (live) {
+              setLibraryRecoveries(recoveries.map(({ workspaceId, reason }) => ({ workspaceId, reason })));
+              setLibraryRecoveryOpen(recoveries.length > 0);
+            }
+          } catch { /* backup metadata must not block a valid drawing */ }
           setStatus(lock.acquired ? "ready" : "error");
         } catch (error) {
           if (!live) return;
@@ -584,6 +593,17 @@ export default function App() {
       } else release();
     };
   }, [autosave, bridgeAutosave, setDocument]);
+
+  useEffect(() => {
+    if (!doc || !canWrite) return;
+    let live = true;
+    void listWorkspaceLibraryRecoveries().then((recoveries) => {
+      if (!live) return;
+      setLibraryRecoveries(recoveries.map(({ workspaceId, reason }) => ({ workspaceId, reason })));
+      if (!recoveries.length) setLibraryRecoveryOpen(false);
+    }).catch(() => { /* backup metadata must not interrupt drawing */ });
+    return () => { live = false; };
+  }, [workspaces, canWrite, doc?.document.id]);
 
   const onChange = useCallback((elements: readonly any[], appState: any, files: any) => {
     if (!writerOwned.current) return;
@@ -819,8 +839,16 @@ export default function App() {
     if (!file) return;
     try {
       const imported = await parseDrawFile(await file.text());
-      await switchToNewCanvas(activeWorkspaceId, imported.document.title, imported);
-      setMessage("Imported as a new editable canvas.");
+      await settleEditorBeforeSwitch();
+      autosave.cancelPending(); bridgeAutosave.cancelPending();
+      const workspaceName = imported.document.title || "Imported drawing";
+      const created = await createWorkspaceWithCanvas(workspaceName, workspaceName, imported);
+      await setActiveCanvas(created.canvas.id);
+      await activateWorkspaceLibrary(created.workspace.id);
+      lastMcpOperation.current = null; lastUndoneOperation.current = null;
+      setDocument(created.document); setEditorKey((key) => key + 1); setStatus("saved");
+      await refreshWorkspaceList(created.workspace.id, created.canvas.id);
+      setMessage("Opened as a new workspace. The editable source file remains unchanged.");
     }
     catch (error) { setMessage(error instanceof Error ? error.message : "Could not open this Draw file."); }
     finally { if (fileInput.current) fileInput.current.value = ""; }
@@ -868,14 +896,25 @@ export default function App() {
   };
 
   const createNewWorkspace = async () => {
+    setWorkspaceMenuOpen(false);
     try {
       await settleEditorBeforeSwitch();
-      const workspace = await createWorkspace("New workspace");
-      await switchToNewCanvas(workspace.id, "Untitled drawing");
+      const created = await createWorkspaceWithCanvas("New workspace", "Untitled drawing");
+      await setActiveCanvas(created.canvas.id);
+      await activateWorkspaceLibrary(created.workspace.id);
+      lastMcpOperation.current = null; lastUndoneOperation.current = null;
+      setDocument(created.document); setEditorKey((key) => key + 1); setStatus("saved"); setMessage("");
+      await refreshWorkspaceList(created.workspace.id, created.canvas.id);
     } catch (error) { setMessage(`Could not create workspace: ${error instanceof Error ? error.message : String(error)}`); }
   };
 
+  const closeWorkspaceMenu = (restoreFocus: boolean) => {
+    workspaceMenuRestoreFocus.current = restoreFocus;
+    setWorkspaceMenuOpen(false);
+  };
+
   const selectWorkspace = async (workspaceId: string) => {
+    closeWorkspaceMenu(true);
     if (workspaceId === activeWorkspaceId) return;
     try {
       const items = await listCanvases(workspaceId);
@@ -884,37 +923,71 @@ export default function App() {
     } catch (error) { setMessage(`Could not open workspace: ${error instanceof Error ? error.message : String(error)}`); }
   };
 
-  const createNewCanvas = async () => {
-    try { await switchToNewCanvas(activeWorkspaceId, "Untitled drawing"); }
-    catch (error) { setMessage(`Could not create canvas: ${error instanceof Error ? error.message : String(error)}`); }
+  const focusWorkspaceMenuItem = (index: number) => {
+    const items = workspaceMenuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]');
+    if (!items?.length) return;
+    items[Math.max(0, Math.min(index, items.length - 1))]?.focus();
   };
 
-  const duplicateActiveCanvas = async () => {
-    try {
-      await settleEditorBeforeSwitch();
-      autosave.cancelPending(); bridgeAutosave.cancelPending();
-      const duplicate = await duplicateCanvas(activeCanvasId);
-      const next = await loadCanvasDocument(duplicate.id);
-      if (!next) throw new Error("The copy could not be loaded.");
-      await setActiveCanvas(duplicate.id); setDocument(next); setEditorKey((key) => key + 1);
-      await refreshWorkspaceList(activeWorkspaceId, duplicate.id);
-    } catch (error) { setMessage(`Could not duplicate canvas: ${error instanceof Error ? error.message : String(error)}`); }
-  };
+  useEffect(() => {
+    const wasOpen = workspaceMenuWasOpen.current;
+    workspaceMenuWasOpen.current = workspaceMenuOpen;
+    if (workspaceMenuOpen) {
+      requestAnimationFrame(() => {
+        const items = workspaceMenuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]');
+        const selected = Array.from(items ?? []).find((item) => item.getAttribute("aria-checked") === "true");
+        (selected ?? items?.[0])?.focus();
+      });
+    } else if (wasOpen) {
+      const restoreFocus = workspaceMenuRestoreFocus.current;
+      workspaceMenuRestoreFocus.current = false;
+      if (restoreFocus) requestAnimationFrame(() => workspaceMenuTriggerRef.current?.focus());
+    }
+  }, [workspaceMenuOpen]);
 
-  const renameActiveCanvas = async () => {
-    const name = window.prompt("Canvas name", canvases.find((item) => item.id === activeCanvasId)?.name ?? "Untitled drawing");
-    if (name === null) return;
-    try {
-      await settleEditorBeforeSwitch();
-      const renamed = await renameCanvas(activeCanvasId, name);
-      const next = await loadCanvasDocument(activeCanvasId);
-      if (next) setDocument(next);
-      await refreshWorkspaceList(activeWorkspaceId, activeCanvasId);
-      setMessage(`Canvas renamed to ${renamed.name}.`);
-    } catch (error) { setMessage(`Could not rename canvas: ${error instanceof Error ? error.message : String(error)}`); }
+  useEffect(() => {
+    if (!workspaceMenuOpen) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (event.target instanceof Node && !workspaceSelectorRef.current?.contains(event.target)) {
+        closeWorkspaceMenu(false);
+      }
+    };
+    const closeWhenFocusLeavesMenu = (event: FocusEvent) => {
+      if (event.target instanceof Node && !workspaceMenuRef.current?.contains(event.target)) {
+        closeWorkspaceMenu(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer, true);
+    document.addEventListener("focusin", closeWhenFocusLeavesMenu, true);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer, true);
+      document.removeEventListener("focusin", closeWhenFocusLeavesMenu, true);
+    };
+  }, [workspaceMenuOpen]);
+
+  const handleWorkspaceMenuKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const items = Array.from(workspaceMenuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]') ?? []);
+    const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeWorkspaceMenu(true);
+    } else if (event.key === "ArrowDown") {
+      event.preventDefault();
+      focusWorkspaceMenuItem(currentIndex < 0 ? 0 : (currentIndex + 1) % items.length);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      focusWorkspaceMenuItem(currentIndex < 0 ? items.length - 1 : (currentIndex - 1 + items.length) % items.length);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      focusWorkspaceMenuItem(0);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      focusWorkspaceMenuItem(items.length - 1);
+    }
   };
 
   const renameActiveWorkspace = async () => {
+    setWorkspaceMenuOpen(false);
     const current = workspaces.find((item) => item.id === activeWorkspaceId);
     const name = window.prompt("Workspace name", current?.name ?? "My workspace");
     if (name === null) return;
@@ -922,28 +995,10 @@ export default function App() {
     catch (error) { setMessage(`Could not rename workspace: ${error instanceof Error ? error.message : String(error)}`); }
   };
 
-  const removeActiveCanvas = async () => {
-    const target = canvases.find((item) => item.id === activeCanvasId);
-    if (!target || !window.confirm(`Delete canvas “${target.name}”? Its saved editable drawing and history will be removed from this device.`)) return;
-    try {
-      await settleEditorBeforeSwitch();
-      autosave.cancelPending(); bridgeAutosave.cancelPending();
-      await deleteCanvas(target.id);
-      activeDocumentIdRef.current = null;
-      const next = await loadCurrentDocument();
-      let updated = await listCanvases(activeWorkspaceId);
-      if (!updated.length) { const fresh = await createCanvas(activeWorkspaceId, "Untitled drawing"); updated = [fresh]; await setActiveCanvas(fresh.id); }
-      const active = updated.find((item) => item.documentId === next?.document.id) ?? updated[0];
-      const activeDocument = next?.document.id === active.documentId ? next : await loadCanvasDocument(active.id);
-      if (activeDocument) { await setActiveCanvas(active.id); setDocument(activeDocument); setEditorKey((key) => key + 1); }
-      await refreshWorkspaceList(activeWorkspaceId, active.id);
-      setStatus("saved"); setMessage("");
-    } catch (error) { setMessage(`Could not delete canvas: ${error instanceof Error ? error.message : String(error)}`); }
-  };
-
   const removeActiveWorkspace = async () => {
+    setWorkspaceMenuOpen(false);
     const workspace = workspaces.find((item) => item.id === activeWorkspaceId);
-    if (!workspace || !window.confirm(`Delete workspace “${workspace.name}” and all ${canvases.length} saved canvas${canvases.length === 1 ? "" : "es"}? This permanently removes those editable drawings and their history from this device.`)) return;
+    if (!workspace || !window.confirm(`Delete workspace “${workspace.name}” and its drawing? This permanently removes the editable drawing, its workspace library, and history from this device.`)) return;
     try {
       await settleEditorBeforeSwitch();
       autosave.cancelPending(); bridgeAutosave.cancelPending();
@@ -952,8 +1007,8 @@ export default function App() {
       let remaining = await listWorkspaces();
       if (!remaining.length) remaining = [await createWorkspace("My workspace")];
       const nextWorkspace = remaining[0];
-      let nextCanvases = await listCanvases(nextWorkspace.id);
-      if (!nextCanvases.length) nextCanvases = [await createCanvas(nextWorkspace.id, "Untitled drawing")];
+      const nextCanvases = await listCanvases(nextWorkspace.id);
+      if (!nextCanvases.length) throw new Error("The replacement workspace has no board.");
       const nextCanvas = nextCanvases[0];
       await setActiveCanvas(nextCanvas.id);
       const next = await loadCanvasDocument(nextCanvas.id);
@@ -1988,6 +2043,24 @@ export default function App() {
       libraryItems: libraryItemsRef.current as unknown as LibraryItems,
     } as unknown as ExcalidrawInitialDataState;
   }, [doc?.document.id, editorKey]);
+  const editorDocumentId = doc?.document.id;
+  const onEditorReady = useCallback((api: ExcalidrawImperativeAPI) => {
+    if (activeDocumentIdRef.current !== editorDocumentId) return;
+    apiRef.current = api;
+    const state = initialData?.appState as any;
+    if (state) api.updateScene({
+      appState: { scrollX: state.scrollX, scrollY: state.scrollY, zoom: state.zoom },
+      captureUpdate: CaptureUpdateAction.NEVER,
+    });
+  }, [editorDocumentId, initialData]);
+  const onCurrentEditorChange = useCallback((elements: readonly any[], appState: any, files: any) => {
+    if (activeDocumentIdRef.current !== editorDocumentId) return;
+    onChange(elements, appState, files);
+  }, [editorDocumentId, onChange]);
+  const onCurrentLibraryChange = useCallback((items: LibraryItems) => {
+    if (activeDocumentIdRef.current !== editorDocumentId) return;
+    return persistLibraryChanges(items);
+  }, [editorDocumentId, persistLibraryChanges]);
   if (!doc || status === "loading") return <main className="loading-screen"><div className="brand-mark">D</div><p>Preparing your canvas…</p></main>;
   const background = doc.document.canvas.background.preset;
   const savedSelection = doc.document.appState.selectedElementIds as Record<string, boolean> | undefined;
@@ -2011,29 +2084,30 @@ export default function App() {
         <button className="button button-quiet" disabled={!imageCredits.length} onClick={() => setCreditsOpen(true)} title="Inspect saved image attribution">Image credits</button>
         <button className="button button-quiet" disabled={!canWrite} onClick={() => { setConnectError(""); setConnectOpen(true); }} title="Pair this editor with the local MCP bridge">{editorConnected ? "MCP connected" : "Connect MCP"}</button>
         <button className="button button-quiet" disabled={!canWrite} onClick={() => void openMcpManagement()} title="Pair or revoke local MCP clients">MCP clients</button>
-        <button className="button button-quiet" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open an editable Draw document" : "Close the other Draw tab to open files here"}>Open .draw</button>
+        <button className="button button-quiet file-action" aria-label="Open" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open a .draw file as a new workspace" : "Close the other Draw tab to open files here"}><span aria-hidden="true">↥</span></button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
+        {libraryRecoveries.length > 0 && <button className="button button-quiet" aria-label="Library recovery backups" title="View preserved library backups" onClick={() => setLibraryRecoveryOpen(true)}><span aria-hidden="true">↧</span></button>}
         {recoveryDataAvailable && !recoveryAvailable && <button className="button button-quiet" aria-label="Download recovery data" title="Download preserved recovery data" onClick={() => void (async () => {
           try {
             const raw = await exportLegacyDocumentRecovery();
             if (raw !== null) download(new Blob([raw], { type: "application/json" }), "draw-recovery.json");
           } catch (error) { setMessage(`Could not download recovery data: ${error instanceof Error ? error.message : String(error)}`); }
         })()}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4" /></svg></button>}
-        <button className="button button-primary" onClick={saveFile} title="Save the complete editable Draw file"><span className="button-icon">↓</span>Save .draw</button>
+        <button className="button button-primary file-action" aria-label="Save" onClick={saveFile} title="Save the editable .draw file"><span aria-hidden="true">↓</span></button>
         <div className="export-group"><button className="button button-quiet export-main" disabled={exportScope === "selection" && !selectionAvailable} title={exportScope === "selection" && !selectionAvailable ? "Select one or more objects to export a selection" : undefined} onClick={() => void exportImage("image/png")}>Export</button><select aria-label="Export scope" value={exportScope} onChange={(event) => setExportScope(event.target.value as "canvas" | "selection")}><option value="canvas">Whole drawing</option><option value="selection">Selection only</option></select><select aria-label="Image export format" value="image/png" onChange={(event) => void exportImage(event.target.value as "image/png" | "image/jpeg")}><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option></select></div>
       </div>
     </header>
-    <nav className="project-toolbar" aria-label="Workspace and canvas management">
-      <label>Workspace <select aria-label="Workspace" value={activeWorkspaceId} disabled={!canWrite} onChange={(event) => void selectWorkspace(event.target.value)}>{workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}</select></label>
-      <button className="button" disabled={!canWrite} onClick={() => void createNewWorkspace()}>New workspace</button>
-      <button className="button" disabled={!canWrite} onClick={() => void renameActiveWorkspace()}>Rename workspace</button>
-      <button className="button button-danger-quiet" disabled={!canWrite || workspaces.length < 1} onClick={() => void removeActiveWorkspace()}>Delete workspace</button>
-      <span className="project-divider" />
-      <label>Canvas <select aria-label="Canvas" value={activeCanvasId} disabled={!canWrite} onChange={(event) => void switchToCanvas(event.target.value)}>{canvases.map((canvas) => <option key={canvas.id} value={canvas.id}>{canvas.name}</option>)}</select></label>
-      <button className="button" disabled={!canWrite} onClick={() => void createNewCanvas()}>New canvas</button>
-      <button className="button" disabled={!canWrite || !activeCanvasId} onClick={() => void duplicateActiveCanvas()}>Duplicate canvas</button>
-      <button className="button" disabled={!canWrite || !activeCanvasId} onClick={() => void renameActiveCanvas()}>Rename canvas</button>
-      <button className="button button-danger-quiet" disabled={!canWrite || !activeCanvasId} onClick={() => void removeActiveCanvas()}>Delete canvas</button>
+    <nav className="project-toolbar" aria-label="Workspace management">
+      <div ref={workspaceSelectorRef} className="workspace-selector">
+        <button ref={workspaceMenuTriggerRef} className="button icon-button workspace-list-button" aria-label="Saved workspaces" title="Choose a saved workspace" aria-haspopup="menu" aria-expanded={workspaceMenuOpen} aria-controls="draw-workspace-menu" disabled={!canWrite} onClick={() => workspaceMenuOpen ? closeWorkspaceMenu(true) : setWorkspaceMenuOpen(true)}><span aria-hidden="true">▤</span></button>
+        <span className="workspace-current-name" aria-live="polite">{workspaces.find((workspace) => workspace.id === activeWorkspaceId)?.name ?? "Workspace"}</span>
+        {workspaceMenuOpen && <div ref={workspaceMenuRef} className="workspace-menu" id="draw-workspace-menu" role="menu" aria-label="Saved workspaces" onKeyDown={handleWorkspaceMenuKeyDown}>
+          {workspaces.map((workspace) => <button key={workspace.id} className="workspace-menu-item" type="button" role="menuitemradio" tabIndex={-1} aria-checked={workspace.id === activeWorkspaceId} data-workspace-id={workspace.id} onClick={() => void selectWorkspace(workspace.id)}>{workspace.name}{workspace.id === activeWorkspaceId && <span aria-hidden="true">✓</span>}</button>)}
+        </div>}
+      </div>
+      <button className="button icon-button" aria-label="New workspace" title="Create a new workspace" disabled={!canWrite} onClick={() => void createNewWorkspace()}><span aria-hidden="true">＋</span></button>
+      <button className="button icon-button" aria-label="Rename workspace" title="Rename the selected workspace" disabled={!canWrite} onClick={() => void renameActiveWorkspace()}><span aria-hidden="true">✎</span></button>
+      <button className="button button-danger-quiet icon-button" aria-label="Delete workspace" title="Delete the selected workspace and its drawing" disabled={!canWrite || workspaces.length < 1} onClick={() => void removeActiveWorkspace()}><svg aria-hidden="true" viewBox="0 0 16 16" focusable="false"><path d="M3.5 4.5h9l-.7 9h-7.6l-.7-9ZM2.5 2.5h11M6 2.5V1.7h4v.8M6.5 6.5v4.5m3-4.5v4.5" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/></svg></button>
       <span className="project-divider" />
       <button className="button" disabled={!canWrite || !selectionAvailable} title={selectionAvailable ? "Save selected objects and their labels to this workspace's library" : "Select objects to add them to the library"} onClick={() => void addSelectionToLibrary()}>Add selection to library</button>
       <button className="button" disabled={!canWrite || !activeWorkspaceId} onClick={() => setLibraryManagerOpen(true)}>Manage library ({libraryItems.length})</button>
@@ -2091,7 +2165,7 @@ export default function App() {
     </div>}
     <div className="workspace">
       <section className="canvas-area" aria-label="Drawing canvas">
-    <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onChange} onLibraryChange={persistLibraryChanges} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS}
+    <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onCurrentEditorChange} onLibraryChange={onCurrentLibraryChange} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS}
       renderTopRightUI={renderCanvasToolbar}>{DRAW_MENU}</Excalidraw></div>
       </section>
     </div>
@@ -2167,6 +2241,18 @@ export default function App() {
         </div>
       </section>
     </div>}
+    {libraryRecoveryOpen && libraryRecoveries.length > 0 && <section className="draw-recovery" role="region" aria-label="Library recovery">
+      <p>Some saved library data could not be read. Your drawings and autosave are available; the original library data is preserved below.</p>
+      {libraryRecoveries.map((recovery) => <div key={recovery.workspaceId}>
+        <button className="button" onClick={() => void (async () => {
+          try {
+            const raw = await exportWorkspaceLibraryRecovery(recovery.workspaceId);
+            if (raw !== null) download(new Blob([raw], { type: "application/json" }), "draw-library-recovery.json");
+          } catch (error) { setMessage(`Could not download library backup: ${error instanceof Error ? error.message : String(error)}`); }
+        })()}>Download library backup: {workspaces.find((workspace) => workspace.id === recovery.workspaceId)?.name ?? recovery.workspaceId}</button>
+      </div>)}
+      <button className="button button-quiet" onClick={() => setLibraryRecoveryOpen(false)}>Dismiss library notice</button>
+    </section>}
     {recoveryAvailable && <section className="draw-recovery" role="region" aria-label="Workspace recovery">
       <p>Your previous saved drawing is preserved for recovery. Autosave is paused for this board.</p>
       <button className="button" disabled={recoveryBusy} onClick={() => void (async () => {
