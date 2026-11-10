@@ -193,16 +193,7 @@ export default function App() {
   const lastMcpOperation = useRef<{ id: string; revision: number } | null>(null);
   const lastUndoneOperation = useRef<{ id: string; revision: number } | null>(null);
   const viewRevisionTimer = useRef<number | null>(null);
-  const onEditorReady = useCallback((api: ExcalidrawImperativeAPI) => {
-    apiRef.current = api;
-    const viewport = docRef.current?.document.canvas.viewport;
-    if (viewport) {
-      api.updateScene({
-        appState: { scrollX: viewport.x, scrollY: viewport.y, zoom: { value: viewport.zoom as any } },
-        captureUpdate: CaptureUpdateAction.NEVER,
-      });
-    }
-  }, []);
+
 
   useEffect(() => {
     const invalidateMcpHistoryOnHumanAction = (event: Event) => {
@@ -2003,6 +1994,24 @@ export default function App() {
       libraryItems: libraryItemsRef.current as unknown as LibraryItems,
     } as unknown as ExcalidrawInitialDataState;
   }, [doc?.document.id, editorKey]);
+  const editorDocumentId = doc?.document.id;
+  const onEditorReady = useCallback((api: ExcalidrawImperativeAPI) => {
+    if (activeDocumentIdRef.current !== editorDocumentId) return;
+    apiRef.current = api;
+    const state = initialData?.appState as any;
+    if (state) api.updateScene({
+      appState: { scrollX: state.scrollX, scrollY: state.scrollY, zoom: state.zoom },
+      captureUpdate: CaptureUpdateAction.NEVER,
+    });
+  }, [editorDocumentId, initialData]);
+  const onCurrentEditorChange = useCallback((elements: readonly any[], appState: any, files: any) => {
+    if (activeDocumentIdRef.current !== editorDocumentId) return;
+    onChange(elements, appState, files);
+  }, [editorDocumentId, onChange]);
+  const onCurrentLibraryChange = useCallback((items: LibraryItems) => {
+    if (activeDocumentIdRef.current !== editorDocumentId) return;
+    return persistLibraryChanges(items);
+  }, [editorDocumentId, persistLibraryChanges]);
   if (!doc || status === "loading") return <main className="loading-screen"><div className="brand-mark">D</div><p>Preparing your canvas…</p></main>;
   const background = doc.document.canvas.background.preset;
   const savedSelection = doc.document.appState.selectedElementIds as Record<string, boolean> | undefined;
@@ -2106,7 +2115,7 @@ export default function App() {
     </div>}
     <div className="workspace">
       <section className="canvas-area" aria-label="Drawing canvas">
-    <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onChange} onLibraryChange={persistLibraryChanges} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS}
+    <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onCurrentEditorChange} onLibraryChange={onCurrentLibraryChange} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS}
       renderTopRightUI={renderCanvasToolbar}>{DRAW_MENU}</Excalidraw></div>
       </section>
     </div>

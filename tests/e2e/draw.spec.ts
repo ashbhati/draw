@@ -566,8 +566,8 @@ test("canvas controls fit inside the editor across responsive breakpoints", asyn
     );
     if (width <= 1020) {
       await expect(selector).toBeVisible();
-      const bounds = await selector.boundingBox();
-      expect(bounds).not.toBeNull();
+      let bounds: Awaited<ReturnType<typeof selector.boundingBox>> = null;
+      await expect.poll(async () => { bounds = await selector.boundingBox(); return bounds !== null; }).toBe(true);
       expect(bounds!.x).toBeGreaterThanOrEqual(editorBounds!.x);
       expect(bounds!.y).toBeGreaterThanOrEqual(editorBounds!.y);
       expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(editorBounds!.x + editorBounds!.width);
@@ -3224,7 +3224,7 @@ test("quarantined autosave can be exported while new edits resume autosaving in 
   await page.mouse.move(board.x + board.width * 0.55 + 140, board.y + 220, { steps: 3 });
   await page.mouse.up();
   const draftWait = page.waitForEvent("download");
-  await page.getByRole("button", { name: /Save/ }).click();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
   const draft = await draftWait;
   const draftPath = await draft.path();
   const draftDocument = JSON.parse(await readFile(draftPath!, "utf8"));
