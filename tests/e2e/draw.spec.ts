@@ -229,6 +229,32 @@ async function readLocalDocument(page: Page) {
   }));
 }
 
+async function openWorkspaceMenu(page: Page) {
+  await page.getByRole("button", { name: "Saved workspaces" }).click();
+  return page.getByRole("menu", { name: "Saved workspaces" });
+}
+
+async function currentWorkspaceId(page: Page) {
+  const menu = await openWorkspaceMenu(page);
+  const active = menu.locator('[role="menuitemradio"][aria-checked="true"]');
+  const id = await active.getAttribute("data-workspace-id");
+  await page.keyboard.press("Escape");
+  if (!id) throw new Error("The active workspace is not available in the workspace list.");
+  return id;
+}
+
+async function workspaceCount(page: Page) {
+  const menu = await openWorkspaceMenu(page);
+  const count = await menu.getByRole("menuitemradio").count();
+  await page.keyboard.press("Escape");
+  return count;
+}
+
+async function selectWorkspace(page: Page, id: string) {
+  const menu = await openWorkspaceMenu(page);
+  await menu.locator(`[role="menuitemradio"][data-workspace-id="${id}"]`).click();
+}
+
 async function countWarmImagePixels(page: Page, image: Buffer): Promise<number> {
   return page.evaluate(async (bytes) => {
     const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: "image/png" }));
@@ -739,7 +765,7 @@ test("the Draw wordmark and Open .draw action do not overlap on narrow screens",
   for (const width of [360, 390]) {
     await page.setViewportSize({ width, height: 844 });
     const brand = await page.locator(".brand-name").boundingBox();
-    const open = await page.getByRole("button", { name: "Open .draw" }).boundingBox();
+    const open = await page.getByRole("button", { name: "Open", exact: true }).boundingBox();
     expect(brand, `wordmark should be visible at ${width}px`).not.toBeNull();
     expect(open, `Open .draw should be visible at ${width}px`).not.toBeNull();
     const overlaps = brand!.x < open!.x + open!.width && brand!.x + brand!.width > open!.x && brand!.y < open!.y + open!.height && brand!.y + brand!.height > open!.y;
@@ -797,7 +823,7 @@ test("MCP create and update stay editable through save, reload, open, and image 
   expect((await readLocalDocument(page)).document.elements.some((element: any) => element.originalText === longText && element.text.includes("\n"))).toBeTruthy();
 
   const drawDownloadWait = page.waitForEvent("download");
-  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
   const drawDownload = await drawDownloadWait;
   const drawBuffer = await readFile(await drawDownload.path());
   const savedFile = JSON.parse(drawBuffer.toString("utf8"));
@@ -900,7 +926,7 @@ test("Open .draw restores a downloaded file that remains editable through a seco
   await expect.poll(async () => (await freshBridgeDocument(page)).document.canvas.background.preset).toBe("white");
 
   const firstDownloadWait = page.waitForEvent("download");
-  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
   const firstDownload = await firstDownloadWait;
   const firstFilePath = await firstDownload.path();
   const firstFile = JSON.parse((await readFile(firstFilePath)).toString("utf8"));
@@ -924,7 +950,7 @@ test("Open .draw restores a downloaded file that remains editable through a seco
 
   page.once("dialog", (dialog) => dialog.accept());
   const firstChooserWait = page.waitForEvent("filechooser");
-  await page.getByRole("button", { name: "Open .draw" }).click();
+  await page.getByRole("button", { name: "Open", exact: true }).click();
   await (await firstChooserWait).setFiles(firstFilePath);
   await expect.poll(async () => {
     const reopened = await freshBridgeDocument(page);
@@ -958,7 +984,7 @@ test("Open .draw restores a downloaded file that remains editable through a seco
   }).toBe(true);
 
   const secondDownloadWait = page.waitForEvent("download");
-  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
   const secondDownload = await secondDownloadWait;
   const secondFilePath = await secondDownload.path();
   const secondFile = JSON.parse((await readFile(secondFilePath)).toString("utf8"));
@@ -966,7 +992,7 @@ test("Open .draw restores a downloaded file that remains editable through a seco
 
   page.once("dialog", (dialog) => dialog.accept());
   const secondChooserWait = page.waitForEvent("filechooser");
-  await page.getByRole("button", { name: "Open .draw" }).click();
+  await page.getByRole("button", { name: "Open", exact: true }).click();
   await (await secondChooserWait).setFiles(secondFilePath);
   await expect.poll(async () => {
     const reopened = await freshBridgeDocument(page);
@@ -1301,7 +1327,7 @@ test("MCP creates rendered editable primitives with relationships that stay edit
   }).toBe(true);
 
   const downloadWait = page.waitForEvent("download");
-  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
   const drawBuffer = await readFile(await (await downloadWait).path());
   const saved = JSON.parse(drawBuffer.toString("utf8"));
   expect(saved.format).toBe("draw");
@@ -1615,7 +1641,7 @@ test("the supplied reference fixture keeps chalk, layout, and editable nodes aft
   }
 
   const downloadWait = page.waitForEvent("download");
-  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
   const savedFile = await readFile(await (await downloadWait).path());
   const saveJson = JSON.parse(savedFile.toString("utf8"));
   await page.locator('input[type="file"][accept^=".draw"]').setInputFiles({ name: "reference-roundtrip.draw", mimeType: "application/vnd.draw+json", buffer: savedFile });
@@ -1653,7 +1679,7 @@ test("embedded image assets survive autosave and editable Draw save/reopen", asy
   expect(Object.values(autosaved.document.assets).some((asset: any) => asset.dataURL?.startsWith("data:image/png;base64,"))).toBe(true);
 
   const downloadWait = page.waitForEvent("download");
-  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
   const drawDownload = await downloadWait;
   const saved = JSON.parse((await readFile(await drawDownload.path())).toString("utf8"));
   expect(saved.document.elements.some((element: any) => element.type === "image")).toBe(true);
@@ -1720,7 +1746,7 @@ test("Openverse picker previews license metadata and embeds an offline-editable 
   await page.getByRole("button", { name: "Close" }).last().click();
 
   const drawWait = page.waitForEvent("download");
-  await page.getByRole("button", { name: /Save \.draw/ }).click();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
   const drawDownload = await drawWait;
   const drawFile = JSON.parse(await readFile(await drawDownload.path(), "utf8"));
   expect(drawFile.document.assets[imageElement.fileId].attribution.providerId).toBe(id);
@@ -2194,7 +2220,7 @@ test("revoking an MCP client cancels its pending command without overwriting a l
   expect(retry.status()).toBe(401);
   await page.getByRole("button", { name: "Close" }).click();
   const savedFile = page.waitForEvent("download");
-  await page.getByRole("button", { name: "Save .draw" }).click();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
   const saved = JSON.parse(await readFile(await (await savedFile).path(), "utf8"));
   expect(saved.document.elements).toEqual(expect.arrayContaining([expect.objectContaining({ originalText: "Human edit after MCP" })]));
   expect(saved.document.elements.filter((element: any) => element.originalText === "Human edit after MCP")).toHaveLength(1);
@@ -2684,150 +2710,60 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
   }
 });
 
-test("workspaces and canvases create, switch, rename, duplicate, delete, and survive reload", async ({ page }) => {
-  const workspacePicker = page.locator('select[aria-label="Workspace"]');
-  const canvasPicker = page.locator('nav select[aria-label="Canvas"]');
-  const firstWorkspaceId = await workspacePicker.inputValue();
-  const firstCanvasId = await canvasPicker.inputValue();
+test("workspaces create, switch, rename, delete, and survive reload with one board each", async ({ page }) => {
+  const originalWorkspaceId = await currentWorkspaceId(page);
+  await expect(page.locator('nav select[aria-label="Canvas"]')).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "New canvas" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Open", exact: true })).toHaveAttribute("title", /Open a \.draw file/);
+  await expect(page.getByRole("button", { name: "Save", exact: true })).toHaveAttribute("title", /Save the editable \.draw file/);
+  await expect(page.getByRole("button", { name: "New workspace" })).toHaveAttribute("title", "Create a new workspace");
+  await expect(page.getByRole("button", { name: "Rename workspace" })).toHaveAttribute("title", "Rename the selected workspace");
+  await expect(page.getByRole("button", { name: "Delete workspace" })).toHaveAttribute("title", "Delete the selected workspace and its drawing");
+  await expect(page.getByRole("button", { name: "Saved workspaces" })).toHaveAttribute("title", "Choose a saved workspace");
+  await expect(page.locator(".workspace-current-name")).toHaveText("My workspace");
   await page.getByLabel("Drawing title").fill("Alpha notes");
-  await expect(page.getByText("Saved on this device")).toBeVisible();
+  await expect.poll(async () => (await readLocalDocument(page))?.document.title).toBe("Alpha notes");
 
-  await page.getByRole("button", { name: "New canvas" }).click();
-  await expect(canvasPicker.locator("option")).toHaveCount(2);
-  await page.getByLabel("Drawing title").fill("Beta notes");
-  await expect.poll(async () => (await readLocalDocument(page))?.document.title).toBe("Beta notes");
-  await canvasPicker.selectOption(firstCanvasId);
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Alpha notes");
+  await page.getByRole("button", { name: "New workspace" }).click();
+  await expect.poll(() => workspaceCount(page)).toBe(2);
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
   await page.reload();
   await page.locator(".topbar").waitFor();
-  await expect(workspacePicker).toHaveValue(firstWorkspaceId);
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Alpha notes");
-
-  await canvasPicker.selectOption({ index: 1 });
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Beta notes");
-  const canvas = page.locator(".excalidraw canvas").last();
-  const box = await canvas.boundingBox();
-  if (!box) throw new Error("The drawing canvas is unavailable.");
-  for (const offset of [-210, 30]) {
-    await page.locator('.excalidraw label[title^="Rectangle"]').click();
-    const startX = box.x + box.width / 2 + offset;
-    const startY = box.y + box.height / 2 - 35;
-    await page.mouse.move(startX, startY);
-    await page.mouse.down(); await page.mouse.move(startX + 120, startY + 80, { steps: 3 }); await page.mouse.up();
-  }
-  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.length).toBe(2);
-  page.once("dialog", (dialog) => dialog.accept("Beta renamed"));
-  await page.getByRole("button", { name: "Rename canvas" }).click();
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Beta renamed");
-  const renamedScene = await readLocalDocument(page);
-  const lastShape = renamedScene.document.elements.at(-1);
-  const undoCanvas = page.locator(".excalidraw canvas").last();
-  const undoBounds = await undoCanvas.boundingBox();
-  if (!undoBounds || !lastShape) throw new Error("The renamed scene is unavailable.");
-  await page.mouse.click(undoBounds.x + lastShape.x + lastShape.width / 2, undoBounds.y + lastShape.y + lastShape.height / 2);
-  await page.keyboard.press("ControlOrMeta+z");
-  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.filter((element: any) => !element.isDeleted).length).toBe(1);
-  await page.getByRole("button", { name: "Duplicate canvas" }).click();
-  await expect(canvasPicker.locator("option")).toHaveCount(3);
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Beta renamed copy");
-  page.once("dialog", (dialog) => dialog.accept());
-  await page.getByRole("button", { name: "Delete canvas" }).click();
-  await expect(canvasPicker.locator("option")).toHaveCount(2);
+  await expect.poll(() => workspaceCount(page)).toBe(2);
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
+  await selectWorkspace(page, originalWorkspaceId);
   await expect(page.getByLabel("Drawing title")).toHaveValue("Alpha notes");
 
   page.once("dialog", (dialog) => dialog.accept("Research workspace"));
   await page.getByRole("button", { name: "Rename workspace" }).click();
-  await expect(workspacePicker.locator("option").first()).toHaveText("Research workspace");
+  await expect(page.locator(".workspace-current-name")).toHaveText("Research workspace");
   await page.getByRole("button", { name: "New workspace" }).click();
-  await expect(workspacePicker.locator("option")).toHaveCount(2);
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
+  await expect.poll(() => workspaceCount(page)).toBe(3);
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "Delete workspace" }).click();
-  await expect(workspacePicker.locator("option")).toHaveCount(1);
-  await expect(workspacePicker.locator("option").first()).toHaveText("Research workspace");
+  await expect.poll(() => workspaceCount(page)).toBe(2);
   await expect(page.getByLabel("Drawing title")).toHaveValue("Alpha notes");
 });
 
-test("pending autosave is discarded safely when switching or deleting a canvas", async ({ page }) => {
-  const canvasPicker = page.locator('nav select[aria-label="Canvas"]');
-  const firstCanvasId = await canvasPicker.inputValue();
-  await page.getByRole("button", { name: "New canvas" }).click();
-  await expect.poll(() => canvasPicker.inputValue()).not.toBe(firstCanvasId);
-  await expect(canvasPicker.locator("option")).toHaveCount(2);
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
-  const canvas = page.locator(".excalidraw canvas").last();
-  await expect(canvas).toBeVisible();
-  let box: Awaited<ReturnType<typeof canvas.boundingBox>> = null;
-  await expect.poll(async () => {
-    box = await canvas.boundingBox();
-    return box !== null;
-  }).toBe(true);
-  if (!box) throw new Error("The drawing canvas is unavailable.");
-  await page.locator('.excalidraw label[title^="Rectangle"]').click();
-  const startX = box.x + box.width / 2 - 70;
-  const startY = box.y + box.height / 2 - 30;
-  await page.mouse.move(startX, startY);
-  await page.mouse.down(); await page.mouse.move(startX + 140, startY + 100, { steps: 2 }); await page.mouse.up();
-  // Confirm Excalidraw accepted the human drag and queued its debounced save
-  // before switching. This keeps a slow CI render from switching on mouseup
-  // before the editor has committed the newly drawn rectangle to React state.
+test("pending autosave is preserved when switching workspaces", async ({ page }) => {
+  const originalWorkspaceId = await currentWorkspaceId(page);
+  await page.getByLabel("Drawing title").fill("Pending board edit");
   await expect(page.locator(".save-indicator.saving")).toBeVisible();
-  await canvasPicker.selectOption(firstCanvasId);
-  await expect(page.getByText("Saved on this device")).toBeVisible();
-  await expect(page.getByText(/reload the page to continue/i)).toHaveCount(0);
-  await canvasPicker.selectOption({ index: 1 });
-  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.length).toBe(1);
-  page.once("dialog", (dialog) => dialog.accept());
-  await page.getByRole("button", { name: "Delete canvas" }).click();
-  await expect(canvasPicker.locator("option")).toHaveCount(1);
+  await page.getByRole("button", { name: "New workspace" }).click();
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
+  await selectWorkspace(page, originalWorkspaceId);
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Pending board edit");
   await expect(page.getByText("Saved on this device")).toBeVisible();
   await expect(page.getByText(/reload the page to continue/i)).toHaveCount(0);
 });
 
-test("same-canvas save conflicts show an error, then deleting canvas or workspace resets status", async ({ page }) => {
-  const createSameCanvasSaveConflict = async (title: string) => {
-    await expect(page.getByText("Saved on this device")).toBeVisible();
-    // Let a just-created workspace/canvas finish its initial debounced write
-    // before installing the competing revision used by this fixture.
-    await page.waitForTimeout(450);
-    const current = await readLocalDocument(page);
-    const newerSaved = structuredClone(current);
-    newerSaved.document.documentRevision += 1_000_000;
-    await page.evaluate((document) => new Promise<void>((resolve, reject) => {
-      const request = indexedDB.open("draw-local");
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => {
-        const db = request.result;
-        const tx = db.transaction("documents", "readwrite");
-        tx.objectStore("documents").put(document, ["draw-document", document.document.id]);
-        tx.objectStore("documents").put(document, "current");
-        tx.oncomplete = () => { db.close(); resolve(); };
-        tx.onerror = () => { db.close(); reject(tx.error); };
-        tx.onabort = () => { db.close(); reject(tx.error); };
-      };
-    }), newerSaved);
-    await expect.poll(async () => (await readLocalDocument(page))?.document.documentRevision)
-      .toBe(newerSaved.document.documentRevision);
-    await page.getByLabel("Drawing title").fill(title);
-    await expect(page.getByText("Save issue")).toBeVisible();
-    await expect(page.getByText(/newer saved scene/i)).toBeVisible();
-  };
-
-  const canvasPicker = page.locator('nav select[aria-label="Canvas"]');
-  await createSameCanvasSaveConflict("Canvas conflict");
-  page.once("dialog", (dialog) => dialog.accept());
-  await page.getByRole("button", { name: "Delete canvas" }).click();
-  await expect(canvasPicker.locator("option")).toHaveCount(1);
-  await expect(page.getByText("Saved on this device")).toBeVisible();
-  await expect(page.getByText(/newer saved scene/i)).toHaveCount(0);
-
+test("deleting a workspace removes its board and library state", async ({ page }) => {
   await page.getByRole("button", { name: "New workspace" }).click();
-  await createSameCanvasSaveConflict("Workspace conflict");
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "Delete workspace" }).click();
-  await expect(page.locator('select[aria-label="Workspace"] option')).toHaveCount(1);
+  await expect.poll(() => workspaceCount(page)).toBe(1);
   await expect(page.getByText("Saved on this device")).toBeVisible();
-  await expect(page.getByText(/newer saved scene/i)).toHaveCount(0);
 });
 
 test("a read-only tab does not bootstrap a fresh workspace or active canvas pointer", async ({ browser, baseURL }) => {
@@ -2869,7 +2805,7 @@ test("a read-only tab does not bootstrap a fresh workspace or active canvas poin
   }
 });
 
-test("importing a .draw file adds a separate editable canvas and keeps the active drawing", async ({ page }) => {
+test("opening a .draw file creates a separate editable workspace", async ({ page }) => {
   const create = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
     input: { idempotencyKey: "e2e-workspace-import-fixture", nodes: [{ id: "import-fixture", label: "Preserve in imported copy", x: 100, y: 100 }], edges: [] },
@@ -2879,16 +2815,18 @@ test("importing a .draw file adds a separate editable canvas and keeps the activ
   const source = structuredClone(before);
   source.document.id = "portable-source-id";
   source.document.title = "Imported reference";
-  const canvasPicker = page.locator('nav select[aria-label="Canvas"]');
-  const countBefore = await canvasPicker.locator("option").count();
+  const oldWorkspaceId = await currentWorkspaceId(page);
+  const countBefore = await workspaceCount(page);
   const importInput = page.locator('input[type="file"][accept^=".draw"]');
   await importInput.setInputFiles({ name: "reference.draw", mimeType: "application/vnd.draw+json", buffer: Buffer.from(JSON.stringify(source)) });
-  await expect(canvasPicker.locator("option")).toHaveCount(countBefore + 1);
+  await expect.poll(() => workspaceCount(page)).toBe(countBefore + 1);
   await expect(page.getByLabel("Drawing title")).toHaveValue("Imported reference");
+  const importedWorkspaceId = await currentWorkspaceId(page);
+  expect(importedWorkspaceId).not.toBe(oldWorkspaceId);
   const imported = await readLocalDocument(page);
   expect(imported.document.id).not.toBe("portable-source-id");
   expect(imported.document.elements).toEqual(before.document.elements);
-  await canvasPicker.selectOption({ index: 0 });
+  await selectWorkspace(page, oldWorkspaceId);
   await expect(page.getByLabel("Drawing title")).toHaveValue(before.document.title);
   expect((await readLocalDocument(page)).document.elements).toEqual(before.document.elements);
 });
@@ -2918,15 +2856,15 @@ test("V1 current-document data migrates into the default workspace without losin
   await page.reload();
   await page.locator(".topbar").waitFor();
   await expect(page.getByLabel("Drawing title")).toHaveValue("Migrated V1 diagram");
-  await expect(page.locator('select[aria-label="Workspace"] option')).toHaveCount(1);
-  await expect(page.locator('nav select[aria-label="Canvas"] option')).toHaveCount(1);
+  await expect.poll(() => workspaceCount(page)).toBe(1);
+  await expect(page.locator('nav select[aria-label="Canvas"]')).toHaveCount(0);
   const migrated = await readLocalDocument(page);
   expect(migrated.document.elements).toEqual(legacy.document.elements);
   expect(migrated.document.canvas.viewport).toEqual(legacy.document.canvas.viewport);
   expect(migrated.document.documentRevision).toBe(12);
 });
 
-test("stdio MCP manages stable workspaces and canvases with durable replay, safe import, and human-approved deletion", async ({ page, baseURL }) => {
+test("stdio MCP manages workspaces with durable replay, safe imports, and human-approved deletion", async ({ page, baseURL }) => {
   const directory = await mkdtemp(join(tmpdir(), "draw-e2e-workspace-mcp-"));
   const source = await readLocalDocument(page);
   source.document.id = "mcp-import-source";
@@ -2953,10 +2891,13 @@ test("stdio MCP manages stable workspaces and canvases with durable replay, safe
     expect(created.activeDocument.document.id).toBeTruthy();
     const retry = await result(await mcp.call("create_workspace", createArgs));
     expect(retry.activeWorkspaceId).toBe(created.activeWorkspaceId);
-    await page.getByLabel("Drawing title").fill("Human edited agent canvas");
-    await expect.poll(async () => (await readLocalDocument(page))?.document.title).toBe("Human edited agent canvas");
-    await page.getByRole("button", { name: "New canvas" }).click();
-    await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
+    await page.getByLabel("Drawing title").fill("Human edited agent workspace");
+    await expect.poll(async () => (await readLocalDocument(page))?.document.title).toBe("Human edited agent workspace");
+    const afterFirstCreate = await result(await mcp.call("list_workspaces", {}));
+    const humanWorkspace = await result(await mcp.call("create_workspace", {
+      expectedCatalogRevision: afterFirstCreate.catalogRevision, idempotencyKey: "mcp-human-workspace-e2e", name: "Human workspace",
+    }));
+    expect(humanWorkspace.activeWorkspaceId).not.toBe(created.activeWorkspaceId);
     await page.getByLabel("Drawing title").fill("Current human canvas");
     await expect.poll(async () => (await readLocalDocument(page))?.document.title).toBe("Current human canvas");
     const currentCanvas = page.locator(".excalidraw canvas").last();
@@ -2969,10 +2910,10 @@ test("stdio MCP manages stable workspaces and canvases with durable replay, safe
     await page.mouse.down(); await page.mouse.move(rectangleX + 120, rectangleY + 70, { steps: 2 }); await page.mouse.up();
     await expect.poll(async () => (await readLocalDocument(page))?.document.elements.length).toBe(1);
     const currentBeforeReplay = await readLocalDocument(page);
-    const currentWorkspaceId = await page.locator('select[aria-label="Workspace"]').inputValue();
+    const currentWorkspace = await currentWorkspaceId(page);
     const currentCanvasId = await page.locator('nav select[aria-label="Canvas"]').inputValue();
     const safeReplay = await result(await mcp.call("create_workspace", createArgs));
-    expect(safeReplay.activeWorkspaceId).toBe(currentWorkspaceId);
+    expect(safeReplay.activeWorkspaceId).toBe(currentWorkspace);
     expect(safeReplay.activeCanvasId).toBe(currentCanvasId);
     expect(safeReplay.activeDocument.document.title).toBe("Current human canvas");
     expect(safeReplay.activeDocument.document.elements).toHaveLength(1);
@@ -2983,15 +2924,17 @@ test("stdio MCP manages stable workspaces and canvases with durable replay, safe
     const beforeImport = await result(await mcp.call("list_workspaces", {}));
     const canvasArgs = { expectedCatalogRevision: beforeImport.catalogRevision, idempotencyKey: "mcp-import-canvas-e2e", workspaceId: created.activeWorkspaceId, path: "agent-source.draw", name: "Imported agent plan" };
     const imported = await result(await mcp.call("import_draw_file_as_canvas", canvasArgs));
+    expect(imported.activeWorkspaceId).not.toBe(created.activeWorkspaceId);
     expect(imported.activeCanvasId).not.toBe(created.activeCanvasId);
     expect(imported.activeDocument.document.title).toBe("Imported agent plan");
     expect(imported.activeDocument.document.elements.some((element: any) => element.id === "agent-import-node")).toBe(true);
     const stale = await mcp.call("create_canvas", { expectedCatalogRevision: created.catalogRevision, idempotencyKey: "mcp-stale-catalog", workspaceId: created.activeWorkspaceId, name: "Should conflict" });
     expect(stale.result?.isError).toBe(true);
-    const canvasList = await result(await mcp.call("list_canvases", { workspaceId: created.activeWorkspaceId }));
-    expect(canvasList.canvases.some((canvas: any) => canvas.id === imported.activeCanvasId)).toBe(true);
-    expect(canvasList.activeDocument.document.id).toBe(imported.activeDocument.document.id);
+    const importedWorkspaceCanvases = await result(await mcp.call("list_canvases", { workspaceId: imported.activeWorkspaceId }));
+    expect(importedWorkspaceCanvases.canvases).toHaveLength(1);
+    expect(importedWorkspaceCanvases.canvases[0].id).toBe(imported.activeCanvasId);
     const duplicate = await result(await mcp.call("duplicate_canvas", { expectedCatalogRevision: imported.catalogRevision, idempotencyKey: "mcp-duplicate-canvas-e2e", canvasId: imported.activeCanvasId, name: "Editable duplicate" }));
+    expect(duplicate.activeWorkspaceId).not.toBe(imported.activeWorkspaceId);
     expect(duplicate.activeCanvasId).not.toBe(imported.activeCanvasId);
     expect(duplicate.activeDocument.document.elements.some((element: any) => element.id === "agent-import-node")).toBe(true);
     await expect.poll(async () => (await readLocalDocument(page))?.document.id).toBe(duplicate.activeDocument.document.id);
@@ -3009,7 +2952,7 @@ test("stdio MCP manages stable workspaces and canvases with durable replay, safe
     expect(spoofDialogText).toContain("Agent project");
     expect(spoofDialogText).not.toContain("Forged target");
     expect(spoofDialogText).not.toContain("Forged project");
-    expect(spoofDialogText).toContain("4 canvas(es)");
+    expect(spoofDialogText).toContain("1 canvas(es)");
     expect(spoofDialogText).not.toContain("999 canvas(es)");
     await page.getByRole("button", { name: "Keep drawings" }).click();
     const deleteArgs = { expectedCatalogRevision: duplicate.catalogRevision, idempotencyKey: "mcp-delete-workspace-e2e", workspaceId: created.activeWorkspaceId };
