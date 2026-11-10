@@ -13,7 +13,7 @@ import {
 import { isSafeHttpsUrl } from "./document/attribution";
 import { composeBackgroundSvg, hasSelectedExportElements, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorForBackgroundPreset } from "./export/background-recolor";
-import { createFreshWorkspaceFromRecovery, exportLegacyDocumentRecovery, loadLegacyDocumentRecovery, addWorkspaceLibraryItem, saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, listCanvases, listWorkspaces, loadCanvasDocument, loadWorkspaceLibrary, loadWorkspaceLibraryState, renameWorkspace, renameWorkspaceLibraryItem, saveWorkspaceLibrary, setActiveCanvas, type DrawCanvas, type DrawLibraryItem, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
+import { createFreshWorkspaceFromRecovery, exportLegacyDocumentRecovery, loadLegacyDocumentRecovery, addWorkspaceLibraryItem, saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createWorkspaceWithCanvas, createCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, listCanvases, listWorkspaces, loadCanvasDocument, loadWorkspaceLibrary, loadWorkspaceLibraryState, renameWorkspace, renameWorkspaceLibraryItem, saveWorkspaceLibrary, setActiveCanvas, type DrawCanvas, type DrawLibraryItem, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
 import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, reloadLibraryAfterConflict, resolveLibraryWorkspaceFromCatalog, shouldPersistLibraryChange } from "./ui/draw-library";
 import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
@@ -492,11 +492,14 @@ export default function App() {
           let workspaceItems = await listWorkspaces();
           if (!workspaceItems.length) {
             if (lock.acquired) {
-              const workspace = await createWorkspace("My workspace");
-              const canvas = await createCanvas(workspace.id, stored?.document.title ?? "Untitled drawing", stored ?? undefined);
-              await setActiveCanvas(canvas.id);
-              stored = await loadCanvasDocument(canvas.id);
-              workspaceItems = [workspace];
+              if (stored) {
+                const created = await createWorkspaceWithCanvas("My workspace", stored.document.title || "Untitled drawing", stored);
+                await setActiveCanvas(created.canvas.id);
+                stored = created.document;
+                workspaceItems = [created.workspace];
+              } else {
+                workspaceItems = [await createWorkspace("My workspace")];
+              }
             }
           }
           let workspaceId = "";
@@ -825,15 +828,13 @@ export default function App() {
       const imported = await parseDrawFile(await file.text());
       await settleEditorBeforeSwitch();
       autosave.cancelPending(); bridgeAutosave.cancelPending();
-      const workspace = await createWorkspace(imported.document.title || "Imported drawing");
-      const canvas = await createCanvas(workspace.id, imported.document.title, imported);
-      const next = await loadCanvasDocument(canvas.id);
-      if (!next) throw new Error("The imported drawing could not be loaded.");
-      await setActiveCanvas(canvas.id);
-      await activateWorkspaceLibrary(workspace.id);
+      const workspaceName = imported.document.title || "Imported drawing";
+      const created = await createWorkspaceWithCanvas(workspaceName, workspaceName, imported);
+      await setActiveCanvas(created.canvas.id);
+      await activateWorkspaceLibrary(created.workspace.id);
       lastMcpOperation.current = null; lastUndoneOperation.current = null;
-      setDocument(next); setEditorKey((key) => key + 1); setStatus("saved");
-      await refreshWorkspaceList(workspace.id, canvas.id);
+      setDocument(created.document); setEditorKey((key) => key + 1); setStatus("saved");
+      await refreshWorkspaceList(created.workspace.id, created.canvas.id);
       setMessage("Opened as a new workspace. The editable source file remains unchanged.");
     }
     catch (error) { setMessage(error instanceof Error ? error.message : "Could not open this Draw file."); }
@@ -885,8 +886,12 @@ export default function App() {
     setWorkspaceMenuOpen(false);
     try {
       await settleEditorBeforeSwitch();
-      const workspace = await createWorkspace("New workspace");
-      await switchToNewCanvas(workspace.id, "Untitled drawing");
+      const created = await createWorkspaceWithCanvas("New workspace", "Untitled drawing");
+      await setActiveCanvas(created.canvas.id);
+      await activateWorkspaceLibrary(created.workspace.id);
+      lastMcpOperation.current = null; lastUndoneOperation.current = null;
+      setDocument(created.document); setEditorKey((key) => key + 1); setStatus("saved"); setMessage("");
+      await refreshWorkspaceList(created.workspace.id, created.canvas.id);
     } catch (error) { setMessage(`Could not create workspace: ${error instanceof Error ? error.message : String(error)}`); }
   };
 
@@ -962,8 +967,8 @@ export default function App() {
       let remaining = await listWorkspaces();
       if (!remaining.length) remaining = [await createWorkspace("My workspace")];
       const nextWorkspace = remaining[0];
-      let nextCanvases = await listCanvases(nextWorkspace.id);
-      if (!nextCanvases.length) nextCanvases = [await createCanvas(nextWorkspace.id, "Untitled drawing")];
+      const nextCanvases = await listCanvases(nextWorkspace.id);
+      if (!nextCanvases.length) throw new Error("The replacement workspace has no board.");
       const nextCanvas = nextCanvases[0];
       await setActiveCanvas(nextCanvas.id);
       const next = await loadCanvasDocument(nextCanvas.id);

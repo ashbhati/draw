@@ -2950,6 +2950,13 @@ test("stdio MCP manages workspaces with durable replay, safe imports, and human-
     expect(duplicate.activeDocument.document.elements.some((element: any) => element.id === "agent-import-node")).toBe(true);
     await expect.poll(async () => (await readLocalDocument(page))?.document.id).toBe(duplicate.activeDocument.document.id);
     const confirmationCatalog = await result(await mcp.call("list_workspaces", {}));
+    const rejectedCanvasDelete = await mcp.call("delete_canvas", {
+      expectedCatalogRevision: confirmationCatalog.catalogRevision,
+      idempotencyKey: "mcp-delete-canvas-rejected-e2e", canvasId: created.activeCanvasId,
+    });
+    expect(rejectedCanvasDelete.result?.isError ?? rejectedCanvasDelete.error !== undefined).toBe(true);
+    expect(rejectedCanvasDelete.result?.content?.[0]?.text ?? rejectedCanvasDelete.error?.message ?? "").toMatch(/delete_workspace/i);
+    await expect(page.getByRole("dialog", { name: "Delete this workspace?" })).toHaveCount(0);
     const spoofedConfirmation = await page.request.post("/__draw/api/confirmations", { headers: mcpAuthHeaders(), data: {
       action: "delete_workspace", documentId: confirmationCatalog.activeDocument.document.id,
       expectedDocumentRevision: confirmationCatalog.activeDocument.document.documentRevision,
