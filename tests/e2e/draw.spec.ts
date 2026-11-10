@@ -2721,6 +2721,16 @@ test("workspaces create, switch, rename, delete, and survive reload with one boa
   await expect(page.getByRole("button", { name: "Delete workspace" })).toHaveAttribute("title", "Delete the selected workspace and its drawing");
   await expect(page.getByRole("button", { name: "Saved workspaces" })).toHaveAttribute("title", "Choose a saved workspace");
   await expect(page.locator(".workspace-current-name")).toHaveText("My workspace");
+  await page.getByRole("button", { name: "Saved workspaces" }).click();
+  const menu = page.getByRole("menu", { name: "Saved workspaces" });
+  const activeOption = menu.getByRole("menuitemradio", { name: "My workspace" });
+  await expect(activeOption).toBeFocused();
+  await page.keyboard.press("End");
+  await expect(menu.getByRole("menuitemradio").last()).toBeFocused();
+  await page.keyboard.press("Home");
+  await expect(activeOption).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("button", { name: "Saved workspaces" })).toBeFocused();
   await page.getByLabel("Drawing title").fill("Alpha notes");
   await expect.poll(async () => (await readLocalDocument(page))?.document.title).toBe("Alpha notes");
 
@@ -2911,7 +2921,8 @@ test("stdio MCP manages workspaces with durable replay, safe imports, and human-
     await expect.poll(async () => (await readLocalDocument(page))?.document.elements.length).toBe(1);
     const currentBeforeReplay = await readLocalDocument(page);
     const currentWorkspace = await currentWorkspaceId(page);
-    const currentCanvasId = await page.locator('nav select[aria-label="Canvas"]').inputValue();
+    const activeCatalog = await result(await mcp.call("list_workspaces", {}));
+    const currentCanvasId = activeCatalog.activeCanvasId;
     const safeReplay = await result(await mcp.call("create_workspace", createArgs));
     expect(safeReplay.activeWorkspaceId).toBe(currentWorkspace);
     expect(safeReplay.activeCanvasId).toBe(currentCanvasId);
