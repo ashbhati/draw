@@ -13,7 +13,7 @@ import {
 import { isSafeHttpsUrl } from "./document/attribution";
 import { composeBackgroundSvg, hasSelectedExportElements, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorForBackgroundPreset } from "./export/background-recolor";
-import { addWorkspaceLibraryItem, saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createCanvas, duplicateCanvas, deleteCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, listCanvases, listWorkspaces, loadCanvasDocument, loadWorkspaceLibrary, loadWorkspaceLibraryState, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, saveWorkspaceLibrary, setActiveCanvas, type DrawCanvas, type DrawLibraryItem, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
+import { createFreshWorkspaceFromRecovery, exportLegacyDocumentRecovery, loadLegacyDocumentRecovery, addWorkspaceLibraryItem, saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createCanvas, duplicateCanvas, deleteCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, listCanvases, listWorkspaces, loadCanvasDocument, loadWorkspaceLibrary, loadWorkspaceLibraryState, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, saveWorkspaceLibrary, setActiveCanvas, type DrawCanvas, type DrawLibraryItem, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
 import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, reloadLibraryAfterConflict, resolveLibraryWorkspaceFromCatalog, shouldPersistLibraryChange } from "./ui/draw-library";
 import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
@@ -142,6 +142,8 @@ export default function App() {
   const [libraryManagerOpen, setLibraryManagerOpen] = useState(false);
   const [status, setStatus] = useState<Status>("loading");
   const [message, setMessage] = useState("");
+  const [recoveryAvailable, setRecoveryAvailable] = useState(false);
+  const [recoveryBusy, setRecoveryBusy] = useState(false);
   const [confirmation, setConfirmation] = useState<BridgeConfirmation | null>(null);
   const [editorConnected, setEditorConnected] = useState(false);
   const [connectOpen, setConnectOpen] = useState(false);
@@ -549,6 +551,7 @@ export default function App() {
           setDocument(createEmptyDocument());
           setStatus("error");
           setMessage(`Local autosave could not be loaded, so Draw will not overwrite it. Save a portable .draw file to keep new edits. ${error instanceof Error ? error.message : String(error)}`);
+          try { const recovery = await loadLegacyDocumentRecovery(); if (live) setRecoveryAvailable(Boolean(recovery)); } catch { /* original storage error remains visible */ }
         }
       } catch (error) {
         if (!live) return;
@@ -2153,6 +2156,25 @@ export default function App() {
         </div>
       </section>
     </div>}
+    {recoveryAvailable && <section className="draw-recovery" role="region" aria-label="Workspace recovery">
+      <p>Your previous saved drawing is preserved for recovery. Autosave is paused for this board.</p>
+      <button className="button" disabled={recoveryBusy} onClick={() => void (async () => {
+        try {
+          const raw = await exportLegacyDocumentRecovery();
+          if (raw !== null) download(new Blob([raw], { type: "application/json" }), "draw-recovery.json");
+        } catch (error) { setMessage(`Could not download recovery data: ${error instanceof Error ? error.message : String(error)}`); }
+      })()}>Download recovery data</button>
+      <button className="button button-primary" disabled={recoveryBusy || !canWrite} onClick={() => void (async () => {
+        setRecoveryBusy(true);
+        try {
+          await createFreshWorkspaceFromRecovery(docRef.current?.document.title || "New workspace", docRef.current ?? undefined);
+          window.location.reload();
+        } catch (error) {
+          setRecoveryBusy(false);
+          setMessage(`Could not enable autosave: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      })()}>{recoveryBusy ? "Saving workspace…" : "Enable autosave in new workspace"}</button>
+    </section>}
     {message && <div className="toast" role="status"><span>{message}</span><button onClick={() => setMessage("")} aria-label="Dismiss message">×</button></div>}
     <footer className="footer"><span>DRAW V1</span><span className="footer-dot"/>LOCAL FIRST<span className="footer-spacer"/>A canvas for thoughts, drawn by hand.</footer>
   </main>;

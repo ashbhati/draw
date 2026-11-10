@@ -3226,3 +3226,40 @@ test("workspace library items add with labels, persist, insert as editable eleme
   await page.getByRole("dialog", { name: "Workspace library" }).getByRole("button", { name: "Remove" }).click();
   await expect(page.getByRole("button", { name: "Manage library (0)" })).toBeVisible();
 });
+
+test("quarantined autosave can be exported while new edits resume autosaving in a fresh workspace", async ({ page }) => {
+  const raw = { format: "draw", formatVersion: 1, document: { id: "damaged-original", title: "Preserve this raw payload", elemnts: [] } };
+  await page.evaluate(async (raw) => {
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.deleteDatabase("draw-local");
+      request.onsuccess = () => resolve(); request.onerror = () => reject(request.error);
+      request.onblocked = () => reject(new Error("Fixture database is still open"));
+    });
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("draw-local", 4);
+      request.onupgradeneeded = () => request.result.createObjectStore("documents");
+      request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+    });
+    const tx = db.transaction("documents", "readwrite");
+    tx.objectStore("documents").put(raw, "current");
+    await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); });
+    db.close();
+  }, raw);
+  await page.reload();
+  const recovery = page.getByRole("region", { name: "Workspace recovery" });
+  await expect(recovery).toBeVisible();
+  const downloadWait = page.waitForEvent("download");
+  await recovery.getByRole("button", { name: "Download recovery data" }).click();
+  const downloaded = await downloadWait;
+  const path = await downloaded.path();
+  expect(path).toBeTruthy();
+  expect(JSON.parse(await readFile(path!, "utf8"))).toEqual(raw);
+  await page.getByLabel("Drawing title").fill("New edits kept safely");
+  await recovery.getByRole("button", { name: "Enable autosave in new workspace" }).click();
+  await expect(recovery).toBeHidden();
+  await expect(page.getByLabel("Drawing title")).toHaveValue("New edits kept safely");
+  await page.getByLabel("Drawing title").fill("Autosave restored");
+  await expect(page.locator(".save-indicator")).toHaveText("Saved on this device");
+  await page.reload();
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Autosave restored");
+});
