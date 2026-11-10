@@ -3275,6 +3275,10 @@ test("quarantined autosave can be exported while new edits resume autosaving in 
   await expect(page.locator(".save-indicator")).toHaveText("Saved on this device");
   await page.reload();
   await expect(page.getByLabel("Drawing title")).toHaveValue("Autosave restored");
+  const retainedWait = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Download recovery data" }).click();
+  const retained = await retainedWait;
+  expect(JSON.parse(await readFile((await retained.path())!, "utf8"))).toEqual(raw);
   const normalized = (elements: any[]) => elements.map((element) => ({ ...element, boundElements: element.boundElements ?? [] }));
   expect(normalized((await readLocalDocument(page)).document.elements)).toEqual(normalized(draftDocument.document.elements));
 });

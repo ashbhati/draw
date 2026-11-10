@@ -143,6 +143,7 @@ export default function App() {
   const [status, setStatus] = useState<Status>("loading");
   const [message, setMessage] = useState("");
   const [recoveryAvailable, setRecoveryAvailable] = useState(false);
+  const [recoveryDataAvailable, setRecoveryDataAvailable] = useState(false);
   const [recoveryBusy, setRecoveryBusy] = useState(false);
   const [confirmation, setConfirmation] = useState<BridgeConfirmation | null>(null);
   const [editorConnected, setEditorConnected] = useState(false);
@@ -544,6 +545,10 @@ export default function App() {
               setMessage(`The drawing loaded, but stored MCP undo history is damaged. That undo is unavailable; the next successful edit will clear the damaged history. ${historyError instanceof Error ? historyError.message : String(historyError)}`);
             }
           }
+          try {
+            const recovery = await loadLegacyDocumentRecovery();
+            if (live) setRecoveryDataAvailable(Boolean(recovery));
+          } catch { /* a recovery backup error must not block a valid workspace */ }
           setStatus(lock.acquired ? "ready" : "error");
         } catch (error) {
           if (!live) return;
@@ -551,7 +556,7 @@ export default function App() {
           setDocument(createEmptyDocument());
           setStatus("error");
           setMessage(`Local autosave could not be loaded, so Draw will not overwrite it. Save a portable .draw file to keep new edits. ${error instanceof Error ? error.message : String(error)}`);
-          try { const recovery = await loadLegacyDocumentRecovery(); if (live) setRecoveryAvailable(Boolean(recovery)); } catch { /* original storage error remains visible */ }
+          try { const recovery = await loadLegacyDocumentRecovery(); if (live) { setRecoveryAvailable(Boolean(recovery)); setRecoveryDataAvailable(Boolean(recovery)); } } catch { /* original storage error remains visible */ }
         }
       } catch (error) {
         if (!live) return;
@@ -2008,6 +2013,12 @@ export default function App() {
         <button className="button button-quiet" disabled={!canWrite} onClick={() => void openMcpManagement()} title="Pair or revoke local MCP clients">MCP clients</button>
         <button className="button button-quiet" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open an editable Draw document" : "Close the other Draw tab to open files here"}>Open .draw</button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
+        {recoveryDataAvailable && !recoveryAvailable && <button className="button button-quiet" aria-label="Download recovery data" title="Download preserved recovery data" onClick={() => void (async () => {
+          try {
+            const raw = await exportLegacyDocumentRecovery();
+            if (raw !== null) download(new Blob([raw], { type: "application/json" }), "draw-recovery.json");
+          } catch (error) { setMessage(`Could not download recovery data: ${error instanceof Error ? error.message : String(error)}`); }
+        })()}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4" /></svg></button>}
         <button className="button button-primary" onClick={saveFile} title="Save the complete editable Draw file"><span className="button-icon">↓</span>Save .draw</button>
         <div className="export-group"><button className="button button-quiet export-main" disabled={exportScope === "selection" && !selectionAvailable} title={exportScope === "selection" && !selectionAvailable ? "Select one or more objects to export a selection" : undefined} onClick={() => void exportImage("image/png")}>Export</button><select aria-label="Export scope" value={exportScope} onChange={(event) => setExportScope(event.target.value as "canvas" | "selection")}><option value="canvas">Whole drawing</option><option value="selection">Selection only</option></select><select aria-label="Image export format" value="image/png" onChange={(event) => void exportImage(event.target.value as "image/png" | "image/jpeg")}><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option></select></div>
       </div>
