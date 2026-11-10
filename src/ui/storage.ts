@@ -1,9 +1,9 @@
-import { createEmptyDocument, validateDrawDocument, type DrawDocument } from "../document/document";
+import { createEmptyDocument, normalizeStoredDrawDocument, validateDrawDocument, type DrawDocument } from "../document/document";
 import { normalizeDrawImageAttributions } from "../document/attribution";
 import { compactOperationLedger, operationLedgerKey, OPERATION_SNAPSHOT_RETENTION_MS, OPERATION_TOMBSTONE_RETENTION_MS, sameSceneSnapshot, type DurableMcpOperation, type DurableMcpOperationResult, type DurableMcpRedo, type DurableMcpTombstone, type OperationLedgerEntry } from "../integrations/operation-ledger";
 
 const DATABASE_NAME = "draw-local";
-const DATABASE_VERSION = 9;
+const DATABASE_VERSION = 10;
 const DOCUMENTS_STORE = "documents";
 const MCP_OPERATIONS_STORE = "mcpOperations";
 const MCP_WORKSPACE_OPERATIONS_STORE = "mcpWorkspaceOperations";
@@ -17,6 +17,8 @@ const WORKSPACE_CATALOG_REVISION_KEY = "workspace-catalog-revision";
 const WORKSPACE_LIBRARY_STORE = "workspaceLibrary";
 const MIGRATION_MARKER_KEY = "migration-v6-complete";
 const LEGACY_RECOVERY_KEY = "legacy-recovery";
+const LEGACY_RECOVERY_INFO_KEY = "legacy-recovery-info";
+const LEGACY_RECOVERY_FORMAT = "draw-legacy-recovery-v1";
 const CURRENT_DOCUMENT_KEY = "current";
 const CURRENT_WRITE_ORDER_KEY = "current-write-order";
 const ACTIVE_POINTER_KEY = "active";
@@ -34,6 +36,14 @@ type AutosaveOrder = { sessionId: string; sequence: number };
 
 export interface DrawWorkspace { id: string; name: string; createdAt: number; updatedAt: number }
 export interface DrawCanvas { id: string; workspaceId: string; name: string; documentId: string; createdAt: number; updatedAt: number }
+export interface LegacyDocumentRecovery {
+  source: string;
+  raw: unknown;
+  reason?: string;
+  canvasId?: string;
+  quarantinedAt?: number;
+  recovered: boolean;
+}
 export interface DrawLibraryItem {
   id: string;
   status?: "published" | "unpublished";
@@ -115,6 +125,43 @@ export class WorkspaceLibraryConflictError extends Error {
 function documentKey(id: string): IDBValidKey { return ["draw-document", id]; }
 function writeOrderKey(id: string): IDBValidKey { return ["draw-write-order", id]; }
 
+function recoveryRecord(raw: unknown, metadata?: unknown, reason?: string): LegacyDocumentRecovery {
+  let original = raw;
+  let info = metadata;
+  // Schema 9 wrote v5 recovery metadata and the raw value in one object. Split
+  // that known envelope during upgrade; all newer records keep raw separate.
+  if (info === undefined && raw && typeof raw === "object" && !Array.isArray(raw)
+    && (raw as Record<string, unknown>).source === "v5-canvas"
+    && typeof (raw as Record<string, unknown>).canvasId === "string"
+    && Object.prototype.hasOwnProperty.call(raw, "raw")) {
+    info = raw;
+    original = (raw as Record<string, unknown>).raw;
+  }
+  if (info && typeof info === "object" && !Array.isArray(info)) {
+    const record = info as Partial<LegacyDocumentRecovery> & { format?: string };
+    if (typeof record.source === "string") {
+      return {
+        source: record.source,
+        raw: original,
+        ...(typeof record.reason === "string" ? { reason: record.reason } : {}),
+        ...(typeof record.canvasId === "string" ? { canvasId: record.canvasId } : {}),
+        ...(Number.isFinite(record.quarantinedAt) ? { quarantinedAt: record.quarantinedAt } : {}),
+        recovered: record.recovered === true,
+      };
+    }
+  }
+  return { source: "legacy-current", raw: original, ...(reason ? { reason } : {}), quarantinedAt: Date.now(), recovered: false };
+}
+
+function storedRecoveryRecord(record: LegacyDocumentRecovery): Omit<LegacyDocumentRecovery, "raw"> & { format: typeof LEGACY_RECOVERY_FORMAT } {
+  const { raw: _raw, ...metadata } = record;
+  return { ...metadata, format: LEGACY_RECOVERY_FORMAT };
+}
+
+function recoveryErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function autosaveSceneAndMetadata(document: DrawDocument): string {
   const { appState: _appState, ...metadata } = document.document;
   const { viewport: _viewport, ...canvas } = metadata.canvas;
@@ -168,12 +215,12 @@ function openDatabase(): Promise<IDBDatabase> {
           const legacy = legacyRequest.result as unknown;
           if (legacy !== undefined) {
             try {
-              validateDrawDocument(legacy);
-              const doc = legacy as DrawDocument;
+              const doc = normalizeStoredDrawDocument(legacy);
               const workspaceId = `workspace-${doc.document.id}`;
               const canvasId = `canvas-${doc.document.id}`;
               const now = Date.now();
               documents.put(doc, documentKey(doc.document.id));
+              documents.put(doc, CURRENT_DOCUMENT_KEY);
               workspaces.put({ id: workspaceId, name: "My workspace", createdAt: now, updatedAt: now } satisfies DrawWorkspace, workspaceId);
               canvases.put({ id: canvasId, workspaceId, name: doc.document.title, documentId: doc.document.id, createdAt: now, updatedAt: now } satisfies DrawCanvas, canvasId);
               meta.put({ workspaceId, canvasId } satisfies ActiveCanvasPointer, ACTIVE_POINTER_KEY);
@@ -183,13 +230,15 @@ function openDatabase(): Promise<IDBDatabase> {
                 if (oldOrder.result !== undefined) documents.put(oldOrder.result, writeOrderKey(doc.document.id));
                 documents.delete(CURRENT_WRITE_ORDER_KEY);
               };
-            } catch {
-              meta.put(legacy, LEGACY_RECOVERY_KEY);
+            } catch (error) {
+              const record = recoveryRecord(structuredClone(legacy), undefined, recoveryErrorMessage(error));
+              meta.put(record.raw, LEGACY_RECOVERY_KEY);
+              meta.put(storedRecoveryRecord(record), LEGACY_RECOVERY_INFO_KEY);
             }
           }
           meta.put(true, MIGRATION_MARKER_KEY);
         };
-      } else {
+      } else if (event.oldVersion === 5) {
         // PR #47's first v5 draft keyed documents by raw IDs. Re-key every
         // referenced row before accepting arbitrary IDs from portable files.
         const canvasRequest = canvases.getAll();
@@ -204,8 +253,13 @@ function openDatabase(): Promise<IDBDatabase> {
             oldDocumentRequest.onsuccess = () => {
               const raw = oldDocumentRequest.result as unknown;
               try {
-                validateDrawDocument(raw);
-                documents.put(raw, documentKey(canvas.documentId));
+                const normalized = normalizeStoredDrawDocument(raw);
+                if (normalized.document.id !== canvas.documentId) throw new Error("The legacy canvas document id does not match its canvas row.");
+                documents.put(normalized, documentKey(canvas.documentId));
+                const aliasRequest = documents.get(CURRENT_DOCUMENT_KEY);
+                aliasRequest.onsuccess = () => {
+                  try { if (normalizeStoredDrawDocument(aliasRequest.result).document.id === canvas.documentId) documents.put(normalized, CURRENT_DOCUMENT_KEY); } catch { /* another canvas owns the alias or it is quarantined */ }
+                };
                 if (canvas.documentId !== CURRENT_DOCUMENT_KEY && canvas.documentId !== CURRENT_WRITE_ORDER_KEY) documents.delete(canvas.documentId);
                 const oldOrderKey = `${canvas.documentId}-write-order`;
                 const orderRequest = documents.get(oldOrderKey);
@@ -218,8 +272,10 @@ function openDatabase(): Promise<IDBDatabase> {
                   remaining -= 1;
                   finish();
                 };
-              } catch {
-                meta.put({ source: "v5-canvas", canvasId: canvas.id, raw: raw ?? null }, LEGACY_RECOVERY_KEY);
+              } catch (error) {
+                const record = recoveryRecord(structuredClone(raw ?? null), { source: "v5-canvas", canvasId: canvas.id, reason: recoveryErrorMessage(error), quarantinedAt: Date.now(), recovered: false });
+                meta.put(record.raw, LEGACY_RECOVERY_KEY);
+                meta.put(storedRecoveryRecord(record), LEGACY_RECOVERY_INFO_KEY);
                 remaining -= 1;
                 finish();
               }
@@ -263,6 +319,64 @@ function openDatabase(): Promise<IDBDatabase> {
           rows.forEach(({ key, compact }) => receipts.put(compact, key));
         };
         keys.onsuccess = values.onsuccess = compactLegacyReceipts;
+      }
+      if (event.oldVersion < 10) {
+        // Earlier upgrades quarantined malformed-looking V1 rows as-is. Some
+        // were valid Draw v1 documents that only lacked revision counters, so
+        // retry the normalizer now while retaining the original value.
+        const recoveryRequest = meta.get(LEGACY_RECOVERY_KEY);
+        const recoveryInfoRequest = meta.get(LEGACY_RECOVERY_INFO_KEY);
+        const canvasesRequest = canvases.getAll();
+        const pointerRequest = meta.get(ACTIVE_POINTER_KEY);
+        let pending = 4;
+        let recovery: unknown;
+        let recoveryInfo: unknown;
+        let existingCanvases: DrawCanvas[] = [];
+        let activePointer: ActiveCanvasPointer | undefined;
+        const attemptRecovery = () => {
+          pending -= 1;
+          if (pending) return;
+          if (recovery === undefined) return;
+          const record = recoveryRecord(recovery, recoveryInfo);
+          try {
+            const document = normalizeStoredDrawDocument(record.raw);
+            if (record.source === "v5-canvas" && record.canvasId) {
+              const canvas = existingCanvases.find((item) => item.id === record.canvasId);
+              if (!canvas || canvas.documentId !== document.document.id) throw new Error("The quarantined v5 document does not match its canvas row.");
+              documents.put(document, documentKey(canvas.documentId));
+              if (activePointer?.canvasId === canvas.id) documents.put(document, CURRENT_DOCUMENT_KEY);
+            } else {
+              const existing = existingCanvases.find((item) => item.documentId === document.document.id);
+              if (existing) {
+                documents.put(document, documentKey(existing.documentId));
+                if (activePointer?.canvasId === existing.id) documents.put(document, CURRENT_DOCUMENT_KEY);
+              } else {
+                const now = Date.now();
+                const workspace = { id: `workspace-${crypto.randomUUID()}`, name: "Recovered workspace", createdAt: now, updatedAt: now } satisfies DrawWorkspace;
+                const canvas = { id: `canvas-${crypto.randomUUID()}`, workspaceId: workspace.id, name: document.document.title, documentId: document.document.id, createdAt: now, updatedAt: now } satisfies DrawCanvas;
+                workspaces.put(workspace, workspace.id);
+                canvases.put(canvas, canvas.id);
+                documents.put(document, documentKey(document.document.id));
+                if (!activePointer) {
+                  meta.put({ workspaceId: workspace.id, canvasId: canvas.id } satisfies ActiveCanvasPointer, ACTIVE_POINTER_KEY);
+                  documents.put(document, CURRENT_DOCUMENT_KEY);
+                }
+                meta.put(true, INITIALIZED_KEY);
+                incrementWorkspaceCatalogRevision(meta);
+              }
+            }
+            meta.put(record.raw, LEGACY_RECOVERY_KEY);
+            meta.put(storedRecoveryRecord({ ...record, recovered: true }), LEGACY_RECOVERY_INFO_KEY);
+          } catch (error) {
+            meta.put(record.raw, LEGACY_RECOVERY_KEY);
+            meta.put(storedRecoveryRecord({ ...record, reason: recoveryErrorMessage(error), recovered: false }), LEGACY_RECOVERY_INFO_KEY);
+          }
+        };
+        recoveryRequest.onsuccess = () => { recovery = recoveryRequest.result; attemptRecovery(); };
+        recoveryInfoRequest.onsuccess = () => { recoveryInfo = recoveryInfoRequest.result; attemptRecovery(); };
+        canvasesRequest.onsuccess = () => { existingCanvases = canvasesRequest.result as DrawCanvas[]; attemptRecovery(); };
+        pointerRequest.onsuccess = () => { activePointer = pointerRequest.result as ActiveCanvasPointer | undefined; attemptRecovery(); };
+        recoveryRequest.onerror = recoveryInfoRequest.onerror = canvasesRequest.onerror = pointerRequest.onerror = () => { request.transaction!.abort(); };
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -464,6 +578,70 @@ export async function loadCurrentDocument(): Promise<DrawDocument | null> {
   } finally {
     database.close();
   }
+}
+
+/** Read the original quarantined value without replacing or consuming it. */
+export async function loadLegacyDocumentRecovery(): Promise<LegacyDocumentRecovery | null> {
+  const database = await openDatabase();
+  try {
+    const tx = database.transaction(WORKSPACE_META_STORE, "readonly");
+    const meta = tx.objectStore(WORKSPACE_META_STORE);
+    const [raw, info] = await Promise.all([
+      requestValue<unknown>(meta.get(LEGACY_RECOVERY_KEY)),
+      requestValue<unknown>(meta.get(LEGACY_RECOVERY_INFO_KEY)),
+    ]);
+    await waitForTransaction(tx);
+    return raw === undefined ? null : recoveryRecord(raw, info);
+  } finally { database.close(); }
+}
+
+/** Serialize the untouched quarantined value for a user-owned backup download. */
+export async function exportLegacyDocumentRecovery(): Promise<string | null> {
+  const recovery = await loadLegacyDocumentRecovery();
+  if (!recovery) return null;
+  try {
+    const json = JSON.stringify(recovery.raw, null, 2);
+    if (typeof json !== "string") throw new Error("Quarantined data is not representable as JSON.");
+    return `${json}\n`;
+  } catch (error) {
+    throw new DrawStorageRecoveryError(`The quarantined data is still preserved, but could not be exported as JSON: ${recoveryErrorMessage(error)}`);
+  }
+}
+
+/** Atomically establish a writable workspace while leaving the quarantine untouched. */
+export async function createFreshWorkspaceFromRecovery(
+  name: string,
+  source?: DrawDocument,
+): Promise<{ workspace: DrawWorkspace; canvas: DrawCanvas; document: DrawDocument }> {
+  const workspaceName = name.trim() || "Recovered workspace";
+  const now = Date.now();
+  const workspace = { id: `workspace-${crypto.randomUUID()}`, name: workspaceName, createdAt: now, updatedAt: now } satisfies DrawWorkspace;
+  const document = source ? structuredClone(source) : createEmptyDocument(workspaceName);
+  document.document.id = crypto.randomUUID();
+  document.document.title = document.document.title.trim() || workspaceName;
+  document.document.documentRevision = 0;
+  document.document.viewRevision = 0;
+  validateDrawDocument(document);
+  normalizeDrawImageAttributions(document, "trusted-storage");
+  const canvas = { id: `canvas-${crypto.randomUUID()}`, workspaceId: workspace.id, name: document.document.title, documentId: document.document.id, createdAt: now, updatedAt: now } satisfies DrawCanvas;
+  const database = await openDatabase();
+  try {
+    const tx = database.transaction([DOCUMENTS_STORE, WORKSPACES_STORE, CANVASES_STORE, WORKSPACE_META_STORE], "readwrite");
+    const documents = tx.objectStore(DOCUMENTS_STORE);
+    const workspaces = tx.objectStore(WORKSPACES_STORE);
+    const canvases = tx.objectStore(CANVASES_STORE);
+    const meta = tx.objectStore(WORKSPACE_META_STORE);
+    workspaces.put(workspace, workspace.id);
+    canvases.put(canvas, canvas.id);
+    documents.put(document, documentKey(document.document.id));
+    documents.put(document, CURRENT_DOCUMENT_KEY);
+    documents.put({ sessionId: AUTOSAVE_SESSION_ID, sequence: ++autosaveSequence } satisfies AutosaveOrder, writeOrderKey(document.document.id));
+    meta.put({ workspaceId: workspace.id, canvasId: canvas.id } satisfies ActiveCanvasPointer, ACTIVE_POINTER_KEY);
+    meta.put(true, INITIALIZED_KEY);
+    incrementWorkspaceCatalogRevision(meta);
+    await waitForTransaction(tx);
+    return { workspace, canvas, document };
+  } finally { database.close(); }
 }
 
 /** List workspaces in creation order. Storage API intended for the V2 shell. */

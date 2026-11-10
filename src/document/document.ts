@@ -268,6 +268,29 @@ function looksLikeLegacyPrimitiveDocument(raw: Record<string, unknown>): boolean
   );
 }
 
+function normalizeDrawDocumentPayload(raw: unknown, attributionTrust: "unverified" | "trusted-storage"): DrawDocument {
+  if (!isRecord(raw)) throw new DrawDocumentError("Draw file must contain a JSON object.");
+  if (raw.format !== "draw") throw new DrawDocumentError('Expected a Draw document with format "draw".');
+  if (raw.formatVersion !== FORMAT_VERSION) {
+    throw new DrawDocumentError(
+      `Unsupported Draw format version ${String(raw.formatVersion)}.`,
+      "UNSUPPORTED_VERSION",
+    );
+  }
+
+  const normalized = looksLikeLegacyPrimitiveDocument(raw)
+    ? normalizeLegacyDraw(raw)
+    : normalizeVersionOneDocument(raw);
+  normalizeDrawImageAttributions(normalized, attributionTrust);
+  validateDrawDocument(normalized);
+  return normalized;
+}
+
+/** Normalize a locally stored V1 document without downgrading trusted attribution. */
+export function normalizeStoredDrawDocument(value: unknown): DrawDocument {
+  return normalizeDrawDocumentPayload(value, "trusted-storage");
+}
+
 export function parseDrawFile(input: string | unknown): DrawDocument {
   let raw: unknown = input;
   if (typeof input === "string") {
@@ -284,21 +307,7 @@ export function parseDrawFile(input: string | unknown): DrawDocument {
       throw new DrawDocumentError("Draw file is not valid JSON.", "INVALID_DOCUMENT", { cause });
     }
   }
-  if (!isRecord(raw)) throw new DrawDocumentError("Draw file must contain a JSON object.");
-  if (raw.format !== "draw") throw new DrawDocumentError('Expected a Draw document with format "draw".');
-  if (raw.formatVersion !== FORMAT_VERSION) {
-    throw new DrawDocumentError(
-      `Unsupported Draw format version ${String(raw.formatVersion)}.`,
-      "UNSUPPORTED_VERSION",
-    );
-  }
-
-  const normalized = looksLikeLegacyPrimitiveDocument(raw)
-    ? normalizeLegacyDraw(raw)
-    : normalizeVersionOneDocument(raw);
-  normalizeDrawImageAttributions(normalized, "unverified");
-  validateDrawDocument(normalized);
-  return normalized;
+  return normalizeDrawDocumentPayload(raw, "unverified");
 }
 
 export function serializeDrawFile(value: DrawDocument): string {
