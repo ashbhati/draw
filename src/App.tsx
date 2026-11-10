@@ -594,6 +594,17 @@ export default function App() {
     };
   }, [autosave, bridgeAutosave, setDocument]);
 
+  useEffect(() => {
+    if (!doc || !canWrite) return;
+    let live = true;
+    void listWorkspaceLibraryRecoveries().then((recoveries) => {
+      if (!live) return;
+      setLibraryRecoveries(recoveries.map(({ workspaceId, reason }) => ({ workspaceId, reason })));
+      if (!recoveries.length) setLibraryRecoveryOpen(false);
+    }).catch(() => { /* backup metadata must not interrupt drawing */ });
+    return () => { live = false; };
+  }, [workspaces, canWrite, doc?.document.id]);
+
   const onChange = useCallback((elements: readonly any[], appState: any, files: any) => {
     if (!writerOwned.current) return;
     const current = docRef.current;

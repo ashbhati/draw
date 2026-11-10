@@ -5,6 +5,20 @@ import { addWorkspaceLibraryItem, commitMcpOperation, commitMcpWorkspaceOperatio
 import { canRedoMcpOperation, canUndoMcpOperation, OPERATION_RESULT_RETENTION_MS, OPERATION_SNAPSHOT_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "../integrations/operation-ledger";
 
 describe("local Draw autosave", () => {
+  it.each(["ui", "mcp"])("removes preserved library recovery data with its workspace through %s", async (actor) => {
+    await seedV10MultiCanvasWorkspace({ items: [{ malformed: "private library payload" }], revision: 3 });
+    await listWorkspaces();
+    expect(await listWorkspaceLibraryRecoveries()).toHaveLength(1);
+    if (actor === "ui") await deleteWorkspace("workspace-alpha");
+    else {
+      const catalog = await getMcpWorkspaceCatalog();
+      await commitMcpWorkspaceOperation({ clientIdentity: "agent", idempotencyKey: "delete-recovery-project", payloadHash: "delete-recovery-project", expectedCatalogRevision: catalog.catalogRevision,
+        action: { type: "delete_workspace", workspaceId: "workspace-alpha" } });
+    }
+    expect(await listWorkspaceLibraryRecoveries()).toEqual([]);
+    expect(await exportWorkspaceLibraryRecovery("workspace-alpha")).toBeNull();
+  });
+
   beforeEach(async () => {
     await new Promise<void>((resolve, reject) => {
       const request = indexedDB.deleteDatabase("draw-local");

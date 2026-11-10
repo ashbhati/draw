@@ -3309,4 +3309,9 @@ test("a malformed saved library is downloadable while its drawing and autosave r
   await page.reload();
   await expect(page.getByLabel("Drawing title")).toHaveValue("Still autosaving");
   expect((await readLocalDocument(page)).document.elements).toMatchObject([{ id: "library-recovery-shape", type: "rectangle" }]);
+  await page.getByRole("button", { name: "Dismiss library notice" }).click();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete workspace", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Library recovery backups", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "Library recovery", exact: true })).toHaveCount(0);
 });

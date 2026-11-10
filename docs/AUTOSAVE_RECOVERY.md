@@ -25,4 +25,4 @@ A pre-existing migration from the draft schema-5 database keeps only one primary
 
 ## Unreadable saved libraries
 
-An unreadable reusable-item library does not prevent opening or autosaving its workspace drawing. During the workspace upgrade, Draw preserves the original library data as a recovery backup and starts that workspace with an empty usable library. The Library recovery notice lets you download the preserved JSON. Dismissing the notice keeps the backup; the library-recovery icon can reopen it later. This recovery does not flatten or change your diagram elements.
+An unreadable reusable-item library does not prevent opening or autosaving its workspace drawing. During the workspace upgrade, Draw preserves the original library data as a recovery backup and starts that workspace with an empty usable library. The Library recovery notice lets you download the preserved JSON. Dismissing the notice keeps the backup; the library-recovery icon can reopen it later. Deleting that workspace also deletes its preserved library backup. This recovery does not flatten or change your diagram elements.

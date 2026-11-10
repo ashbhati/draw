@@ -1113,6 +1113,7 @@ export async function commitMcpWorkspaceOperation(request: McpWorkspaceOperation
               const deleted = canvases.filter((item) => item.workspaceId === target.id);
               workspaces = workspaces.filter((item) => item.id !== target.id); workspaceStore.delete(target.id);
               tx.objectStore(WORKSPACE_LIBRARY_STORE).delete(target.id);
+              meta.delete(workspaceLibraryRecoveryKey(target.id));
               canvases = canvases.filter((item) => item.workspaceId !== target.id);
               for (const canvas of deleted) {
                 canvasStore.delete(canvas.id); documents.delete(documentKey(canvas.documentId)); documents.delete(writeOrderKey(canvas.documentId));
@@ -1683,6 +1684,7 @@ export async function deleteWorkspace(workspaceId: string): Promise<void> {
       workspaces.delete(workspaceId);
       incrementWorkspaceCatalogRevision(meta);
       tx.objectStore(WORKSPACE_LIBRARY_STORE).delete(workspaceId);
+      meta.delete(workspaceLibraryRecoveryKey(workspaceId));
       for (const canvas of removed) {
         canvases.delete(canvas.id);
         documents.delete(documentKey(canvas.documentId));
