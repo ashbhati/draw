@@ -19,6 +19,7 @@ const MIGRATION_MARKER_KEY = "migration-v6-complete";
 const LEGACY_RECOVERY_KEY = "legacy-recovery";
 const LEGACY_RECOVERY_INFO_KEY = "legacy-recovery-info";
 const LEGACY_RECOVERY_FORMAT = "draw-legacy-recovery-v1";
+const WORKSPACE_LIBRARY_RECOVERY_PREFIX = "workspace-library-recovery";
 const CURRENT_DOCUMENT_KEY = "current";
 const CURRENT_WRITE_ORDER_KEY = "current-write-order";
 const ACTIVE_POINTER_KEY = "active";
@@ -43,6 +44,12 @@ export interface LegacyDocumentRecovery {
   canvasId?: string;
   quarantinedAt?: number;
   recovered: boolean;
+}
+export interface WorkspaceLibraryRecovery {
+  workspaceId: string;
+  raw: unknown;
+  reason: string;
+  quarantinedAt: number;
 }
 export interface DrawLibraryItem {
   id: string;
@@ -160,6 +167,33 @@ function storedRecoveryRecord(record: LegacyDocumentRecovery): Omit<LegacyDocume
 
 function recoveryErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function workspaceLibraryRecoveryKey(workspaceId: string): IDBValidKey {
+  return [WORKSPACE_LIBRARY_RECOVERY_PREFIX, workspaceId];
+}
+
+function emptyWorkspaceLibrary(revision = 0): StoredWorkspaceLibrary {
+  return { items: [], revision, receipts: {} };
+}
+
+function nextLibraryRevisionAfterQuarantine(raw: unknown): number {
+  if (Array.isArray(raw)) return 1;
+  if (raw && typeof raw === "object") {
+    const revision = (raw as Record<string, unknown>).revision;
+    if (Number.isSafeInteger(revision) && Number(revision) >= 0 && Number(revision) < Number.MAX_SAFE_INTEGER) return Number(revision) + 1;
+  }
+  return 1;
+}
+
+function quarantineWorkspaceLibrary(meta: IDBObjectStore, workspaceId: string, raw: unknown, error: unknown): void {
+  const recovery: WorkspaceLibraryRecovery = {
+    workspaceId,
+    raw: structuredClone(raw),
+    reason: recoveryErrorMessage(error),
+    quarantinedAt: Date.now(),
+  };
+  meta.put(recovery, workspaceLibraryRecoveryKey(workspaceId));
 }
 
 function autosaveSceneAndMetadata(document: DrawDocument): string {
@@ -401,6 +435,20 @@ function openDatabase(): Promise<IDBDatabase> {
           pending -= 1;
           if (pending) return;
           try {
+            const libraryByWorkspace = new Map<string, StoredWorkspaceLibrary>();
+            for (const workspace of workspaceRows) {
+              const rowIndex = libraryKeys.findIndex((key) => key === workspace.id);
+              if (rowIndex < 0) continue;
+              const raw = libraryRows[rowIndex];
+              try {
+                libraryByWorkspace.set(workspace.id, readStoredWorkspaceLibrary(raw));
+              } catch (error) {
+                quarantineWorkspaceLibrary(meta, workspace.id, raw, error);
+                const emptyLibrary = emptyWorkspaceLibrary(nextLibraryRevisionAfterQuarantine(raw));
+                libraryByWorkspace.set(workspace.id, emptyLibrary);
+                libraryStore.put(emptyLibrary, workspace.id);
+              }
+            }
             const grouped = new Map<string, DrawCanvas[]>();
             for (const canvas of canvasRows) grouped.set(canvas.workspaceId, [...(grouped.get(canvas.workspaceId) ?? []), canvas]);
             let changed = false;
@@ -434,9 +482,8 @@ function openDatabase(): Promise<IDBDatabase> {
                   pointer = { workspaceId: newWorkspace.id, canvasId: canvas.id };
                   meta.put(pointer, ACTIVE_POINTER_KEY);
                 }
-                const sourceLibraryIndex = libraryKeys.findIndex((key) => key === workspace.id);
-                if (sourceLibraryIndex >= 0 && libraryRows[sourceLibraryIndex] !== undefined) {
-                  const sourceLibrary = readStoredWorkspaceLibrary(libraryRows[sourceLibraryIndex]);
+                const sourceLibrary = libraryByWorkspace.get(workspace.id);
+                if (sourceLibrary) {
                   libraryStore.put({ items: sourceLibrary.items, revision: sourceLibrary.revision, receipts: {} } satisfies StoredWorkspaceLibrary, newWorkspace.id);
                 }
                 changed = true;
@@ -451,8 +498,8 @@ function openDatabase(): Promise<IDBDatabase> {
               workspaceReceipts.clear();
             }
           } catch {
-            // A versionchange transaction is atomic. Do not let an unreadable
-            // library or malformed row commit only part of the board split.
+            // Malformed libraries are quarantined above; unexpected row or
+            // write failures still abort instead of committing a partial split.
             request.transaction!.abort();
           }
         };
@@ -1160,14 +1207,16 @@ function compactLibraryReceiptResult(result: Record<string, unknown>): Record<st
 }
 
 function readStoredWorkspaceLibrary(value: unknown): StoredWorkspaceLibrary {
-  if (Array.isArray(value)) return { items: structuredClone(value as DrawLibraryItem[]), revision: 0, receipts: {} };
-  if (!value || typeof value !== "object") return { items: [], revision: 0, receipts: {} };
+  if (value === undefined) return emptyWorkspaceLibrary();
+  if (Array.isArray(value)) return { items: normalizeLibraryItems(value as DrawLibraryItem[]), revision: 0, receipts: {} };
+  if (!value || typeof value !== "object") throw new DrawStorageRecoveryError("The workspace library record is damaged.");
   const record = value as Partial<StoredWorkspaceLibrary>;
-  if (!Array.isArray(record.items) || !Number.isSafeInteger(record.revision) || (record.revision as number) < 0) {
+  if (!Array.isArray(record.items) || !Number.isSafeInteger(record.revision) || (record.revision as number) < 0
+    || record.receipts !== undefined && (!record.receipts || typeof record.receipts !== "object" || Array.isArray(record.receipts))) {
     throw new DrawStorageRecoveryError("The workspace library record is damaged.");
   }
   return {
-    items: structuredClone(record.items),
+    items: normalizeLibraryItems(record.items),
     revision: record.revision as number,
     receipts: record.receipts && typeof record.receipts === "object" ? structuredClone(record.receipts) : {},
   };
@@ -1198,6 +1247,40 @@ function normalizeLibraryItems(items: readonly DrawLibraryItem[]): DrawLibraryIt
     ids.add(item.id);
   }
   return normalized;
+}
+
+/** List workspaces whose invalid library payload was preserved for recovery. */
+export async function listWorkspaceLibraryRecoveries(): Promise<WorkspaceLibraryRecovery[]> {
+  const db = await openDatabase();
+  try {
+    const tx = db.transaction(WORKSPACE_META_STORE, "readonly");
+    const store = tx.objectStore(WORKSPACE_META_STORE);
+    const [keys, values] = await Promise.all([
+      requestValue<IDBValidKey[]>(store.getAllKeys()),
+      requestValue<unknown[]>(store.getAll()),
+      waitForTransaction(tx),
+    ]);
+    return keys.flatMap((key, index) => {
+      if (!Array.isArray(key) || key[0] !== WORKSPACE_LIBRARY_RECOVERY_PREFIX) return [];
+      const value = values[index] as Partial<WorkspaceLibraryRecovery> | undefined;
+      if (!value || typeof value.workspaceId !== "string" || value.workspaceId !== key[1]
+        || typeof value.reason !== "string" || !Number.isFinite(value.quarantinedAt)) return [];
+      return [{ workspaceId: value.workspaceId, raw: structuredClone(value.raw), reason: value.reason, quarantinedAt: value.quarantinedAt! }];
+    }).sort((a, b) => a.workspaceId.localeCompare(b.workspaceId));
+  } finally { db.close(); }
+}
+
+/** Export the untouched quarantined workspace-library value as a JSON backup. */
+export async function exportWorkspaceLibraryRecovery(workspaceId: string): Promise<string | null> {
+  const recovery = (await listWorkspaceLibraryRecoveries()).find((item) => item.workspaceId === workspaceId);
+  if (!recovery) return null;
+  try {
+    const serialized = JSON.stringify({ format: "draw-workspace-library-recovery-v1", ...recovery }, null, 2);
+    if (typeof serialized !== "string") throw new Error("The preserved value is not representable as JSON.");
+    return `${serialized}\n`;
+  } catch (error) {
+    throw new DrawStorageRecoveryError(`The original workspace library remains preserved, but could not be exported as JSON: ${recoveryErrorMessage(error)}`);
+  }
 }
 
 /** Load the reusable element library and compare-and-swap revision for a workspace. */
