@@ -2710,6 +2710,22 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
   }
 });
 
+test("workspace menu dismisses on Tab and outside click without stealing focus", async ({ page }) => {
+  const trigger = page.getByRole("button", { name: "Saved workspaces" });
+  const menu = page.getByRole("menu", { name: "Saved workspaces" });
+  await trigger.click();
+  await expect(menu.getByRole("menuitemradio", { name: "My workspace" })).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(page.getByRole("button", { name: "New workspace" })).toBeFocused();
+  await expect(menu).toHaveCount(0);
+
+  await trigger.click();
+  await expect(menu).toBeVisible();
+  await page.getByLabel("Drawing title").click();
+  await expect(menu).toHaveCount(0);
+  await expect(page.getByLabel("Drawing title")).toBeFocused();
+});
+
 test("workspaces create, switch, rename, delete, and survive reload with one board each", async ({ page }) => {
   const originalWorkspaceId = await currentWorkspaceId(page);
   await expect(page.locator('nav select[aria-label="Canvas"]')).toHaveCount(0);
@@ -2743,6 +2759,7 @@ test("workspaces create, switch, rename, delete, and survive reload with one boa
   await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
   await selectWorkspace(page, originalWorkspaceId);
   await expect(page.getByLabel("Drawing title")).toHaveValue("Alpha notes");
+  await expect(page.getByRole("button", { name: "Saved workspaces" })).toBeFocused();
 
   page.once("dialog", (dialog) => dialog.accept("Research workspace"));
   await page.getByRole("button", { name: "Rename workspace" }).click();

@@ -139,8 +139,10 @@ export default function App() {
   const [activeWorkspaceId, setActiveWorkspaceId] = useState("");
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const workspaceMenuTriggerRef = useRef<HTMLButtonElement>(null);
+  const workspaceSelectorRef = useRef<HTMLDivElement>(null);
   const workspaceMenuRef = useRef<HTMLDivElement>(null);
   const workspaceMenuWasOpen = useRef(false);
+  const workspaceMenuRestoreFocus = useRef(false);
   const [activeCanvasId, setActiveCanvasId] = useState("");
   const [libraryItems, setLibraryItems] = useState<DrawLibraryItem[]>([]);
   const [libraryManagerOpen, setLibraryManagerOpen] = useState(false);
@@ -886,8 +888,13 @@ export default function App() {
     } catch (error) { setMessage(`Could not create workspace: ${error instanceof Error ? error.message : String(error)}`); }
   };
 
-  const selectWorkspace = async (workspaceId: string) => {
+  const closeWorkspaceMenu = (restoreFocus: boolean) => {
+    workspaceMenuRestoreFocus.current = restoreFocus;
     setWorkspaceMenuOpen(false);
+  };
+
+  const selectWorkspace = async (workspaceId: string) => {
+    closeWorkspaceMenu(true);
     if (workspaceId === activeWorkspaceId) return;
     try {
       const items = await listCanvases(workspaceId);
@@ -912,8 +919,30 @@ export default function App() {
         (selected ?? items?.[0])?.focus();
       });
     } else if (wasOpen) {
-      requestAnimationFrame(() => workspaceMenuTriggerRef.current?.focus());
+      const restoreFocus = workspaceMenuRestoreFocus.current;
+      workspaceMenuRestoreFocus.current = false;
+      if (restoreFocus) requestAnimationFrame(() => workspaceMenuTriggerRef.current?.focus());
     }
+  }, [workspaceMenuOpen]);
+
+  useEffect(() => {
+    if (!workspaceMenuOpen) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (event.target instanceof Node && !workspaceSelectorRef.current?.contains(event.target)) {
+        closeWorkspaceMenu(false);
+      }
+    };
+    const closeWhenFocusLeavesMenu = (event: FocusEvent) => {
+      if (event.target instanceof Node && !workspaceMenuRef.current?.contains(event.target)) {
+        closeWorkspaceMenu(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer, true);
+    document.addEventListener("focusin", closeWhenFocusLeavesMenu, true);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer, true);
+      document.removeEventListener("focusin", closeWhenFocusLeavesMenu, true);
+    };
   }, [workspaceMenuOpen]);
 
   const handleWorkspaceMenuKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
@@ -921,7 +950,7 @@ export default function App() {
     const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
     if (event.key === "Escape") {
       event.preventDefault();
-      setWorkspaceMenuOpen(false);
+      closeWorkspaceMenu(true);
     } else if (event.key === "ArrowDown") {
       event.preventDefault();
       focusWorkspaceMenuItem(currentIndex < 0 ? 0 : (currentIndex + 1) % items.length);
@@ -2048,8 +2077,8 @@ export default function App() {
       </div>
     </header>
     <nav className="project-toolbar" aria-label="Workspace management">
-      <div className="workspace-selector" onKeyDown={(event) => { if (event.key === "Escape") setWorkspaceMenuOpen(false); }}>
-        <button ref={workspaceMenuTriggerRef} className="button icon-button workspace-list-button" aria-label="Saved workspaces" title="Choose a saved workspace" aria-haspopup="menu" aria-expanded={workspaceMenuOpen} aria-controls="draw-workspace-menu" disabled={!canWrite} onClick={() => setWorkspaceMenuOpen((open) => !open)}><span aria-hidden="true">▤</span></button>
+      <div ref={workspaceSelectorRef} className="workspace-selector">
+        <button ref={workspaceMenuTriggerRef} className="button icon-button workspace-list-button" aria-label="Saved workspaces" title="Choose a saved workspace" aria-haspopup="menu" aria-expanded={workspaceMenuOpen} aria-controls="draw-workspace-menu" disabled={!canWrite} onClick={() => workspaceMenuOpen ? closeWorkspaceMenu(true) : setWorkspaceMenuOpen(true)}><span aria-hidden="true">▤</span></button>
         <span className="workspace-current-name" aria-live="polite">{workspaces.find((workspace) => workspace.id === activeWorkspaceId)?.name ?? "Workspace"}</span>
         {workspaceMenuOpen && <div ref={workspaceMenuRef} className="workspace-menu" id="draw-workspace-menu" role="menu" aria-label="Saved workspaces" onKeyDown={handleWorkspaceMenuKeyDown}>
           {workspaces.map((workspace) => <button key={workspace.id} className="workspace-menu-item" type="button" role="menuitemradio" tabIndex={-1} aria-checked={workspace.id === activeWorkspaceId} data-workspace-id={workspace.id} onClick={() => void selectWorkspace(workspace.id)}>{workspace.name}{workspace.id === activeWorkspaceId && <span aria-hidden="true">✓</span>}</button>)}
