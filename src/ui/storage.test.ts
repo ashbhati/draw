@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import "fake-indexeddb/auto";
 import { createEmptyDocument, parseDrawFile, serializeDrawFile } from "../document/document";
-import { addWorkspaceLibraryItem, commitMcpOperation, commitMcpWorkspaceOperation, createCanvas, createWorkspace, deleteCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, duplicateCanvas, DrawStorageRecoveryError, getMcpWorkspaceCatalog, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadMcpOperation, loadMcpWorkspaceOperationReceipt, loadWorkspaceLibrary, loadWorkspaceLibraryState, MCP_WORKSPACE_RECEIPT_LIMIT, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, restoreMcpCommandSnapshot, saveCurrentDocument, saveWorkspaceLibrary, setActiveCanvas, WorkspaceLibraryConflictError } from "./storage";
+import { addWorkspaceLibraryItem, commitMcpOperation, commitMcpWorkspaceOperation, createCanvas, createFreshWorkspaceFromRecovery, createWorkspace, deleteCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, duplicateCanvas, DrawStorageRecoveryError, exportLegacyDocumentRecovery, getMcpWorkspaceCatalog, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadLegacyDocumentRecovery, loadMcpOperation, loadMcpWorkspaceOperationReceipt, loadWorkspaceLibrary, loadWorkspaceLibraryState, MCP_WORKSPACE_RECEIPT_LIMIT, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, restoreMcpCommandSnapshot, saveCurrentDocument, saveWorkspaceLibrary, setActiveCanvas, WorkspaceLibraryConflictError } from "./storage";
 import { canRedoMcpOperation, canUndoMcpOperation, OPERATION_RESULT_RETENTION_MS, OPERATION_SNAPSHOT_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "../integrations/operation-ledger";
 
 describe("local Draw autosave", () => {
@@ -382,6 +382,109 @@ describe("local Draw autosave", () => {
     expect(canvases[0]).toMatchObject({ workspaceId: workspaces[0].id, documentId: legacy.document.id, name: "Existing V1 work" });
     expect(await loadCanvasDocument(canvases[0].id)).toEqual(legacy);
     expect(await readLegacyCurrentDocument()).toEqual(legacy);
+  });
+
+  it("normalizes legacy V1 autosaves that predate document and view revisions", async () => {
+    const legacy = createEmptyDocument("Pre-revision autosave");
+    legacy.document.elements.push({ id: "pre-revision-node", type: "rectangle", x: 8, y: 13, width: 72, height: 44 });
+    delete (legacy.document as Partial<typeof legacy.document>).documentRevision;
+    delete (legacy.document as Partial<typeof legacy.document>).viewRevision;
+    await seedLegacyCurrentDocument(legacy as import("../document/document").DrawDocument);
+
+    const restored = await loadCurrentDocument();
+    expect(restored).toMatchObject({
+      document: {
+        id: legacy.document.id,
+        title: "Pre-revision autosave",
+        documentRevision: 0,
+        viewRevision: 0,
+        elements: [{ id: "pre-revision-node", type: "rectangle" }],
+      },
+    });
+    expect(await loadLegacyDocumentRecovery()).toBeNull();
+    expect(await saveCurrentDocument(restored!)).toMatchObject({ saved: true });
+    expect((await loadCurrentDocument())?.document.elements).toEqual(legacy.document.elements);
+  });
+
+  it("repairs a schema 9 quarantined V1 document while retaining its original data for export", async () => {
+    const quarantined = createEmptyDocument("Already quarantined V1");
+    quarantined.document.elements.push({ id: "recoverable-node", type: "ellipse", x: 4, y: 7, width: 50, height: 32 });
+    delete (quarantined.document as Partial<typeof quarantined.document>).documentRevision;
+    delete (quarantined.document as Partial<typeof quarantined.document>).viewRevision;
+    const raw = structuredClone(quarantined);
+    await seedV9LegacyRecovery(raw);
+
+    expect(await loadCurrentDocument()).toMatchObject({
+      document: {
+        id: quarantined.document.id,
+        documentRevision: 0,
+        viewRevision: 0,
+        elements: [{ id: "recoverable-node", type: "ellipse" }],
+      },
+    });
+    expect(await loadLegacyDocumentRecovery()).toMatchObject({ source: "legacy-current", raw, recovered: true });
+    expect(await exportLegacyDocumentRecovery()).toBe(`${JSON.stringify(raw, null, 2)}\n`);
+  });
+
+  it("upgrades a healthy schema 9 workspace without changing document revisions or creating recovery data", async () => {
+    const document = createEmptyDocument("Healthy schema 9 board");
+    document.document.documentRevision = 17;
+    document.document.viewRevision = 6;
+    document.document.elements.push({ id: "healthy-v9-node", type: "rectangle", x: 9, y: 14, width: 70, height: 42 });
+    const workspace = { id: "healthy-v9-workspace", name: "Healthy project", createdAt: 10, updatedAt: 20 };
+    const canvas = { id: "healthy-v9-canvas", workspaceId: workspace.id, name: document.document.title, documentId: document.document.id, createdAt: 11, updatedAt: 21 };
+    await seedV9WorkspaceDocument(document, workspace, canvas);
+
+    expect(await loadCurrentDocument()).toEqual(document);
+    expect(await listWorkspaces()).toEqual([workspace]);
+    expect(await listCanvases(workspace.id)).toEqual([canvas]);
+    expect(await loadLegacyDocumentRecovery()).toBeNull();
+    expect(await exportLegacyDocumentRecovery()).toBeNull();
+  });
+
+  it("repairs a schema 9 v5-canvas quarantine with missing revisions and exports the original document", async () => {
+    const quarantined = createEmptyDocument("Quarantined v5 board");
+    quarantined.document.elements.push({ id: "v5-recovery-node", type: "ellipse", x: 12, y: 18, width: 65, height: 39 });
+    delete (quarantined.document as Partial<typeof quarantined.document>).documentRevision;
+    delete (quarantined.document as Partial<typeof quarantined.document>).viewRevision;
+    const raw = structuredClone(quarantined);
+    const workspace = { id: "v5-recovery-workspace", name: "Older project", createdAt: 30, updatedAt: 31 };
+    const canvas = { id: "v5-recovery-canvas", workspaceId: workspace.id, name: quarantined.document.title, documentId: quarantined.document.id, createdAt: 32, updatedAt: 33 };
+    const envelope = { source: "v5-canvas", canvasId: canvas.id, raw, reason: "Legacy revision fields were missing", quarantinedAt: 34, recovered: false };
+    await seedV9WorkspaceDocument(quarantined as import("../document/document").DrawDocument, workspace, canvas, envelope);
+
+    expect(await loadCurrentDocument()).toMatchObject({
+      document: {
+        id: raw.document.id,
+        title: "Quarantined v5 board",
+        documentRevision: 0,
+        viewRevision: 0,
+        elements: [{ id: "v5-recovery-node", type: "ellipse" }],
+      },
+    });
+    expect(await loadLegacyDocumentRecovery()).toMatchObject({ source: "v5-canvas", canvasId: canvas.id, raw, recovered: true });
+    expect(await exportLegacyDocumentRecovery()).toBe(`${JSON.stringify(raw, null, 2)}\n`);
+    expect(await listCanvases(workspace.id)).toEqual([canvas]);
+  });
+
+  it("starts an autosaving workspace from a recovery draft without deleting quarantine", async () => {
+    const raw = { malformed: "original legacy bytes", nested: [1, 2, 3] };
+    await seedV9LegacyRecovery(raw);
+    await expect(loadCurrentDocument()).rejects.toBeInstanceOf(DrawStorageRecoveryError);
+    const recoveryDraft = createEmptyDocument("Unsaved recovery draft");
+    recoveryDraft.document.elements.push({ id: "draft-node", type: "diamond", x: 17, y: 21, width: 64, height: 39 });
+
+    const created = await createFreshWorkspaceFromRecovery("Recovered board", recoveryDraft);
+
+    expect(created.document.document.title).toBe("Unsaved recovery draft");
+    expect(created.workspace.name).toBe("Recovered board");
+    expect(created.canvas.workspaceId).toBe(created.workspace.id);
+    expect(created.document.document.id).not.toBe(recoveryDraft.document.id);
+    expect(await loadCurrentDocument()).toEqual(created.document);
+    expect(await loadCanvasDocument(created.canvas.id)).toEqual(created.document);
+    expect((await listCanvases(created.workspace.id))).toHaveLength(1);
+    expect(await loadLegacyDocumentRecovery()).toMatchObject({ source: "legacy-current", raw, recovered: false });
+    expect(await exportLegacyDocumentRecovery()).toBe(`${JSON.stringify(raw, null, 2)}\n`);
   });
 
   it("rekeys draft V5 document rows without losing canvas selections or revisions", async () => {
@@ -771,6 +874,8 @@ describe("local Draw autosave", () => {
     db.close();
     expect(raw).toEqual({ garbage: true });
     expect(recovery).toEqual({ garbage: true });
+    expect(await loadLegacyDocumentRecovery()).toMatchObject({ source: "legacy-current", raw: { garbage: true } });
+    expect(await exportLegacyDocumentRecovery()).toBe(`${JSON.stringify({ garbage: true }, null, 2)}\n`);
   });
 
   it("repairs a missing active pointer to a valid sibling canvas and reports missing document rows", async () => {
@@ -1218,6 +1323,72 @@ async function seedLegacyCurrentDocument(document: import("../document/document"
   const transaction = database.transaction("documents", "readwrite");
   transaction.objectStore("documents").put(document, "current");
   await transactionDone(transaction);
+  database.close();
+}
+
+async function seedV9LegacyRecovery(raw: unknown): Promise<void> {
+  const database = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open("draw-local", 9);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      const documents = db.createObjectStore("documents");
+      db.createObjectStore("mcpOperations");
+      db.createObjectStore("mcpWorkspaceOperations");
+      const undo = db.createObjectStore("mcpUndo");
+      undo.createIndex("byCompletedAt", "completedAt", { unique: false });
+      const redo = db.createObjectStore("mcpRedo");
+      redo.createIndex("byCompletedAt", "operation.completedAt", { unique: false });
+      db.createObjectStore("mcpMeta");
+      db.createObjectStore("workspaces");
+      const canvases = db.createObjectStore("canvases");
+      canvases.createIndex("byWorkspaceId", "workspaceId", { unique: false });
+      canvases.createIndex("byDocumentId", "documentId", { unique: true });
+      const workspaceMeta = db.createObjectStore("workspaceMeta");
+      db.createObjectStore("workspaceLibrary");
+      documents.put(raw, "current");
+      workspaceMeta.put(raw, "legacy-recovery");
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  database.close();
+}
+
+async function seedV9WorkspaceDocument(
+  document: import("../document/document").DrawDocument,
+  workspace: import("./storage").DrawWorkspace,
+  canvas: import("./storage").DrawCanvas,
+  recovery?: unknown,
+): Promise<void> {
+  const database = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open("draw-local", 9);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      const documents = db.createObjectStore("documents");
+      db.createObjectStore("mcpOperations");
+      db.createObjectStore("mcpWorkspaceOperations");
+      const undo = db.createObjectStore("mcpUndo");
+      undo.createIndex("byCompletedAt", "completedAt", { unique: false });
+      const redo = db.createObjectStore("mcpRedo");
+      redo.createIndex("byCompletedAt", "operation.completedAt", { unique: false });
+      db.createObjectStore("mcpMeta");
+      const workspaces = db.createObjectStore("workspaces");
+      const canvases = db.createObjectStore("canvases");
+      canvases.createIndex("byWorkspaceId", "workspaceId", { unique: false });
+      canvases.createIndex("byDocumentId", "documentId", { unique: true });
+      const meta = db.createObjectStore("workspaceMeta");
+      db.createObjectStore("workspaceLibrary");
+      documents.put(document, ["draw-document", document.document.id]);
+      documents.put(document, "current");
+      workspaces.put(workspace, workspace.id);
+      canvases.put(canvas, canvas.id);
+      meta.put({ workspaceId: workspace.id, canvasId: canvas.id }, "active");
+      meta.put(true, "has-canvas-history");
+      if (recovery !== undefined) meta.put(recovery, "legacy-recovery");
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
   database.close();
 }
 
