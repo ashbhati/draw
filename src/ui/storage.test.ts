@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import "fake-indexeddb/auto";
 import { createEmptyDocument, parseDrawFile, serializeDrawFile } from "../document/document";
-import { addWorkspaceLibraryItem, commitMcpOperation, commitMcpWorkspaceOperation, createCanvas, createFreshWorkspaceFromRecovery, createWorkspace, deleteCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, duplicateCanvas, DrawStorageRecoveryError, exportLegacyDocumentRecovery, getMcpWorkspaceCatalog, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadLegacyDocumentRecovery, loadMcpOperation, loadMcpWorkspaceOperationReceipt, loadWorkspaceLibrary, loadWorkspaceLibraryState, MCP_WORKSPACE_RECEIPT_LIMIT, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, restoreMcpCommandSnapshot, saveCurrentDocument, saveWorkspaceLibrary, setActiveCanvas, WorkspaceLibraryConflictError } from "./storage";
+import { addWorkspaceLibraryItem, commitMcpOperation, commitMcpWorkspaceOperation, createCanvas, createFreshWorkspaceFromRecovery, createWorkspace, createWorkspaceWithCanvas, deleteCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, duplicateCanvas, DrawStorageRecoveryError, exportLegacyDocumentRecovery, getMcpWorkspaceCatalog, listCanvases, listWorkspaces, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadLegacyDocumentRecovery, loadMcpOperation, loadMcpWorkspaceOperationReceipt, loadWorkspaceLibrary, loadWorkspaceLibraryState, MCP_WORKSPACE_RECEIPT_LIMIT, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, restoreMcpCommandSnapshot, saveCurrentDocument, saveWorkspaceLibrary, setActiveCanvas, WorkspaceLibraryConflictError } from "./storage";
 import { canRedoMcpOperation, canUndoMcpOperation, OPERATION_RESULT_RETENTION_MS, OPERATION_SNAPSHOT_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "../integrations/operation-ledger";
 
 describe("local Draw autosave", () => {
@@ -101,6 +101,16 @@ describe("local Draw autosave", () => {
     expect(copy?.document.elements).toEqual(source.document.elements);
     expect(copy?.document.canvas.viewport).toEqual(source.document.canvas.viewport);
     expect(copy?.document.documentRevision).toBe(0);
+    expect(copyCanvas.workspaceId).not.toBe(originalCanvas.workspaceId);
+    expect(await listCanvases(copyCanvas.workspaceId)).toEqual([copyCanvas]);
+  });
+
+  it("creates a default board atomically with a workspace and rejects a second board in that workspace", async () => {
+    const workspace = await createWorkspace("Single board project");
+    const [board] = await listCanvases(workspace.id);
+    expect(board).toMatchObject({ workspaceId: workspace.id, name: "Untitled drawing" });
+    await expect(createCanvas(workspace.id, "Second board")).rejects.toThrow(/already has a board/i);
+    expect(await listCanvases(workspace.id)).toEqual([board]);
   });
 
   it("deletes an active workspace and its documents, selecting a sibling canvas transactionally", async () => {
@@ -108,7 +118,7 @@ describe("local Draw autosave", () => {
     await saveCurrentDocument(keep);
     const keepWorkspace = (await listWorkspaces())[0];
     const doomedWorkspace = await createWorkspace("Doomed");
-    const doomedCanvas = await createCanvas(doomedWorkspace.id, "Private diagram");
+    const doomedCanvas = (await listCanvases(doomedWorkspace.id))[0];
     const doomedDocument = await loadCanvasDocument(doomedCanvas.id);
     await setActiveCanvas(doomedCanvas.id);
     await deleteWorkspace(doomedWorkspace.id);
@@ -157,7 +167,7 @@ describe("local Draw autosave", () => {
     };
     const applied = await commitMcpWorkspaceOperation(request);
     const humanWorkspace = await createWorkspace("Human workspace");
-    const humanCanvas = await createCanvas(humanWorkspace.id, "Human edit");
+    const humanCanvas = (await listCanvases(humanWorkspace.id))[0];
     await setActiveCanvas(humanCanvas.id);
     const catalogAfterHumanSwitch = await getMcpWorkspaceCatalog();
     await commitMcpWorkspaceOperation({
@@ -268,7 +278,8 @@ describe("local Draw autosave", () => {
       action: { type: "create_canvas", workspaceId: createdWorkspace.activeWorkspaceId, name: "Temporary canvas" },
     });
     const deletedCanvasId = createdCanvas.canvas!.id;
-    await deleteCanvas(deletedCanvasId);
+    await expect(deleteCanvas(deletedCanvasId)).rejects.toThrow(/delete.*workspace/i);
+    await deleteWorkspace(createdCanvas.activeWorkspaceId);
     let receipts = await getWorkspaceReceipts();
     expect(receipts.every((receipt) => !(receipt.canvasIds ?? []).includes(deletedCanvasId))).toBe(true);
     await deleteWorkspace(createdWorkspace.activeWorkspaceId);
@@ -291,7 +302,7 @@ describe("local Draw autosave", () => {
     });
   });
 
-  it("atomically applies MCP canvas rename, duplicate, select, and confirmation-approved delete targets", async () => {
+  it("atomically applies MCP canvas rename/select and workspace-level deletion", async () => {
     await saveCurrentDocument(createEmptyDocument("Original"));
     const catalog = await getMcpWorkspaceCatalog();
     const workspaceId = catalog.activeWorkspaceId;
@@ -309,6 +320,7 @@ describe("local Draw autosave", () => {
       action: { type: "duplicate_canvas", canvasId: originalCanvasId },
     });
     expect(duplicate.canvas?.name).toBe("Source map copy");
+    expect(duplicate.activeWorkspaceId).not.toBe(workspaceId);
     const selected = await commitMcpWorkspaceOperation({
       clientIdentity: "agent-one", idempotencyKey: "select-original", payloadHash: "select-hash",
       expectedCatalogRevision: duplicate.catalogRevision,
@@ -319,7 +331,7 @@ describe("local Draw autosave", () => {
     const deleted = await commitMcpWorkspaceOperation({
       clientIdentity: "agent-one", idempotencyKey: "delete-copy", payloadHash: "delete-hash",
       expectedCatalogRevision: selected.catalogRevision,
-      action: { type: "delete_canvas", canvasId: duplicate.canvas!.id },
+      action: { type: "delete_workspace", workspaceId: duplicate.activeWorkspaceId },
     });
     expect(deleted.activeCanvasId).toBe(originalCanvasId);
     expect(deleted.canvases.map((item) => item.id)).toEqual([originalCanvasId]);
@@ -360,9 +372,57 @@ describe("local Draw autosave", () => {
       action: { type: "import_draw_file_as_canvas", workspaceId, name: "Imported", document: imported },
     });
     expect(result.canvas?.name).toBe("Imported");
+    expect(result.activeWorkspaceId).not.toBe(workspaceId);
     expect(result.activeDocument.document.id).not.toBe(imported.document.id);
     expect(result.activeDocument.document.elements).toEqual(imported.document.elements);
     expect((await loadCanvasDocument(result.canvas!.id))?.document.elements[0]).toMatchObject({ id: "source-node", type: "rectangle" });
+  });
+
+  it("maps MCP create, duplicate and Draw import to separate single-board workspaces", async () => {
+    await saveCurrentDocument(createEmptyDocument("Project A"));
+    const original = await getMcpWorkspaceCatalog();
+    let result = await commitMcpWorkspaceOperation({
+      clientIdentity: "agent", idempotencyKey: "new-board", payloadHash: "new-board-hash",
+      expectedCatalogRevision: original.catalogRevision,
+      action: { type: "create_canvas", workspaceId: original.activeWorkspaceId, name: "Project B board" },
+    });
+    expect(result.activeWorkspaceId).not.toBe(original.activeWorkspaceId);
+    expect(result.workspace?.name).toContain("Project B board");
+    expect(result.canvases.filter((canvas) => canvas.workspaceId === result.activeWorkspaceId)).toHaveLength(1);
+    expect(await loadWorkspaceLibraryState(result.activeWorkspaceId)).toEqual(await loadWorkspaceLibraryState(original.activeWorkspaceId));
+
+    const sourceCanvas = original.activeCanvasId;
+    result = await commitMcpWorkspaceOperation({
+      clientIdentity: "agent", idempotencyKey: "copy-board", payloadHash: "copy-board-hash",
+      expectedCatalogRevision: result.catalogRevision,
+      action: { type: "duplicate_canvas", canvasId: sourceCanvas, name: "Project A copy" },
+    });
+    expect(result.activeWorkspaceId).not.toBe(original.activeWorkspaceId);
+    expect(result.activeCanvasId).not.toBe(sourceCanvas);
+    expect(result.canvases.filter((canvas) => canvas.workspaceId === result.activeWorkspaceId)).toHaveLength(1);
+
+    const imported = createEmptyDocument("Imported board");
+    result = await commitMcpWorkspaceOperation({
+      clientIdentity: "agent", idempotencyKey: "import-board", payloadHash: "import-board-hash",
+      expectedCatalogRevision: result.catalogRevision,
+      action: { type: "import_draw_file_as_canvas", workspaceId: original.activeWorkspaceId, document: imported },
+    });
+    expect(result.activeWorkspaceId).not.toBe(original.activeWorkspaceId);
+    expect(result.canvases.filter((canvas) => canvas.workspaceId === result.activeWorkspaceId)).toHaveLength(1);
+    expect(result.activeDocument.document.title).toBe("Imported board");
+  });
+
+  it("does not allow deleting the only canvas without workspace-level confirmation", async () => {
+    await saveCurrentDocument(createEmptyDocument("Protected board"));
+    const catalog = await getMcpWorkspaceCatalog();
+    await expect(deleteCanvas(catalog.activeCanvasId)).rejects.toThrow(/delete.*workspace/i);
+    await expect(commitMcpWorkspaceOperation({
+      clientIdentity: "agent", idempotencyKey: "unsafe-canvas-delete", payloadHash: "unsafe-canvas-delete-hash",
+      expectedCatalogRevision: catalog.catalogRevision,
+      action: { type: "delete_canvas", canvasId: catalog.activeCanvasId },
+    })).rejects.toThrow(/delete_workspace/i);
+    expect(await loadCanvasDocument(catalog.activeCanvasId)).not.toBeNull();
+    expect(await listWorkspaces()).toHaveLength(1);
   });
 
   it("migrates the existing current document into a default workspace without changing its portable content", async () => {
@@ -424,6 +484,76 @@ describe("local Draw autosave", () => {
     });
     expect(await loadLegacyDocumentRecovery()).toMatchObject({ source: "legacy-current", raw, recovered: true });
     expect(await exportLegacyDocumentRecovery()).toBe(`${JSON.stringify(raw, null, 2)}\n`);
+  });
+
+  it("splits legacy multi-canvas workspaces into one-board workspaces without losing ids, libraries, assets or history", async () => {
+    const seeded = await seedV10MultiCanvasWorkspace();
+
+    const workspaces = await listWorkspaces();
+    const canvases = await Promise.all(workspaces.map((workspace) => listCanvases(workspace.id)));
+    const flatCanvases = canvases.flat();
+    expect(canvases.every((items) => items.length === 1)).toBe(true);
+    expect(new Set(flatCanvases.map((canvas) => canvas.id))).toEqual(new Set(seeded.canvases.map((canvas) => canvas.id)));
+    expect(new Set(flatCanvases.map((canvas) => canvas.documentId))).toEqual(new Set(seeded.canvases.map((canvas) => canvas.documentId)));
+    for (const canvas of flatCanvases) {
+      expect(await loadCanvasDocument(canvas.id)).toEqual(seeded.documents[canvas.documentId]);
+    }
+    const canvasC = flatCanvases.find((canvas) => canvas.id === "canvas-c")!;
+    expect(canvasC.workspaceId).not.toBe("workspace-alpha");
+    expect(workspaces.find((workspace) => workspace.id === canvasC.workspaceId)?.name).toContain("Team notes");
+    expect(await loadCurrentDocument()).toEqual(seeded.documents["doc-c"]);
+    expect(await getMcpWorkspaceCatalog()).toMatchObject({ activeWorkspaceId: canvasC.workspaceId, activeCanvasId: "canvas-c", catalogRevision: 18 });
+
+    for (const workspaceId of ["workspace-alpha", canvasC.workspaceId]) {
+      const library = await loadWorkspaceLibraryState(workspaceId);
+      expect(library.items).toEqual(seeded.library.items);
+      expect(library.items[0].assets.logo).toEqual({ id: "logo", dataURL: "data:image/png;base64,BOARD_ASSET" });
+    }
+    expect((await loadWorkspaceLibraryState(canvasC.workspaceId)).revision).toBe(4);
+    const database = await openDrawDatabaseForTest();
+    const tx = database.transaction(["mcpWorkspaceOperations", "mcpUndo", "mcpOperations", "mcpRedo"], "readonly");
+    const receipts = await requestValue(tx.objectStore("mcpWorkspaceOperations").getAll());
+    const history = await requestValue(tx.objectStore("mcpUndo").get("doc-c"));
+    const redo = await requestValue(tx.objectStore("mcpRedo").get("doc-c"));
+    const operations = await requestValue(tx.objectStore("mcpOperations").getAll());
+    await transactionDone(tx);
+    database.close();
+    expect(receipts).toEqual([]);
+    expect(history).toMatchObject({ documentId: "doc-c" });
+    expect(redo).toMatchObject({ documentId: "doc-c", preservedRedo: true });
+    expect(operations).toMatchObject([expect.objectContaining({ documentId: "doc-c", operationId: "legacy-op-c" })]);
+    await expect(commitMcpWorkspaceOperation({
+      clientIdentity: "agent", idempotencyKey: "old", payloadHash: "old",
+      expectedCatalogRevision: 8, action: { type: "create_workspace", name: "Stale replay" },
+    })).rejects.toThrow(/CONFLICT.*catalog revision/i);
+    expect((await getMcpWorkspaceCatalog()).canvases).toHaveLength(4);
+  });
+
+  it("rolls back the one-board migration when a library needed for copying is malformed", async () => {
+    const malformedLibrary = { items: [{ retained: "legacy opaque data" }], revision: -1, receipts: { old: { result: { assets: "must not be copied" } } } };
+    const seeded = await seedV10MultiCanvasWorkspace(malformedLibrary);
+    await expect(listWorkspaces()).rejects.toThrow();
+
+    // The versionchange transaction must roll every queued write back, keeping
+    // the original v10 database intact and eligible for a repaired retry.
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("draw-local", 10);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const tx = database.transaction(["workspaces", "canvases", "documents", "workspaceLibrary", "mcpWorkspaceOperations"], "readonly");
+    const workspaces = await requestValue(tx.objectStore("workspaces").getAll());
+    const canvases = await requestValue(tx.objectStore("canvases").getAll());
+    const document = await requestValue(tx.objectStore("documents").get(["draw-document", "doc-c"]));
+    const library = await requestValue(tx.objectStore("workspaceLibrary").get("workspace-alpha"));
+    const receipts = await requestValue(tx.objectStore("mcpWorkspaceOperations").getAll());
+    await transactionDone(tx);
+    database.close();
+    expect(workspaces).toHaveLength(2);
+    expect(canvases).toEqual(seeded.canvases);
+    expect(document).toEqual(seeded.documents["doc-c"]);
+    expect(library).toEqual(malformedLibrary);
+    expect(receipts).toHaveLength(1);
   });
 
   it("upgrades a healthy schema 9 workspace without changing document revisions or creating recovery data", async () => {
@@ -506,8 +636,7 @@ describe("local Draw autosave", () => {
   it("isolates per-canvas autosaves and will not let a delayed inactive-canvas save switch or overwrite the active canvas", async () => {
     const first = createEmptyDocument("First canvas");
     await saveCurrentDocument(first);
-    const workspace = (await listWorkspaces())[0];
-    const secondCanvas = await createCanvas(workspace.id, "Second canvas");
+    const { canvas: secondCanvas } = await createWorkspaceWithCanvas("Second project", "Second canvas");
     const second = await loadCanvasDocument(secondCanvas.id);
     expect(second).not.toBeNull();
     expect(second!.document.id).not.toBe(first.document.id);
@@ -525,15 +654,14 @@ describe("local Draw autosave", () => {
     expect(await saveCurrentDocument(staleFirst)).toEqual({ saved: false });
     expect((await loadCurrentDocument())?.document.id).toBe(second!.document.id);
     expect(await loadCanvasDocument(secondCanvas.id)).toEqual(editedSecond);
-    const firstCanvas = (await listCanvases(workspace.id)).find((canvas) => canvas.documentId === first.document.id)!;
+    const firstCanvas = (await listCanvases((await listWorkspaces()).find((item) => item.name === "My workspace")!.id))[0];
     expect(await loadCanvasDocument(firstCanvas.id)).toEqual(first);
   });
 
   it("keeps the V1 current-document alias aligned when the active canvas changes", async () => {
     const first = createEmptyDocument("First");
     await saveCurrentDocument(first);
-    const workspace = (await listWorkspaces())[0];
-    const secondCanvas = await createCanvas(workspace.id, "Second");
+    const { canvas: secondCanvas } = await createWorkspaceWithCanvas("Second project", "Second");
     const second = await loadCanvasDocument(secondCanvas.id);
     await setActiveCanvas(secondCanvas.id);
     expect(await readLegacyCurrentDocument()).toEqual(second);
@@ -712,23 +840,22 @@ describe("local Draw autosave", () => {
     const imported = createEmptyDocument("Portable drawing");
     imported.document.elements.push({ id: "imported-shape", type: "diamond", x: 20, y: 30, width: 40, height: 50 });
     imported.document.assets.asset1 = { id: "asset1", dataURL: "data:image/png;base64,AA==" };
-    const workspace = await createWorkspace("Research project");
-    const canvas = await createCanvas(workspace.id, imported.document.title, imported);
+    const { workspace, canvas, document } = await createWorkspaceWithCanvas("Research project", imported.document.title, imported);
     const stored = await loadCanvasDocument(canvas.id);
 
     expect(stored).toMatchObject({ format: "draw", formatVersion: 1 });
     expect(stored!.document.id).not.toBe(imported.document.id);
+    expect(stored).toEqual(document);
     expect(stored!.document.documentRevision).toBe(0);
     expect(stored!.document.elements).toEqual(imported.document.elements);
     expect(stored!.document.assets).toEqual(imported.document.assets);
-    expect((await listCanvases(workspace.id))).toContainEqual(expect.objectContaining({ id: canvas.id, documentId: stored!.document.id }));
+    expect(await listCanvases(workspace.id)).toEqual([canvas]);
   });
 
-  it("rolls back imported document and canvas together when canvas creation fails", async () => {
-    const workspace = await createWorkspace("Atomic workspace");
+  it("rolls back workspace, imported document and canvas together when creation fails", async () => {
     const imported = createEmptyDocument("Should not persist");
-    await expect(createCanvas(workspace.id, imported.document.title, imported, { afterDocumentWrite: () => { throw new Error("injected failure"); } })).rejects.toThrow("injected failure");
-    expect(await listCanvases(workspace.id)).toEqual([]);
+    await expect(createWorkspaceWithCanvas("Atomic workspace", imported.document.title, imported, { afterDocumentWrite: () => { throw new Error("injected failure"); } })).rejects.toThrow("injected failure");
+    expect(await listWorkspaces()).toEqual([]);
     const database = await openDrawDatabaseForTest();
     const tx = database.transaction("documents", "readonly");
     const keys = await requestValue(tx.objectStore("documents").getAllKeys());
@@ -737,23 +864,23 @@ describe("local Draw autosave", () => {
     expect(keys).not.toContain(imported.document.id);
   });
 
-  it("deletes a canvas and its document without changing another workspace's active document", async () => {
+  it("requires deleting a workspace to remove its only canvas and document", async () => {
     const first = createEmptyDocument("Kept canvas");
     await saveCurrentDocument(first);
     const defaultWorkspace = (await listWorkspaces())[0];
-    const otherWorkspace = await createWorkspace("Other project");
-    const otherCanvas = await createCanvas(otherWorkspace.id, "Other canvas");
+    const { workspace: otherWorkspace, canvas: otherCanvas } = await createWorkspaceWithCanvas("Other project", "Other canvas");
     await setActiveCanvas(otherCanvas.id);
     const deletedDocument = await loadCanvasDocument(otherCanvas.id);
 
-    await deleteCanvas(otherCanvas.id);
+    await expect(deleteCanvas(otherCanvas.id)).rejects.toThrow(/delete.*workspace/i);
+    await deleteWorkspace(otherWorkspace.id);
     expect(await saveCurrentDocument(deletedDocument!)).toEqual({ saved: false });
 
     expect(await loadCanvasDocument(otherCanvas.id)).toBeNull();
     expect(await loadCurrentDocument()).toEqual(first);
     expect(await listCanvases(defaultWorkspace.id)).toHaveLength(1);
     expect(await listCanvases(otherWorkspace.id)).toHaveLength(0);
-    expect(await listWorkspaces()).toHaveLength(2);
+    expect(await listWorkspaces()).toHaveLength(1);
   });
 
   it("deletes the only canvas without retaining or resurrecting its legacy alias", async () => {
@@ -761,7 +888,7 @@ describe("local Draw autosave", () => {
     secret.document.elements.push({ id: "secret", type: "text", text: "private" });
     await saveCurrentDocument(secret);
     const canvas = (await listCanvases((await listWorkspaces())[0].id))[0];
-    await deleteCanvas(canvas.id);
+    await deleteWorkspace(canvas.workspaceId);
     expect(await loadCurrentDocument()).toBeNull();
     await expect(saveCurrentDocument(secret)).rejects.toThrow(/no active canvas/i);
     const db = await openDrawDatabaseForTest();
@@ -783,7 +910,7 @@ describe("local Draw autosave", () => {
     await saveCurrentDocument(initial);
     const workspace = (await listWorkspaces())[0];
     const canvasA = (await listCanvases(workspace.id))[0];
-    const canvasB = await createCanvas(workspace.id, "Sibling");
+    const { canvas: canvasB } = await createWorkspaceWithCanvas("Sibling project", "Sibling");
     const siblingDocument = (await loadCanvasDocument(canvasB.id))!;
     const incoming = structuredClone(siblingDocument);
     incoming.document.title = "Replacement content";
@@ -881,8 +1008,7 @@ describe("local Draw autosave", () => {
   it("repairs a missing active pointer to a valid sibling canvas and reports missing document rows", async () => {
     const first = createEmptyDocument("First");
     await saveCurrentDocument(first);
-    const workspace = (await listWorkspaces())[0];
-    const secondCanvas = await createCanvas(workspace.id, "Second");
+    const { workspace, canvas: secondCanvas } = await createWorkspaceWithCanvas("Second project", "Second");
     const secondDocument = (await loadCanvasDocument(secondCanvas.id))!;
     await setActiveCanvas(secondCanvas.id);
     await writeStore("workspaceMeta", (store) => store.delete("active"));
@@ -902,15 +1028,15 @@ describe("local Draw autosave", () => {
     await expect(saveCurrentDocument(secondDocument)).rejects.toThrow(/damaged|missing/i);
   });
 
-  it("selects a sibling canvas atomically when deleting the active canvas", async () => {
+  it("selects a sibling workspace atomically when deleting the active workspace", async () => {
     const first = createEmptyDocument("First");
     await saveCurrentDocument(first);
     const workspace = (await listWorkspaces())[0];
-    const sibling = await createCanvas(workspace.id, "Sibling");
+    const { canvas: sibling } = await createWorkspaceWithCanvas("Sibling workspace", "Sibling");
     const siblingDoc = await loadCanvasDocument(sibling.id);
-    const firstCanvas = (await listCanvases(workspace.id)).find((canvas) => canvas.documentId === first.document.id)!;
+    const firstCanvas = (await listCanvases(workspace.id))[0];
     await setActiveCanvas(firstCanvas.id);
-    await deleteCanvas(firstCanvas.id);
+    await deleteWorkspace(workspace.id);
     expect(await loadCurrentDocument()).toEqual(siblingDoc);
     expect((await saveCurrentDocument(siblingDoc!)).saved).toBe(true);
   });
@@ -1344,14 +1470,86 @@ async function seedV9LegacyRecovery(raw: unknown): Promise<void> {
       canvases.createIndex("byWorkspaceId", "workspaceId", { unique: false });
       canvases.createIndex("byDocumentId", "documentId", { unique: true });
       const workspaceMeta = db.createObjectStore("workspaceMeta");
-      db.createObjectStore("workspaceLibrary");
+      const libraryStore = db.createObjectStore("workspaceLibrary");
       documents.put(raw, "current");
       workspaceMeta.put(raw, "legacy-recovery");
     };
     request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onerror = () => reject(new Error(`Seed v10 failed: ${request.error?.name}: ${request.error?.message}; tx=${request.transaction?.error?.name}: ${request.transaction?.error?.message}`));
   });
   database.close();
+}
+
+async function seedV10MultiCanvasWorkspace(libraryOverride?: unknown): Promise<{
+  canvases: Array<{ id: string; workspaceId: string; name: string; documentId: string; createdAt: number; updatedAt: number }>;
+  documents: Record<string, ReturnType<typeof createEmptyDocument>>;
+  library: { items: Array<{ id: string; created: number; name: string; elements: ReturnType<typeof createEmptyDocument>["document"]["elements"]; assets: Record<string, { id: string; dataURL: string }> }>; revision: number; receipts: Record<string, unknown> };
+}> {
+  const workspaces = [
+    { id: "workspace-alpha", name: "Alpha project", createdAt: 1, updatedAt: 4 },
+    { id: "workspace-beta", name: "Beta project", createdAt: 2, updatedAt: 2 },
+  ];
+  const documents = Object.fromEntries(["a", "b", "c", "d"].map((suffix, index) => {
+    const document = createEmptyDocument(`Diagram ${suffix.toUpperCase()}`);
+    document.document.id = `doc-${suffix}`;
+    document.document.elements.push({ id: `node-${suffix}`, type: "rectangle", x: index * 10, y: index * 20, width: 60, height: 40 });
+    if (suffix === "c") {
+      document.document.elements.push({ id: "photo-c", type: "image", fileId: "asset-c", x: 5, y: 6, width: 30, height: 20 });
+      document.document.assets["asset-c"] = { id: "asset-c", dataURL: "data:image/png;base64,IMAGE_BYTES_C" };
+    }
+    document.document.documentRevision = index + 2;
+    return [`doc-${suffix}`, document];
+  })) as Record<string, ReturnType<typeof createEmptyDocument>>;
+  const canvases = [
+    { id: "canvas-a", workspaceId: "workspace-alpha", name: "Overview", documentId: "doc-a", createdAt: 1, updatedAt: 1 },
+    { id: "canvas-b", workspaceId: "workspace-alpha", name: "Architecture", documentId: "doc-b", createdAt: 2, updatedAt: 2 },
+    { id: "canvas-c", workspaceId: "workspace-alpha", name: "Team notes", documentId: "doc-c", createdAt: 3, updatedAt: 3 },
+    { id: "canvas-d", workspaceId: "workspace-beta", name: "Roadmap", documentId: "doc-d", createdAt: 4, updatedAt: 4 },
+  ];
+  const library = {
+    items: [{ id: "library-logo", created: 1, name: "Logo", elements: [], assets: { logo: { id: "logo", dataURL: "data:image/png;base64,BOARD_ASSET" } } }],
+    revision: 4,
+    receipts: { stale: { item: { id: "library-logo", assets: { logo: "PRIVATE" } } } },
+  };
+  const database = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open("draw-local", 10);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      const docs = db.createObjectStore("documents");
+      const operations = db.createObjectStore("mcpOperations");
+      const workspaceOperations = db.createObjectStore("mcpWorkspaceOperations");
+      const undo = db.createObjectStore("mcpUndo");
+      undo.createIndex("byCompletedAt", "completedAt", { unique: false });
+      const redo = db.createObjectStore("mcpRedo");
+      redo.createIndex("byCompletedAt", "operation.completedAt", { unique: false });
+      db.createObjectStore("mcpMeta");
+      const workspaceStore = db.createObjectStore("workspaces");
+      const canvasStore = db.createObjectStore("canvases");
+      canvasStore.createIndex("byWorkspaceId", "workspaceId", { unique: false });
+      canvasStore.createIndex("byDocumentId", "documentId", { unique: true });
+      const meta = db.createObjectStore("workspaceMeta");
+      const libraryStore = db.createObjectStore("workspaceLibrary");
+      for (const workspace of workspaces) workspaceStore.put(workspace, workspace.id);
+      for (const canvas of canvases) canvasStore.put(canvas, canvas.id);
+      for (const [id, document] of Object.entries(documents)) {
+        docs.put(document, ["draw-document", id]);
+        docs.put({ sessionId: "legacy-session", sequence: 1 }, ["draw-write-order", id]);
+      }
+      docs.put(documents["doc-c"], "current");
+      meta.put({ workspaceId: "workspace-alpha", canvasId: "canvas-c" }, "active");
+      meta.put(17, "workspace-catalog-revision");
+      meta.put(true, "has-canvas-history");
+      operations.put({ documentId: "doc-c", operationId: "legacy-op-c", actor: "agent", idempotencyKey: "redo-me", beforeDocument: documents["doc-c"], afterDocument: documents["doc-c"], completedAt: 100 }, "op-c");
+      workspaceOperations.put({ clientIdentity: "agent", idempotencyKey: "old", payloadHash: "old", completedAt: 100, operation: { type: "create_canvas", workspaceId: "workspace-alpha", canvasId: "canvas-b", committedCatalogRevision: 8 }, workspaceIds: ["workspace-alpha"], canvasIds: ["canvas-b"] }, JSON.stringify(["agent", "old"]));
+      undo.put({ documentId: "doc-c", preservedHistory: true }, "doc-c");
+      redo.put({ documentId: "doc-c", preservedRedo: true }, "doc-c");
+  libraryStore.put(libraryOverride ?? library, "workspace-alpha");
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(new Error(`Seed v10 failed: ${request.error?.name}: ${request.error?.message}; tx=${request.transaction?.error?.name}: ${request.transaction?.error?.message}`));
+  });
+  database.close();
+  return { canvases, documents, library };
 }
 
 async function seedV9WorkspaceDocument(
