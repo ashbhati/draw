@@ -18,3 +18,7 @@ If creation fails, Draw reports the error and keeps the current edits visible. A
 ## Storage limits
 
 Browser storage is not cross-device sync. Clearing site data, deleting a browser profile, or using another origin/profile can remove or hide your workspaces. Keep portable `.draw` backups for work you need to retain independently of this browser.
+
+## Older multi-document recovery limitation
+
+A pre-existing migration from the draft schema-5 database keeps only one primary recovery record for export. If several documents in that old database are malformed, the recovery download exposes only the last one encountered. Earlier raw document rows are still stored under their old document-ID keys, but Draw does not yet provide a UI to enumerate/export them. Keep the browser data intact if you need recovery of multiple damaged draft documents. This follow-up is tracked in [issue #60](https://github.com/ashbhati/draw/issues/60).
