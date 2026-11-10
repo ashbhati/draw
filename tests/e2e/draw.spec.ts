@@ -3255,6 +3255,19 @@ test("quarantined autosave can be exported while new edits resume autosaving in 
   expect(path).toBeTruthy();
   expect(JSON.parse(await readFile(path!, "utf8"))).toEqual(raw);
   await page.getByLabel("Drawing title").fill("New edits kept safely");
+  await page.locator('.excalidraw label[title^="Rectangle"]').click();
+  const board = await page.locator(".excalidraw canvas").last().boundingBox();
+  if (!board) throw new Error("Recovery board is unavailable");
+  await page.mouse.move(board.x + board.width * 0.55, board.y + 120);
+  await page.mouse.down();
+  await page.mouse.move(board.x + board.width * 0.55 + 140, board.y + 220, { steps: 3 });
+  await page.mouse.up();
+  const draftWait = page.waitForEvent("download");
+  await page.getByRole("button", { name: /Save/ }).click();
+  const draft = await draftWait;
+  const draftPath = await draft.path();
+  const draftDocument = JSON.parse(await readFile(draftPath!, "utf8"));
+  expect(draftDocument.document.elements).toHaveLength(1);
   await recovery.getByRole("button", { name: "Enable autosave in new workspace" }).click();
   await expect(recovery).toBeHidden();
   await expect(page.getByLabel("Drawing title")).toHaveValue("New edits kept safely");
@@ -3262,4 +3275,6 @@ test("quarantined autosave can be exported while new edits resume autosaving in 
   await expect(page.locator(".save-indicator")).toHaveText("Saved on this device");
   await page.reload();
   await expect(page.getByLabel("Drawing title")).toHaveValue("Autosave restored");
+  const normalized = (elements: any[]) => elements.map((element) => ({ ...element, boundElements: element.boundElements ?? [] }));
+  expect(normalized((await readLocalDocument(page)).document.elements)).toEqual(normalized(draftDocument.document.elements));
 });
