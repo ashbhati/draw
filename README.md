@@ -145,3 +145,7 @@ The drawing engine is the `@excalidraw/excalidraw` package. Draw uses its editor
 The editor's bundled font files are served locally so diagrams render offline, including CJK glyphs. Their family-specific attributions and license texts are in [public/fonts/LICENSES.md](./public/fonts/LICENSES.md). The CJK font subsets are retained for multilingual documents and account for most of the font bundle's size. The Blackboard background's generation source and applicable terms are recorded in [docs/ASSET_ATTRIBUTION.md](./docs/ASSET_ATTRIBUTION.md).
 
 See [PLAN.md](./PLAN.md) for the V1 scope, acceptance checks, and deferred capabilities.
+
+See [docs/HERDR_CODE_REVIEW_WORKFLOW.md](./docs/HERDR_CODE_REVIEW_WORKFLOW.md) for the repeatable Codex implementation and Claude Code review workflow in Herdr, including setup and handoff prompts.
+
+See [docs/HERDR_CODE_REVIEW_WORKFLOW.md](./docs/HERDR_CODE_REVIEW_WORKFLOW.md) for the repeatable Codex implementation and Claude Code review workflow in Herdr, including setup and handoff prompts.
