@@ -720,6 +720,9 @@ function parseWorkspaceAction(value: unknown): WorkspaceActionCommand {
   const input = requireRecord(value, "workspace_action input");
   const action = input.action;
   if (typeof action !== "string" || !WORKSPACE_ACTIONS.has(action)) throw new McpValidationError("workspace_action.action must name a supported workspace or canvas action.");
+  if (action === "delete_canvas") {
+    throw new McpValidationError("Each workspace has one board. Use list_workspaces to find its workspaceId, then delete_workspace for explicit approval to delete the workspace and its library.");
+  }
   const mutation = action !== "list_workspaces" && action !== "list_canvases";
   const allowed = new Set(["action"]);
   const fieldsByAction: Record<string, string[]> = {

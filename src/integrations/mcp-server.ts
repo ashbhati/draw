@@ -422,13 +422,13 @@ function createServer() {
   registerWorkspaceTool(server, "create_workspace", "create_workspace", "Create and select a project workspace with its first editable canvas. Supply expectedCatalogRevision and an idempotencyKey.");
   registerWorkspaceTool(server, "rename_workspace", "rename_workspace", "Rename a workspace by stable ID. Supply expectedCatalogRevision and an idempotencyKey.");
   registerWorkspaceTool(server, "select_workspace", "select_workspace", "Select a workspace and its first canvas by stable ID. Supply expectedCatalogRevision and an idempotencyKey.");
-  registerWorkspaceTool(server, "create_canvas", "create_canvas", "Create and select an empty editable canvas in a workspace by stable ID. Supply expectedCatalogRevision and an idempotencyKey.");
+  registerWorkspaceTool(server, "create_canvas", "create_canvas", "Legacy compatibility: create and select a new workspace with one empty board; workspaceId identifies the source context. Supply expectedCatalogRevision and an idempotencyKey.");
   registerWorkspaceTool(server, "rename_canvas", "rename_canvas", "Rename an editable canvas by stable ID. Supply expectedCatalogRevision and an idempotencyKey.");
-  registerWorkspaceTool(server, "duplicate_canvas", "duplicate_canvas", "Duplicate an editable canvas, including scene and embedded assets, under a new stable ID. Supply expectedCatalogRevision and an idempotencyKey.");
+  registerWorkspaceTool(server, "duplicate_canvas", "duplicate_canvas", "Duplicate a board, including scene and embedded assets, into a new workspace with fresh stable IDs. Supply expectedCatalogRevision and an idempotencyKey.");
   registerWorkspaceTool(server, "select_canvas", "select_canvas", "Select a canvas in a workspace by stable IDs. Supply expectedCatalogRevision and an idempotencyKey.");
-  registerWorkspaceTool(server, "delete_canvas", "delete_canvas", "Delete a canvas only after explicit approval in Draw. First call returns NEEDS_CONFIRMATION; approve it and retry with the same idempotencyKey and confirmationToken.");
-  registerWorkspaceTool(server, "delete_workspace", "delete_workspace", "Delete a workspace and its canvases only after explicit approval in Draw. First call returns NEEDS_CONFIRMATION; approve it and retry with the same idempotencyKey and confirmationToken.");
-  registerWorkspaceTool(server, "import_draw_file_as_canvas", "import_draw_file_as_canvas", "Import a .draw file from DRAW_MCP_DOCUMENT_DIR into a new editable canvas; the source and existing canvases are preserved. Supply expectedCatalogRevision and an idempotencyKey.");
+  registerWorkspaceTool(server, "delete_canvas", "delete_canvas", "Deprecated: returns guidance without requesting approval. Use list_workspaces then delete_workspace to delete a workspace and its board.");
+  registerWorkspaceTool(server, "delete_workspace", "delete_workspace", "Delete a workspace, its board, and its saved library only after explicit approval in Draw. First call returns NEEDS_CONFIRMATION; approve it and retry with the same idempotencyKey and confirmationToken.");
+  registerWorkspaceTool(server, "import_draw_file_as_canvas", "import_draw_file_as_canvas", "Import a .draw file from DRAW_MCP_DOCUMENT_DIR into a new workspace with one editable board; the source and existing workspaces are preserved. Supply expectedCatalogRevision and an idempotencyKey.");
 
   server.registerTool("open_document", {
     description: "Open a native editable .draw file from DRAW_MCP_DOCUMENT_DIR. The MCP path is only a plain filename; this tool cannot read outside that configured directory. Replacing a non-empty canvas returns NEEDS_CONFIRMATION and a one-use token; approve it in the Draw app, then retry with that token.",
