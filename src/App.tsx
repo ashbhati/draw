@@ -13,7 +13,7 @@ import {
 import { isSafeHttpsUrl } from "./document/attribution";
 import { composeBackgroundSvg, hasSelectedExportElements, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorForBackgroundPreset } from "./export/background-recolor";
-import { createFreshWorkspaceFromRecovery, exportLegacyDocumentRecovery, loadLegacyDocumentRecovery, addWorkspaceLibraryItem, saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createWorkspaceWithCanvas, createCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, listCanvases, listWorkspaces, loadCanvasDocument, loadWorkspaceLibrary, loadWorkspaceLibraryState, renameWorkspace, renameWorkspaceLibraryItem, saveWorkspaceLibrary, setActiveCanvas, type DrawCanvas, type DrawLibraryItem, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
+import { listWorkspaceLibraryRecoveries, exportWorkspaceLibraryRecovery, createFreshWorkspaceFromRecovery, exportLegacyDocumentRecovery, loadLegacyDocumentRecovery, addWorkspaceLibraryItem, saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createWorkspaceWithCanvas, createCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, listCanvases, listWorkspaces, loadCanvasDocument, loadWorkspaceLibrary, loadWorkspaceLibraryState, renameWorkspace, renameWorkspaceLibraryItem, saveWorkspaceLibrary, setActiveCanvas, type DrawCanvas, type DrawLibraryItem, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
 import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, reloadLibraryAfterConflict, resolveLibraryWorkspaceFromCatalog, shouldPersistLibraryChange } from "./ui/draw-library";
 import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
@@ -151,6 +151,8 @@ export default function App() {
   const [recoveryAvailable, setRecoveryAvailable] = useState(false);
   const [recoveryDataAvailable, setRecoveryDataAvailable] = useState(false);
   const [recoveryBusy, setRecoveryBusy] = useState(false);
+  const [libraryRecoveries, setLibraryRecoveries] = useState<Array<{ workspaceId: string; reason: string }>>([]);
+  const [libraryRecoveryOpen, setLibraryRecoveryOpen] = useState(false);
   const [confirmation, setConfirmation] = useState<BridgeConfirmation | null>(null);
   const [editorConnected, setEditorConnected] = useState(false);
   const [connectOpen, setConnectOpen] = useState(false);
@@ -549,6 +551,13 @@ export default function App() {
             const recovery = await loadLegacyDocumentRecovery();
             if (live) setRecoveryDataAvailable(Boolean(recovery));
           } catch { /* a recovery backup error must not block a valid workspace */ }
+          try {
+            const recoveries = await listWorkspaceLibraryRecoveries();
+            if (live) {
+              setLibraryRecoveries(recoveries.map(({ workspaceId, reason }) => ({ workspaceId, reason })));
+              setLibraryRecoveryOpen(recoveries.length > 0);
+            }
+          } catch { /* backup metadata must not block a valid drawing */ }
           setStatus(lock.acquired ? "ready" : "error");
         } catch (error) {
           if (!live) return;
@@ -2066,6 +2075,7 @@ export default function App() {
         <button className="button button-quiet" disabled={!canWrite} onClick={() => void openMcpManagement()} title="Pair or revoke local MCP clients">MCP clients</button>
         <button className="button button-quiet file-action" aria-label="Open" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open a .draw file as a new workspace" : "Close the other Draw tab to open files here"}><span aria-hidden="true">↥</span></button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
+        {libraryRecoveries.length > 0 && <button className="button button-quiet" aria-label="Library recovery backups" title="View preserved library backups" onClick={() => setLibraryRecoveryOpen(true)}><span aria-hidden="true">↧</span></button>}
         {recoveryDataAvailable && !recoveryAvailable && <button className="button button-quiet" aria-label="Download recovery data" title="Download preserved recovery data" onClick={() => void (async () => {
           try {
             const raw = await exportLegacyDocumentRecovery();
@@ -2220,6 +2230,18 @@ export default function App() {
         </div>
       </section>
     </div>}
+    {libraryRecoveryOpen && libraryRecoveries.length > 0 && <section className="draw-recovery" role="region" aria-label="Library recovery">
+      <p>Some saved library data could not be read. Your drawings and autosave are available; the original library data is preserved below.</p>
+      {libraryRecoveries.map((recovery) => <div key={recovery.workspaceId}>
+        <button className="button" onClick={() => void (async () => {
+          try {
+            const raw = await exportWorkspaceLibraryRecovery(recovery.workspaceId);
+            if (raw !== null) download(new Blob([raw], { type: "application/json" }), "draw-library-recovery.json");
+          } catch (error) { setMessage(`Could not download library backup: ${error instanceof Error ? error.message : String(error)}`); }
+        })()}>Download library backup: {workspaces.find((workspace) => workspace.id === recovery.workspaceId)?.name ?? recovery.workspaceId}</button>
+      </div>)}
+      <button className="button button-quiet" onClick={() => setLibraryRecoveryOpen(false)}>Dismiss library notice</button>
+    </section>}
     {recoveryAvailable && <section className="draw-recovery" role="region" aria-label="Workspace recovery">
       <p>Your previous saved drawing is preserved for recovery. Autosave is paused for this board.</p>
       <button className="button" disabled={recoveryBusy} onClick={() => void (async () => {

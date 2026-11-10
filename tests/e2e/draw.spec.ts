@@ -3260,3 +3260,53 @@ test("quarantined autosave can be exported while new edits resume autosaving in 
   const normalized = (elements: any[]) => elements.map((element) => ({ ...element, boundElements: element.boundElements ?? [] }));
   expect(normalized((await readLocalDocument(page)).document.elements)).toEqual(normalized(draftDocument.document.elements));
 });
+
+test("a malformed saved library is downloadable while its drawing and autosave remain usable", async ({ page }) => {
+  const document = await readLocalDocument(page);
+  document.document.title = "Preserved drawing";
+  document.document.elements.push({ id: "library-recovery-shape", type: "rectangle", x: 100, y: 100, width: 100, height: 80 });
+  const rawLibrary = { items: [{ opaque: "preserve this library payload" }], revision: -1 };
+  await page.evaluate(async ({ document, rawLibrary }) => {
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.deleteDatabase("draw-local");
+      request.onsuccess = () => resolve(); request.onerror = () => reject(request.error);
+      request.onblocked = () => reject(new Error("Fixture database is still open"));
+    });
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("draw-local", 10);
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        database.createObjectStore("documents"); database.createObjectStore("workspaces");
+        const canvases = database.createObjectStore("canvases");
+        canvases.createIndex("byWorkspaceId", "workspaceId");
+        canvases.createIndex("byDocumentId", "documentId", { unique: true });
+        database.createObjectStore("workspaceMeta"); database.createObjectStore("workspaceLibrary");
+      };
+      request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+    });
+    const tx = db.transaction(["documents", "workspaces", "canvases", "workspaceMeta", "workspaceLibrary"], "readwrite");
+    tx.objectStore("documents").put(document, ["draw-document", document.document.id]);
+    tx.objectStore("documents").put(document, "current");
+    tx.objectStore("workspaces").put({ id: "damaged-library-workspace", name: "Preserved project", createdAt: 1, updatedAt: 1 }, "damaged-library-workspace");
+    tx.objectStore("canvases").put({ id: "preserved-board", workspaceId: "damaged-library-workspace", documentId: document.document.id, name: document.document.title, createdAt: 1, updatedAt: 1 }, "preserved-board");
+    tx.objectStore("workspaceMeta").put({ workspaceId: "damaged-library-workspace", canvasId: "preserved-board" }, "active");
+    tx.objectStore("workspaceMeta").put(true, "has-canvas-history");
+    tx.objectStore("workspaceLibrary").put(rawLibrary, "damaged-library-workspace");
+    await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); });
+    db.close();
+  }, { document, rawLibrary });
+  await page.reload();
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Preserved drawing");
+  const notice = page.getByRole("region", { name: "Library recovery", exact: true });
+  await expect(notice).toBeVisible();
+  const backupWait = page.waitForEvent("download");
+  await notice.getByRole("button", { name: /Download library backup/ }).click();
+  const backup = await backupWait;
+  expect(JSON.parse(await readFile((await backup.path())!, "utf8")).raw).toEqual(rawLibrary);
+  await notice.getByRole("button", { name: "Dismiss library notice" }).click();
+  await page.getByLabel("Drawing title").fill("Still autosaving");
+  await expect(page.locator(".save-indicator")).toHaveText("Saved on this device");
+  await page.reload();
+  await expect(page.getByLabel("Drawing title")).toHaveValue("Still autosaving");
+  expect((await readLocalDocument(page)).document.elements).toMatchObject([{ id: "library-recovery-shape", type: "rectangle" }]);
+});
