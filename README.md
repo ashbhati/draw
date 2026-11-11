@@ -28,7 +28,7 @@ npm install
 npm run dev
 ```
 
-Open <http://127.0.0.1:5173>. Draw organizes work into **Workspaces**, one per project, with one infinite editable board in each workspace. The selected workspace name stays visible beside the saved-workspaces list icon. Use the icon buttons to create, rename, or delete a workspace; their accessible names and tooltips explain each action. Deleting a workspace asks for confirmation and removes its board, reusable library, and local history. The Blackboard and Whiteboard choices change the active board's appearance.
+Open <http://127.0.0.1:5173>. Draw organizes work into **Workspaces**, one per project, with one infinite editable board in each workspace. Use the workspace dropdown to see and select the active project. Use the icon buttons to create, rename, or delete a workspace; their accessible names and tooltips explain each action. Deleting a workspace asks for confirmation and removes its board, reusable library, and local history. The Blackboard and Whiteboard choices change the active board's appearance.
 
 Use **Save** to download the active editable document. **Open** imports that file into a new workspace, leaving the current project intact. PNG and JPEG exports are flattened images for sharing and cannot be edited as Draw objects.
 

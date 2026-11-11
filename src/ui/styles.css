@@ -42,4 +42,12 @@
 
 .file-action{width:35px;min-width:35px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-size:17px;line-height:1}.file-action span{display:block;transform:translateY(-1px)}.file-action:focus-visible{outline:2px solid #b08a36;outline-offset:2px}
 
-.project-toolbar .icon-button{width:32px;min-width:32px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-size:18px;line-height:1}.project-toolbar .icon-button svg{width:15px;height:15px}.workspace-selector{position:relative;display:flex;align-items:center;gap:8px;min-width:0}.project-toolbar .workspace-list-button{font-size:16px}.workspace-current-name{max-width:180px;overflow:hidden;text-overflow:ellipsis;color:#454843;font-size:11px;font-weight:600}.workspace-menu{position:absolute;top:calc(100% + 7px);left:0;z-index:20;min-width:210px;max-width:min(320px,80vw);max-height:60vh;overflow:auto;padding:5px;border:1px solid #dedbd2;border-radius:8px;background:#fff;box-shadow:0 8px 24px #211e1726}.workspace-menu-item{width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 10px;border:0;border-radius:5px;background:transparent;color:#383b35;text-align:left;font-size:12px;cursor:pointer}.workspace-menu-item:hover,.workspace-menu-item:focus-visible{background:#f5f4ef;outline:0}.workspace-menu-item[aria-checked=true]{font-weight:700;background:#f4f1e8}
+
+
+.workspace-controls{display:flex;align-items:center;gap:4px;padding:4px;border:1px solid #e2e2e8;border-radius:10px;background:#fff;box-shadow:0 1px 3px #0000000d}
+.project-toolbar .workspace-combobox{height:32px;min-width:150px;max-width:min(240px,42vw);border:0;border-radius:6px;background-color:#f1f0ff;color:#34334a;font-family:inherit;font-size:13px;font-weight:500;padding:0 28px 0 10px;cursor:pointer}
+.workspace-action{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;padding:0;border:0;border-radius:6px;background:transparent;color:#494850;cursor:pointer}
+.workspace-action svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.workspace-action:hover{background:#f1f0ff;color:#5753c9}.workspace-action-danger:hover{background:#fff0ee;color:#b3322a}
+.workspace-action:focus-visible,.project-toolbar .workspace-combobox:focus-visible{outline:2px solid #6965db;outline-offset:1px}.workspace-action:disabled,.workspace-combobox:disabled{opacity:.45;cursor:default}
+@media(max-width:420px){.project-toolbar .workspace-combobox{min-width:120px;max-width:150px}.workspace-controls{gap:2px}}
