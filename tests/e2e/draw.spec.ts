@@ -3242,20 +3242,41 @@ test("a malformed saved library is downloadable while its drawing and autosave r
 });
 
 test("MCP clients dialog closes from its sticky heading and with Escape", async ({ page }) => {
+  await page.setViewportSize({ width: 900, height: 500 });
   await page.goto("/");
   await connectEditorToMcp(page);
-  await page.getByRole("button", { name: "MCP clients" }).click();
+  const trigger = page.getByRole("button", { name: "MCP clients", exact: true });
+  await trigger.click();
 
   const dialog = page.getByRole("dialog", { name: "MCP clients" });
   await expect(dialog).toBeVisible();
+  const secret = dialog.locator(".mcp-pairing-secret");
+  await expect(secret).toBeVisible();
   const closeButton = dialog.getByRole("button", { name: "Close MCP clients" });
   await expect(closeButton).toBeVisible();
+  await expect(closeButton).toBeFocused();
+  await trigger.evaluate((button) => button.focus());
+  await page.keyboard.press("Tab");
+  await expect(closeButton).toBeFocused();
+  await page.mouse.click(850, 10);
+  await expect(dialog).toBeVisible();
+  await expect(secret).toBeVisible();
+  const closeBox = await closeButton.boundingBox();
+  expect(closeBox).not.toBeNull();
+  expect(closeBox!.y).toBeGreaterThanOrEqual(0);
+  expect(closeBox!.y + closeBox!.height).toBeLessThanOrEqual(500);
+  await page.keyboard.press("Shift+Tab");
+  await expect(dialog.getByRole("button", { name: "Close", exact: true })).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(closeButton).toBeFocused();
   await closeButton.click();
   await expect(dialog).toBeHidden();
+  await expect(trigger).toBeFocused();
   await expect(page.locator(".mcp-pairing-secret")).toHaveCount(0);
 
-  await page.getByRole("button", { name: "MCP clients" }).click();
+  await trigger.click();
   await expect(dialog).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(dialog).toBeHidden();
+  await expect(trigger).toBeFocused();
 });

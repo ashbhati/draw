@@ -83,7 +83,7 @@ When running from source, start `npm run dev` yourself in a trusted terminal. Ty
 }
 ```
 
-Replace `/absolute/path/to/draw` with the root of the exact Draw checkout serving the page; the MCP client inherits its own working directory, so plain `npm run mcp` can accidentally start a different, older Draw copy. Before entering a pairing secret, confirm that the MCP host advertises `pair_mcp_client` in addition to the normal Draw tools. If that tool is missing, correct `--prefix` and reconnect the MCP server. The development bridge uses loopback HTTP and requires the Draw tab to remain open. Its localhost pairing surface is intended only for trusted local development, not as the production MCP transport.
+Replace `/absolute/path/to/draw` with the root of the exact Draw checkout and revision serving the page; the MCP client inherits its own working directory, so plain `npm run mcp` can accidentally start a different, older Draw copy. Before entering a pairing secret, inspect the client's tool list (`tools/list` in MCP) and confirm it includes `pair_mcp_client`, `get_current_canvas`, `create_elements`, `list_workspaces`, `save_document`, and `export_image`. If any expected V2 tools are missing, correct `--prefix` and reconnect before pairing. The development bridge uses loopback HTTP and requires the Draw tab to remain open. Its localhost pairing surface is intended only for trusted local development, not as the production MCP transport.
 
 The bridge requires the paired capability on document reads, confirmations, and commands, and separately requires the active editor-tab secret for editor sync and acknowledgements. In the Vite development bridge, unpaired loopback traffic can invalidate a pending pairing secret or trigger a temporary pairing lockout. Use only trusted local MCP hosts while running the development server. The packaged runtime restricts MCP routes to its private Unix socket; same-OS-user processes remain trusted.
 
@@ -100,22 +100,24 @@ The e2e suite runs the app locally in Chromium and selects an available loopback
 
 ## Configure a development MCP client
 
-From a source checkout, configure your MCP client to launch `npm run mcp` from this project directory. For clients using JSON MCP configuration, the server entry is:
+From a source checkout, use an explicit absolute repository path so the MCP host and Vite development UI come from the same checkout and revision. Do not rely on the MCP client's current working directory. For clients using JSON MCP configuration, the server entry is:
 
 ```json
 {
   "mcpServers": {
     "draw": {
       "command": "npm",
-      "args": ["run", "mcp"],
-      "cwd": "/absolute/path/to/draw",
+      "args": ["--prefix", "/absolute/path/to/draw", "run", "mcp"],
       "env": {
+        "DRAW_MCP_BASE_URL": "http://127.0.0.1:5173",
         "DRAW_MCP_DOCUMENT_DIR": "/absolute/path/to/a/dedicated/draw-documents-folder"
       }
     }
   }
 }
 ```
+
+`DRAW_MCP_DOCUMENT_DIR` must be an absolute path to an existing folder. It is used only by MCP file tools (`open_document`, `save_document`, `export_image`, and `.draw` import); those tools are confined to that folder. Before pairing, verify the advertised tools as described in [Development MCP setup](#development-mcp-setup). Automated browser coverage pairs a source-run MCP host and reads the active canvas through the Vite bridge.
 
 Available tools:
 
