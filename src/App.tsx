@@ -246,6 +246,17 @@ export default function App() {
     setDoc(next);
   }, []);
 
+  const waitForReadyEditor = useCallback(async () => {
+    const deadline = Date.now() + 5_000;
+    while (writerOwned.current && editorSecret.current) {
+      const api = apiRef.current;
+      if (api && !api.getAppState().isLoading) return;
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve) => window.setTimeout(resolve, 10));
+    }
+    throw new Error("EDITOR_NOT_READY: The workspace is still loading. Retry after the editor is ready.");
+  }, []);
+
   const fromCurrentScene = (
     scene: Parameters<typeof fromExcalidrawScene>[0],
     metadata: Parameters<typeof fromExcalidrawScene>[1] = {},
@@ -1118,6 +1129,15 @@ export default function App() {
       while (completedMcpCommandIds.current.size > 256) completedMcpCommandIds.current.delete(completedMcpCommandIds.current.values().next().value!);
       return;
     }
+    if (!editorSecret.current || event.clientId !== clientId.current) return;
+    try { await waitForReadyEditor(); }
+    catch (error) {
+      await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
+        method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
+        body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, error: error instanceof Error ? error.message : String(error) }),
+      }).catch(() => undefined);
+      return;
+    }
     const api = apiRef.current;
     let current = docRef.current;
     if (!api || !current || !editorSecret.current || event.clientId !== clientId.current) return;
@@ -1698,23 +1718,15 @@ export default function App() {
       completedMcpCommandIds.current.add(event.id);
       while (completedMcpCommandIds.current.size > 256) completedMcpCommandIds.current.delete(completedMcpCommandIds.current.values().next().value!);
     }
-  }, [autosave, autosaveBlocked, bridgeAutosave, handleMcpWorkspaceCommand, setDocument]);
+  }, [autosave, autosaveBlocked, bridgeAutosave, handleMcpWorkspaceCommand, setDocument, waitForReadyEditor]);
 
   const handleBridgeFlush = useCallback(async (event: BridgeFlush) => {
-    const api = apiRef.current;
-    const current = docRef.current;
-    if (!current || !editorSecret.current || event.clientId !== clientId.current || !writerOwned.current) return;
+    if (!editorSecret.current || event.clientId !== clientId.current || !writerOwned.current) return;
     try {
-      if (!api || api.getAppState().isLoading) {
-        // During a workspace transition, the persisted incoming snapshot is
-        // authoritative until its editor is available. There are no live edits
-        // on that new editor to flush yet.
-        await fetch(`/__draw/api/document/flush/${encodeURIComponent(event.id)}`, {
-          method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
-          body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, document: current }),
-        });
-        return;
-      }
+      await waitForReadyEditor();
+      const api = apiRef.current;
+      const current = docRef.current;
+      if (!api || !current || api.getAppState().isLoading) throw new Error("EDITOR_NOT_READY: The workspace changed while loading. Retry the read.");
       const state = api.getAppState() as any;
       const elements = api.getSceneElementsIncludingDeleted() as any[];
       const files = api.getFiles();
@@ -1762,7 +1774,7 @@ export default function App() {
         body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, error: error instanceof Error ? error.message : String(error) }),
       }).catch(() => undefined);
     }
-  }, [autosave, autosaveBlocked, bridgeAutosave, setDocument, syncBridgeDocument]);
+  }, [autosave, autosaveBlocked, bridgeAutosave, setDocument, syncBridgeDocument, waitForReadyEditor]);
 
   const handleBridgeConfirmation = useCallback((event: BridgeConfirmation) => {
     if (event.clientId !== clientId.current || !writerOwned.current || !editorSecret.current) return;
