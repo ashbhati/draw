@@ -1758,6 +1758,64 @@ test("web image import reports blocked sources and Escape restores toolbar focus
   await page.keyboard.press("Escape");
 });
 
+for (const switchWorkspace of [false, true]) {
+  test(`pending web import cannot insert after ${switchWorkspace ? "an agent switches workspace" : "the owner cancels"}`, async ({ page, baseURL }) => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const png = Buffer.from(await page.evaluate(() => {
+      const canvas = document.createElement("canvas"); canvas.width = 8; canvas.height = 8;
+      canvas.getContext("2d")!.fillRect(0, 0, 8, 8);
+      return canvas.toDataURL("image/png").split(",")[1];
+    }), "base64");
+    let requested!: () => void;
+    const started = new Promise<void>((resolve) => { requested = resolve; });
+    await page.route("https://images.example/slow.png", async (route) => {
+      requested(); await gate;
+      await route.fulfill({ contentType: "image/png", body: png }).catch(() => undefined);
+    });
+    const original = await currentWorkspaceId(page);
+    await page.locator("label").filter({ has: page.getByRole("radio", { name: "Insert image", exact: true }) }).click();
+    const dialog = page.getByRole("dialog", { name: "Insert image" });
+    await dialog.getByRole("button", { name: "From the web" }).click();
+    await dialog.getByLabel("Image URL").fill("https://images.example/slow.png");
+    await dialog.getByRole("button", { name: "Add image", exact: true }).click();
+    await started;
+    try {
+      if (switchWorkspace) {
+        const directory = await mkdtemp(join(tmpdir(), "draw-web-switch-"));
+        const mcp = await startStdioMcp(baseURL!, directory);
+        try {
+          const catalogResponse = await mcp.call("list_workspaces", {});
+          const catalog = JSON.parse(catalogResponse.result.content[0].text);
+          const response = await mcp.call("create_workspace", { expectedCatalogRevision: catalog.catalogRevision, idempotencyKey: "switch-during-web-import", name: "Other project" });
+          expect(response.result?.isError, response.result?.content?.[0]?.text).not.toBe(true);
+        } finally { await mcp.close(); await rm(directory, { recursive: true, force: true }); }
+      } else {
+        await page.keyboard.press("Escape");
+      }
+    } finally { release(); }
+    if (switchWorkspace) {
+      await expect(dialog.getByRole("alert")).toContainText("workspace changed");
+      await page.keyboard.press("Escape");
+      expect(await currentWorkspaceId(page)).not.toBe(original);
+    }
+    await expect(dialog).not.toBeVisible();
+    const current = await freshBridgeDocument(page);
+    expect(current.document.elements.filter((element: any) => element.type === "image")).toHaveLength(0);
+    expect(Object.keys(current.document.assets)).toHaveLength(0);
+    if (switchWorkspace) await selectWorkspace(page, original);
+    const originalDocument = await freshBridgeDocument(page);
+    expect(originalDocument.document.elements.filter((element: any) => element.type === "image")).toHaveLength(0);
+    expect(Object.keys(originalDocument.document.assets)).toHaveLength(0);
+    await page.locator("label").filter({ has: page.getByRole("radio", { name: "Insert image", exact: true }) }).click();
+    await dialog.getByRole("button", { name: "From the web" }).click();
+    await expect(dialog.getByRole("button", { name: "Add image", exact: true })).toBeEnabled();
+    await expect(dialog.getByRole("alert")).toHaveCount(0);
+    await page.keyboard.press("Tab");
+    expect(await page.evaluate(() => Boolean(document.activeElement?.closest("dialog")))).toBe(true);
+  });
+}
+
 test("paired MCP Openverse image claims remain unverified after save and reload", async ({ page }) => {
   const current = await freshBridgeDocument(page);
   const id = "123e4567-e89b-12d3-a456-426614174000";
