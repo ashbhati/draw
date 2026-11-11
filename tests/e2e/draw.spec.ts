@@ -3289,10 +3289,18 @@ test("MCP clients dialog keeps keyboard focus, scroll state, and canvas selectio
     await expect.poll(async () => Object.keys((await freshBridgeDocument(page)).document.appState.selectedElementIds ?? {})).toEqual([created.nodes["focus-check"]]);
 
     const trigger = page.getByRole("button", { name: "MCP clients", exact: true });
-    await trigger.click();
+    let clientsRequests = 0;
+    let pairingSecretRequests = 0;
+    page.on("request", (request) => {
+      if (request.url().endsWith("/__draw/api/mcp/clients")) clientsRequests += 1;
+      if (request.url().endsWith("/__draw/api/mcp/pairing-secret")) pairingSecretRequests += 1;
+    });
+    await trigger.evaluate((button) => { button.click(); button.click(); });
 
     const dialog = page.getByRole("dialog", { name: "MCP clients" });
     await expect(dialog).toBeVisible();
+    expect(clientsRequests).toBe(1);
+    expect(pairingSecretRequests).toBe(1);
     const secret = dialog.locator(".mcp-pairing-secret");
     await expect(secret).toBeVisible();
     const closeButton = dialog.getByRole("button", { name: "Close MCP clients" });
@@ -3323,6 +3331,11 @@ test("MCP clients dialog keeps keyboard focus, scroll state, and canvas selectio
         clientHeight: element.clientHeight,
         dialogBackground: getComputedStyle(element).backgroundColor,
         headingBackground: getComputedStyle(heading).backgroundColor,
+        headingBackgroundAlpha: (() => {
+          const color = getComputedStyle(heading).backgroundColor;
+          const rgba = color.match(/^rgba\([^,]+,[^,]+,[^,]+,\s*([\d.]+)\)$/);
+          return rgba ? Number(rgba[1]) : 1;
+        })(),
       };
     });
     expect(scrollState.scrollTop).toBeGreaterThan(0);
@@ -3331,6 +3344,7 @@ test("MCP clients dialog keeps keyboard focus, scroll state, and canvas selectio
     expect(scrollState.headingTop - scrollState.dialogTop).toBeLessThanOrEqual(2);
     expect(scrollState.dialogBackground).not.toBe("rgba(0, 0, 0, 0)");
     expect(scrollState.headingBackground).toBe(scrollState.dialogBackground);
+    expect(scrollState.headingBackgroundAlpha).toBe(1);
     const closeBox = await closeButton.boundingBox();
     expect(closeBox).not.toBeNull();
     expect(closeBox!.y).toBeGreaterThanOrEqual(0);

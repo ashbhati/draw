@@ -154,6 +154,7 @@ export default function App() {
   const [launchCodeInput, setLaunchCodeInput] = useState("");
   const [connectError, setConnectError] = useState("");
   const [mcpManagementOpen, setMcpManagementOpen] = useState(false);
+  const [mcpManagementOpening, setMcpManagementOpening] = useState(false);
   const [mcpPairingSecret, setMcpPairingSecret] = useState("");
   const [mcpClients, setMcpClients] = useState<McpPairedClient[]>([]);
   const [mcpPairingRequest, setMcpPairingRequest] = useState<McpPairingRequest | null>(null);
@@ -163,6 +164,7 @@ export default function App() {
   const mcpClientsDialog = useRef<HTMLElement>(null);
   const mcpPairingDialog = useRef<HTMLElement>(null);
   const mcpPairingDeny = useRef<HTMLButtonElement>(null);
+  const mcpManagementOpeningRef = useRef(false);
   const mcpManagementWasOpen = useRef(false);
   const mcpPairingWasOpen = useRef(false);
   const closeMcpManagement = useCallback(() => {
@@ -745,12 +747,15 @@ export default function App() {
   }, [bridgeSync, canWrite, launchCodeInput]);
 
   const openMcpManagement = useCallback(async () => {
+    if (mcpManagementOpeningRef.current || mcpManagementOpen) return;
     setMcpPairingError("");
     if (!editorSecret.current || !canWrite) {
       setMcpPairingError("Connect this Draw tab to the local bridge before pairing MCP clients.");
       setMcpManagementOpen(true);
       return;
     }
+    mcpManagementOpeningRef.current = true;
+    setMcpManagementOpening(true);
     try {
       const headers = { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current };
       const clientsResponse = await fetch("/__draw/api/mcp/clients", { headers: { "x-draw-editor-secret": editorSecret.current }, cache: "no-store" });
@@ -767,8 +772,11 @@ export default function App() {
     } catch (error) {
       setMcpPairingError(error instanceof Error ? error.message : "Could not prepare MCP pairing.");
       setMcpManagementOpen(true);
+    } finally {
+      mcpManagementOpeningRef.current = false;
+      setMcpManagementOpening(false);
     }
-  }, [canWrite]);
+  }, [canWrite, mcpManagementOpen]);
 
   const respondToMcpPairing = useCallback(async (approved: boolean) => {
     const pending = mcpPairingRequest;
@@ -2008,7 +2016,7 @@ export default function App() {
       <div className="toolbar-actions">
         <span className={`save-indicator ${status}`}><i />{statusText}</span>
         <button className="button button-quiet" disabled={!canWrite} onClick={() => { setConnectError(""); setConnectOpen(true); }} title="Pair this editor with the local MCP bridge">{editorConnected ? "MCP connected" : "Connect MCP"}</button>
-        <button ref={mcpClientsTrigger} className="button button-quiet" disabled={!canWrite} onClick={() => void openMcpManagement()} title="Pair or revoke local MCP clients">MCP clients</button>
+        <button ref={mcpClientsTrigger} className="button button-quiet" disabled={!canWrite || mcpManagementOpening} aria-busy={mcpManagementOpening} onClick={() => void openMcpManagement()} title="Pair or revoke local MCP clients">MCP clients</button>
         <button className="button button-quiet file-action" aria-label="Open" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open a .draw file as a new workspace" : "Close the other Draw tab to open files here"}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v2M3 7v13h17l2-10H7L3 20" /></svg></button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
         {libraryRecoveries.length > 0 && <button className="button button-quiet" aria-label="Library recovery backups" title="View preserved library backups" onClick={() => setLibraryRecoveryOpen(true)}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><path d="M12 8v5m0 3h.01M12 3 2 21h20L12 3Z" /></svg></button>}
