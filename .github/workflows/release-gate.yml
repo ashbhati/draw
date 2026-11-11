@@ -11,7 +11,9 @@ on:
 
 jobs:
   release-gate:
-    runs-on: ubuntu-latest
+    # Keep Playwright's Linux dependencies on a stable runner image. ubuntu-latest
+    # advanced to 26.04, where apt mirror DNS prevented browser setup in CI.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
