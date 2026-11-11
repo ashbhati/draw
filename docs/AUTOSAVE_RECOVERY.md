@@ -10,7 +10,7 @@ Draw preserves stored content it cannot safely read instead of replacing it with
 
 Draw upgrades valid older documents, including documents that predate revision counters. If the preserved data is genuinely malformed, the Workspace recovery panel provides:
 
-- **Download recovery data**: downloads the original stored payload as JSON for diagnosis or repair. This can contain your drawing and images; keep it private.
+- **Download recovery backup (JSON)**: downloads the original stored payload as JSON for diagnosis or repair. This can contain your drawing and images; keep it private.
 - **Enable autosave in new workspace**: saves the currently visible edits into a new workspace and reloads it. The original recovery data remains stored and can still be downloaded using the recovery-download icon in the toolbar.
 
 If creation fails, Draw reports the error and keeps the current edits visible. A portable `.draw` download remains the way to preserve those edits while storage is unavailable.

@@ -1,6 +1,6 @@
 import { CaptureUpdateAction, Excalidraw, FONT_FAMILY, MainMenu, convertToExcalidrawElements, exportToSvg } from "@excalidraw/excalidraw";
 import type { ExcalidrawImperativeAPI, ExcalidrawInitialDataState, LibraryItems } from "@excalidraw/excalidraw/types";
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createEmptyDocument,
   fromExcalidrawScene,
@@ -28,7 +28,9 @@ import { hasSceneContentChanged, sceneElementsChanged } from "./integrations/sce
 import { rebaseOpenedDocument, shouldRequireOpenConfirmation } from "./document/open-safety";
 import { canRestoreCancelledMcpCommand } from "./integrations/mcp-cancellation";
 import { canRedoMcpOperation, canUndoMcpOperation, hashMcpOperation, resolveOperationReplay, type DurableMcpOperation } from "./integrations/operation-ledger";
-import { fetchOpenverseImage, imageAttributionFromOpenverseResult, searchOpenverseImages, validateEmbeddedImage, type OpenverseAttribution, type OpenverseImageResult } from "./integrations/openverse";
+import { validateEmbeddedImage, type OpenverseAttribution } from "./integrations/openverse";
+
+import { fetchWebImage, googleImagesSearchUrl } from "./integrations/web-image";
 
 type Status = "loading" | "ready" | "saving" | "saved" | "error";
 type BridgeCommand = { id: string; clientId: string; clientIdentity: string; operation: string; input: any; document?: DrawDocument };
@@ -139,7 +141,6 @@ export default function App() {
   const [activeWorkspaceId, setActiveWorkspaceId] = useState("");
   const [activeCanvasId, setActiveCanvasId] = useState("");
   const [libraryItems, setLibraryItems] = useState<DrawLibraryItem[]>([]);
-  const [libraryManagerOpen, setLibraryManagerOpen] = useState(false);
   const [status, setStatus] = useState<Status>("loading");
   const [message, setMessage] = useState("");
   const [recoveryAvailable, setRecoveryAvailable] = useState(false);
@@ -165,14 +166,17 @@ export default function App() {
   const [exportScope, setExportScope] = useState<"canvas" | "selection">("canvas");
   const [imagePickerOpen, setImagePickerOpen] = useState(false);
   const [imageQuery, setImageQuery] = useState("");
-  const [imageLicense, setImageLicense] = useState("");
-  const [imageCategory, setImageCategory] = useState<"illustration" | "photograph" | "digitized_artwork" | "all">("illustration");
-  const [imageResults, setImageResults] = useState<OpenverseImageResult[]>([]);
-  const [imagePage, setImagePage] = useState(1);
+  const [webImageUrl, setWebImageUrl] = useState("");
   const [imageSearchError, setImageSearchError] = useState("");
-  const [imageSearchBusy, setImageSearchBusy] = useState(false);
-  const [imageInsertBusy, setImageInsertBusy] = useState<string | null>(null);
-  const [creditsOpen, setCreditsOpen] = useState(false);
+  const [imageInsertBusy, setImageInsertBusy] = useState(false);
+  const imageRequest = useRef<AbortController | null>(null);
+  const imageDialog = useRef<HTMLDialogElement>(null);
+  const [imageSource, setImageSource] = useState<"choose" | "web">("choose");
+  useEffect(() => {
+    if (imagePickerOpen) imageDialog.current?.showModal();
+    else imageDialog.current?.close();
+  }, [imagePickerOpen]);
+  useEffect(() => () => imageRequest.current?.abort(), []);
   const fetchedOpenverseAttributions = useRef(new Map<string, OpenverseAttribution>());
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
   const docRef = useRef<DrawDocument | null>(null);
@@ -234,9 +238,23 @@ export default function App() {
   }, []);
 
   const setDocument = useCallback((next: DrawDocument) => {
+    // A bridge read can arrive before React mounts the replacement editor.
+    // Never read the departing editor into the incoming document.
+    if (activeDocumentIdRef.current !== next.document.id) apiRef.current = null;
     docRef.current = next;
     activeDocumentIdRef.current = next.document.id;
     setDoc(next);
+  }, []);
+
+  const waitForReadyEditor = useCallback(async () => {
+    const deadline = Date.now() + 5_000;
+    while (writerOwned.current && editorSecret.current) {
+      const api = apiRef.current;
+      if (api && !api.getAppState().isLoading) return;
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve) => window.setTimeout(resolve, 10));
+    }
+    throw new Error("EDITOR_NOT_READY: The workspace is still loading. Retry after the editor is ready.");
   }, []);
 
   const fromCurrentScene = (
@@ -294,7 +312,6 @@ export default function App() {
           libraryRevisionRef.current = 0;
           libraryItemsRef.current = [];
           setLibraryItems([]);
-          setLibraryManagerOpen(false);
           setMessage("This workspace was deleted while its library was being edited. Choose an existing workspace to continue.");
           return;
         }
@@ -329,94 +346,6 @@ export default function App() {
     if (apiRef.current) {
       await apiRef.current.updateLibrary({ libraryItems: items as unknown as LibraryItems, merge: false, prompt: false });
     }
-  };
-
-  const createHumanLibraryContext = async (operation: string, payload: Record<string, unknown>) => {
-    const idempotencyKey = randomId();
-    const input = { ...payload, idempotencyKey };
-    return {
-      clientIdentity: `human-${clientId.current}`,
-      idempotencyKey,
-      payloadHash: await hashMcpOperation(operation, input),
-      expectedRevision: libraryRevisionRef.current,
-    };
-  };
-
-  const addSelectionToLibrary = async () => {
-    if (!doc || !apiRef.current || !activeWorkspaceIdRef.current) return;
-    const selectedElementIds = doc.document.appState.selectedElementIds as Record<string, boolean> | undefined;
-    const elements = collectLibrarySelection(doc.document.elements, selectedElementIds);
-    if (!elements.length) { setMessage("Select one or more objects before adding them to the library."); return; }
-    const item: DrawLibraryItem = {
-      id: randomId(),
-      status: "unpublished",
-      created: Date.now(),
-      name: `Reusable item ${libraryItemsRef.current.length + 1}`,
-      elements,
-      assets: collectReferencedLibraryAssets(elements, doc.document.assets),
-    };
-    try {
-      const workspaceId = activeWorkspaceIdRef.current;
-      if (!writerOwned.current) throw new Error("This Draw tab is read-only because another tab owns the autosave lock.");
-      const context = await createHumanLibraryContext("add_selection_to_workspace_library", { workspaceId, item });
-      const saved = await addWorkspaceLibraryItem(workspaceId, item, context);
-      await replaceWorkspaceLibrary(saved.items, saved.revision);
-      setLibraryManagerOpen(true);
-      setMessage(`Added ${elements.length} editable element${elements.length === 1 ? "" : "s"} to this workspace's library.`);
-    } catch (error) { setMessage(`Could not save the library item: ${error instanceof Error ? error.message : String(error)}`); }
-  };
-
-  const renameLibraryItem = async (item: DrawLibraryItem) => {
-    const name = window.prompt("Library item name", item.name ?? "Reusable item");
-    if (name === null) return;
-    try {
-      const workspaceId = activeWorkspaceIdRef.current;
-      const context = await createHumanLibraryContext("rename_workspace_library_item", { workspaceId, itemId: item.id, name });
-      const saved = await renameWorkspaceLibraryItem(workspaceId, item.id, name, context);
-      await replaceWorkspaceLibrary(saved.items, saved.revision);
-    } catch (error) { setMessage(`Could not rename the library item: ${error instanceof Error ? error.message : String(error)}`); }
-  };
-
-  const removeLibraryItem = async (item: DrawLibraryItem) => {
-    if (!window.confirm(`Remove “${item.name ?? "Untitled library item"}” from this workspace's library?`)) return;
-    try {
-      const workspaceId = activeWorkspaceIdRef.current;
-      const context = await createHumanLibraryContext("delete_workspace_library_item", { workspaceId, itemId: item.id });
-      const saved = await deleteWorkspaceLibraryItem(workspaceId, item.id, context);
-      await replaceWorkspaceLibrary(saved.items, saved.revision);
-    } catch (error) { setMessage(`Could not remove the library item: ${error instanceof Error ? error.message : String(error)}`); }
-  };
-
-  const insertLibraryItem = async (item: DrawLibraryItem) => {
-    const api = apiRef.current;
-    const current = docRef.current;
-    if (!api || !current || !canWrite || autosaveBlocked) return;
-    const files = Object.values(item.assets ?? {});
-    if (files.length) api.addFiles(files as any);
-    const copies = cloneLibraryElements(item.elements, randomId);
-    const elements = [...api.getSceneElementsIncludingDeleted(), ...copies] as any[];
-    const appState = { ...(api.getAppState() as any), selectedElementIds: Object.fromEntries(copies.map((element) => [element.id, true])) };
-    api.updateScene({ elements, appState, captureUpdate: CaptureUpdateAction.IMMEDIATELY });
-    const next = fromCurrentScene({ elements, appState, files: api.getFiles() as any }, {
-      id: current.document.id,
-      title: current.document.title,
-      documentRevision: current.document.documentRevision + 1,
-      viewRevision: current.document.viewRevision,
-      background: current.document.canvas.background,
-      viewport: current.document.canvas.viewport,
-    });
-    setDocument(next);
-    autosave.schedule(next);
-    bridgeAutosave.schedule(next);
-    try {
-      await Promise.all([autosave.flush(), bridgeAutosave.flush()]);
-    } catch (error) {
-      setStatus("error");
-      setMessage(`Inserted locally, but could not sync the change: ${error instanceof Error ? error.message : String(error)}`);
-      return;
-    }
-    setLibraryManagerOpen(false);
-    setMessage(`Inserted ${copies.length} editable element${copies.length === 1 ? "" : "s"} from the workspace library.`);
   };
 
   useEffect(() => {
@@ -601,6 +530,7 @@ export default function App() {
 
   const onChange = useCallback((elements: readonly any[], appState: any, files: any) => {
     if (!writerOwned.current) return;
+    if (appState.openSidebar?.name === "default" && appState.openSidebar?.tab === "library") apiRef.current?.updateScene({ appState: { openSidebar: null }, captureUpdate: CaptureUpdateAction.NEVER });
     const current = docRef.current;
     if (!current) return;
     const sceneFiles = { ...(files as Record<string, DrawDocument["document"]["assets"][string]>) };
@@ -944,28 +874,15 @@ export default function App() {
 
   const saveFile = () => {
     if (!doc) return;
-    download(new Blob([serializeDrawFile(doc)], { type: "application/vnd.draw+json;charset=utf-8" }), filename(doc.document.title, "draw"));
+    download(new Blob([serializeDrawFile(docRef.current ?? doc)], { type: "application/vnd.draw+json;charset=utf-8" }), filename(workspaces.find((workspace) => workspace.id === activeWorkspaceId)?.name ?? doc.document.title, "draw"));
     setMessage("Editable Draw file saved.");
   };
 
-  const searchImages = async (event?: FormEvent, page = 1, append = false) => {
-    event?.preventDefault();
-    setImageSearchBusy(true);
-    setImageSearchError("");
-    try {
-      const results = await searchOpenverseImages(imageQuery, { page, ...(imageCategory !== "all" ? { category: imageCategory } : {}), ...(imageLicense ? { license: imageLicense } : {}) });
-      setImageResults((current) => append ? [...current, ...results] : results);
-      setImagePage(page);
-    } catch (error) {
-      setImageSearchError(error instanceof Error ? error.message : "Could not search Openverse.");
-    } finally { setImageSearchBusy(false); }
-  };
-
-  const addEmbeddedImage = async (image: { dataURL: string; mimeType: "image/png" | "image/jpeg"; width: number; height: number; attribution: OpenverseAttribution }, position?: { x: number; y: number }, requestedSize?: { width?: number; height?: number }) => {
+  const addEmbeddedImage = async (image: { dataURL: string; mimeType: "image/png" | "image/jpeg"; width: number; height: number; attribution?: OpenverseAttribution }, position?: { x: number; y: number }, requestedSize?: { width?: number; height?: number }) => {
     const api = apiRef.current;
     if (!api || !canWrite) throw new Error("The canvas is read-only in this tab.");
     const id = randomId();
-    fetchedOpenverseAttributions.current.set(id, image.attribution);
+    if (image.attribution) fetchedOpenverseAttributions.current.set(id, image.attribution);
     const scale = Math.min(1, 500 / Math.max(image.width, image.height));
     const defaultWidth = Math.max(24, Math.round(image.width * scale));
     const defaultHeight = Math.max(24, Math.round(image.height * scale));
@@ -975,38 +892,49 @@ export default function App() {
     const skeleton = {
       type: "image", id: randomId(), fileId: id,
       x: position?.x ?? 100, y: position?.y ?? 100, width, height,
-      customData: { drawAttribution: image.attribution },
+      ...(image.attribution ? { customData: { drawAttribution: image.attribution } } : {}),
     };
     const [element] = convertToExcalidrawElements([skeleton] as any[], { regenerateIds: false }) as any[];
     if (!element) throw new Error("Could not create the image element.");
     return element;
   };
 
-  const insertOpenverseImage = async (result: OpenverseImageResult) => {
-    setImageInsertBusy(result.id);
-    setImageSearchError("");
-    try {
-      const image = await fetchOpenverseImage(result.id, imageAttributionFromOpenverseResult(result));
-      const element = await addEmbeddedImage(image);
-      const api = apiRef.current;
-      if (!api) throw new Error("The Draw canvas is not ready.");
-      api.updateScene({ elements: [...api.getSceneElements(), element], captureUpdate: CaptureUpdateAction.IMMEDIATELY });
-      setImagePickerOpen(false);
-      setMessage(`Added “${result.title}” with Openverse attribution saved in the drawing.`);
-    } catch (error) {
-      setImageSearchError(error instanceof Error ? error.message : "Could not add this image.");
-    } finally { setImageInsertBusy(null); }
+  const closeImagePicker = () => {
+    imageDialog.current?.close();
+    imageRequest.current?.abort();
+    setImageInsertBusy(false);
+    setImagePickerOpen(false);
+    requestAnimationFrame(() => document.querySelector<HTMLInputElement>('input[name="editor-current-shape"][aria-label="Insert image"]')?.focus());
   };
-
-  const imageCredits = useMemo(() => {
-    const elements = doc?.document.elements ?? [];
-    const assets = doc?.document.assets ?? {};
-    const elementCredits = elements.flatMap((element: any) => {
-      const attribution = element.customData?.drawAttribution;
-      return element.type === "image" && attribution?.provider === "Openverse" ? [{ id: element.id, attribution: attribution as OpenverseAttribution }] : [];
-    });
-    return elementCredits.length ? elementCredits : Object.values(assets).flatMap((asset: any) => asset.attribution?.provider === "Openverse" ? [{ id: asset.id, attribution: asset.attribution as OpenverseAttribution }] : []);
-  }, [doc]);
+  const openImagePicker = () => {
+    if (!writerOwned.current) return;
+    setImageSource("choose"); setImageSearchError(""); setImagePickerOpen(true);
+  };
+  const insertWebImage = async () => {
+    const documentId = activeDocumentIdRef.current;
+    const api = apiRef.current;
+    if (!api || !documentId || !writerOwned.current) return;
+    const controller = new AbortController();
+    imageRequest.current?.abort(); imageRequest.current = controller;
+    setImageInsertBusy(true); setImageSearchError("");
+    try {
+      const image = await fetchWebImage(webImageUrl, { signal: controller.signal });
+      const bitmap = await createImageBitmap(await (await fetch(image.dataURL)).blob());
+      bitmap.close();
+      controller.signal.throwIfAborted();
+      if (activeDocumentIdRef.current !== documentId || apiRef.current !== api || !writerOwned.current) throw new Error("The workspace changed. Open the image tool again to insert into the active workspace.");
+      const state = api.getAppState();
+      const zoom = state.zoom.value;
+      const element = await addEmbeddedImage(image, { x: (state.width / 2) / zoom - state.scrollX, y: (state.height / 2) / zoom - state.scrollY });
+      element.customData = { drawSourceUrl: image.sourceUrl };
+      api.updateScene({ elements: [...api.getSceneElementsIncludingDeleted(), element], appState: { selectedElementIds: { [element.id]: true } }, captureUpdate: CaptureUpdateAction.IMMEDIATELY });
+      closeImagePicker(); setMessage("Image embedded in this workspace. Save a .draw file to keep an editable copy.");
+    } catch (error) {
+      if (!controller.signal.aborted) setImageSearchError(error instanceof Error ? error.message : "Could not insert this image.");
+    } finally {
+      if (imageRequest.current === controller) { imageRequest.current = null; setImageInsertBusy(false); }
+    }
+  };
 
   const exportImage = async (mime: "image/png" | "image/jpeg") => {
     if (!apiRef.current || !doc) return;
@@ -1025,7 +953,7 @@ export default function App() {
       const svg = await exportToSvg({ elements, appState: { ...appState, exportBackground: false }, files, exportPadding: 32 });
       const composed = composeBackgroundSvg(new XMLSerializer().serializeToString(svg), doc.document.canvas.background.preset);
       const blob = await renderExportBlob(composed, mime);
-      download(blob, filename(doc.document.title, mime === "image/png" ? "png" : "jpg"));
+      download(blob, filename(workspaces.find((workspace) => workspace.id === activeWorkspaceId)?.name ?? doc.document.title, mime === "image/png" ? "png" : "jpg"));
       setMessage(`Exported flattened ${mime === "image/png" ? "PNG" : "JPEG"} image.`);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Image export failed."); }
   };
@@ -1199,6 +1127,15 @@ export default function App() {
       revokedMcpCommandIds.current.delete(event.id);
       completedMcpCommandIds.current.add(event.id);
       while (completedMcpCommandIds.current.size > 256) completedMcpCommandIds.current.delete(completedMcpCommandIds.current.values().next().value!);
+      return;
+    }
+    if (!editorSecret.current || event.clientId !== clientId.current) return;
+    try { await waitForReadyEditor(); }
+    catch (error) {
+      await fetch(`/__draw/api/commands/${encodeURIComponent(event.id)}/ack`, {
+        method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
+        body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, error: error instanceof Error ? error.message : String(error) }),
+      }).catch(() => undefined);
       return;
     }
     const api = apiRef.current;
@@ -1781,13 +1718,15 @@ export default function App() {
       completedMcpCommandIds.current.add(event.id);
       while (completedMcpCommandIds.current.size > 256) completedMcpCommandIds.current.delete(completedMcpCommandIds.current.values().next().value!);
     }
-  }, [autosave, autosaveBlocked, bridgeAutosave, handleMcpWorkspaceCommand, setDocument]);
+  }, [autosave, autosaveBlocked, bridgeAutosave, handleMcpWorkspaceCommand, setDocument, waitForReadyEditor]);
 
   const handleBridgeFlush = useCallback(async (event: BridgeFlush) => {
-    const api = apiRef.current;
-    const current = docRef.current;
-    if (!api || !current || !editorSecret.current || event.clientId !== clientId.current || !writerOwned.current) return;
+    if (!editorSecret.current || event.clientId !== clientId.current || !writerOwned.current) return;
     try {
+      await waitForReadyEditor();
+      const api = apiRef.current;
+      const current = docRef.current;
+      if (!api || !current || api.getAppState().isLoading) throw new Error("EDITOR_NOT_READY: The workspace changed while loading. Retry the read.");
       const state = api.getAppState() as any;
       const elements = api.getSceneElementsIncludingDeleted() as any[];
       const files = api.getFiles();
@@ -1835,7 +1774,7 @@ export default function App() {
         body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, error: error instanceof Error ? error.message : String(error) }),
       }).catch(() => undefined);
     }
-  }, [autosave, autosaveBlocked, bridgeAutosave, setDocument, syncBridgeDocument]);
+  }, [autosave, autosaveBlocked, bridgeAutosave, setDocument, syncBridgeDocument, waitForReadyEditor]);
 
   const handleBridgeConfirmation = useCallback((event: BridgeConfirmation) => {
     if (event.clientId !== clientId.current || !writerOwned.current || !editorSecret.current) return;
@@ -1976,7 +1915,7 @@ export default function App() {
     });
   }, [editorDocumentId, initialData]);
   const onCurrentEditorChange = useCallback((elements: readonly any[], appState: any, files: any) => {
-    if (activeDocumentIdRef.current !== editorDocumentId) return;
+    if (activeDocumentIdRef.current !== editorDocumentId || appState.isLoading) return;
     onChange(elements, appState, files);
   }, [editorDocumentId, onChange]);
   const onCurrentLibraryChange = useCallback((items: LibraryItems) => {
@@ -2002,20 +1941,18 @@ export default function App() {
       }} /></span></div>
       <div className="toolbar-actions">
         <span className={`save-indicator ${status}`}><i />{statusText}</span>
-        <button className="button button-quiet" disabled={!canWrite} onClick={() => { setImageSearchError(""); setImagePickerOpen(true); }} title="Search openly licensed illustrations">Images</button>
-        <button className="button button-quiet" disabled={!imageCredits.length} onClick={() => setCreditsOpen(true)} title="Inspect saved image attribution">Image credits</button>
         <button className="button button-quiet" disabled={!canWrite} onClick={() => { setConnectError(""); setConnectOpen(true); }} title="Pair this editor with the local MCP bridge">{editorConnected ? "MCP connected" : "Connect MCP"}</button>
         <button className="button button-quiet" disabled={!canWrite} onClick={() => void openMcpManagement()} title="Pair or revoke local MCP clients">MCP clients</button>
-        <button className="button button-quiet file-action" aria-label="Open" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open a .draw file as a new workspace" : "Close the other Draw tab to open files here"}><span aria-hidden="true">↥</span></button>
+        <button className="button button-quiet file-action" aria-label="Open" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open a .draw file as a new workspace" : "Close the other Draw tab to open files here"}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v2M3 7v13h17l2-10H7L3 20" /></svg></button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
-        {libraryRecoveries.length > 0 && <button className="button button-quiet" aria-label="Library recovery backups" title="View preserved library backups" onClick={() => setLibraryRecoveryOpen(true)}><span aria-hidden="true">↧</span></button>}
-        {recoveryDataAvailable && !recoveryAvailable && <button className="button button-quiet" aria-label="Download recovery data" title="Download preserved recovery data" onClick={() => void (async () => {
+        {libraryRecoveries.length > 0 && <button className="button button-quiet" aria-label="Library recovery backups" title="View preserved library backups" onClick={() => setLibraryRecoveryOpen(true)}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><path d="M12 8v5m0 3h.01M12 3 2 21h20L12 3Z" /></svg></button>}
+        {recoveryDataAvailable && !recoveryAvailable && <button className="button button-quiet" aria-label="Download recovery backup (JSON)" title="Recovery backup: preserved damaged autosave data (JSON), not the current drawing" onClick={() => void (async () => {
           try {
             const raw = await exportLegacyDocumentRecovery();
             if (raw !== null) download(new Blob([raw], { type: "application/json" }), "draw-recovery.json");
           } catch (error) { setMessage(`Could not download recovery data: ${error instanceof Error ? error.message : String(error)}`); }
         })()}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4" /></svg></button>}
-        <button className="button button-primary file-action" aria-label="Save" onClick={saveFile} title="Save the editable .draw file"><span aria-hidden="true">↓</span></button>
+        <button className="button button-quiet file-action" aria-label="Save" onClick={saveFile} title="Save the editable .draw file"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 3h12l4 4v14H3V3h2Zm2 0v6h10V3M7 21v-8h10v8" /></svg></button>
         <div className="export-group"><button className="button button-quiet export-main" disabled={exportScope === "selection" && !selectionAvailable} title={exportScope === "selection" && !selectionAvailable ? "Select one or more objects to export a selection" : undefined} onClick={() => void exportImage("image/png")}>Export</button><select aria-label="Export scope" value={exportScope} onChange={(event) => setExportScope(event.target.value as "canvas" | "selection")}><option value="canvas">Whole drawing</option><option value="selection">Selection only</option></select><select aria-label="Image export format" value="image/png" onChange={(event) => void exportImage(event.target.value as "image/png" | "image/jpeg")}><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option></select></div>
       </div>
     </header>
@@ -2028,80 +1965,44 @@ export default function App() {
         <button className="workspace-action" aria-label="Rename workspace" title="Rename the selected workspace" disabled={!canWrite} onClick={() => void renameActiveWorkspace()}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 5 4 4M4 20l5-1L20 8a2.8 2.8 0 0 0-4-4L5 15l-1 5Z" /></svg></button>
         <button className="workspace-action workspace-action-danger" aria-label="Delete workspace" title="Delete the selected workspace and its drawing" disabled={!canWrite || !workspaces.length} onClick={() => void removeActiveWorkspace()}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v5m4-5v5" /></svg></button>
       </div>
-      <span className="project-divider" />
-      <button className="button" disabled={!canWrite || !selectionAvailable} title={selectionAvailable ? "Save selected objects and their labels to this workspace's library" : "Select objects to add them to the library"} onClick={() => void addSelectionToLibrary()}>Add selection to library</button>
-      <button className="button" disabled={!canWrite || !activeWorkspaceId} onClick={() => setLibraryManagerOpen(true)}>Manage library ({libraryItems.length})</button>
     </nav>
-    {imagePickerOpen && <div className="draw-confirmation-backdrop" role="presentation">
-      <section className="draw-image-picker" role="dialog" aria-modal="true" aria-labelledby="draw-image-picker-title">
-        <div className="draw-dialog-heading"><div><h2 id="draw-image-picker-title">Find an illustration</h2><p>Search Openverse for openly licensed images. Check each item's source and license before reuse.</p></div><button className="button button-quiet" onClick={() => setImagePickerOpen(false)} aria-label="Close image search">×</button></div>
-        <form className="draw-image-search" onSubmit={(event) => void searchImages(event)}>
-          <label htmlFor="draw-image-query">Search images</label>
-          <input id="draw-image-query" value={imageQuery} onChange={(event) => setImageQuery(event.target.value)} maxLength={200} placeholder="e.g. chalk robot illustration" />
-          <label htmlFor="draw-image-license">License filter</label>
-          <select id="draw-image-license" value={imageLicense} onChange={(event) => setImageLicense(event.target.value)}>
-            <option value="">All supported licenses</option><option value="cc0">CC0</option><option value="pdm">Public domain</option><option value="by">CC BY</option><option value="by-sa">CC BY-SA</option><option value="by-nd">CC BY-ND</option><option value="by-nc">CC BY-NC</option><option value="by-nc-sa">CC BY-NC-SA</option><option value="by-nc-nd">CC BY-NC-ND</option>
-          </select>
-          <label htmlFor="draw-image-category">Image type</label>
-          <select id="draw-image-category" value={imageCategory} onChange={(event) => setImageCategory(event.target.value as typeof imageCategory)}>
-            <option value="illustration">Illustrations</option><option value="digitized_artwork">Digitized artwork</option><option value="photograph">Photographs</option><option value="all">All image types</option>
-          </select>
-          <button className="button button-primary" disabled={imageSearchBusy || !imageQuery.trim()} type="submit">{imageSearchBusy ? "Searching…" : "Search"}</button>
+    <dialog ref={imageDialog} className="draw-image-picker draw-image-source" aria-labelledby="draw-image-picker-title" onCancel={(event) => { event.preventDefault(); closeImagePicker(); }}>
+      <div className="draw-dialog-heading"><h2 id="draw-image-picker-title">Insert image</h2><button className="button button-quiet" onClick={closeImagePicker} aria-label="Close image options">×</button></div>
+      <div className="draw-image-source-actions">
+        <button className="button" disabled={!canWrite} onClick={() => { closeImagePicker(); apiRef.current?.setActiveTool({ type: "image" }); }}>From your device</button>
+        <button className="button" aria-pressed={imageSource === "web"} disabled={!canWrite} onClick={() => setImageSource("web")}>From the web</button>
+      </div>
+      {imageSource === "web" && <>
+        <form className="draw-web-search" onSubmit={(event) => { event.preventDefault(); window.open(googleImagesSearchUrl(imageQuery), "_blank", "noopener,noreferrer"); }}>
+          <label htmlFor="draw-image-query">Search Google Images</label>
+          <div><input id="draw-image-query" value={imageQuery} onChange={(event) => setImageQuery(event.target.value)} maxLength={200} placeholder="e.g. chalk robot" /><button className="button" disabled={!imageQuery.trim()} type="submit">Search Google Images ↗</button></div>
         </form>
-        {imageSearchError && <p role="alert" className="draw-image-error">{imageSearchError}</p>}
-        <div className="draw-image-results" aria-live="polite">
-          {imageResults.map((result) => <article className="draw-image-card" key={result.id}>
-            <img src={result.thumbnailUrl} alt="" loading="lazy" referrerPolicy="no-referrer" />
-            <div className="draw-image-card-copy"><strong>{result.title}</strong>
-              <span>{result.creator ?? "Creator not listed"}</span>
-              <span>License: {result.license ? `${result.license.toUpperCase()}${result.licenseVersion ? ` ${result.licenseVersion}` : ""}` : "Not listed; verify before reuse"}</span>
-              <div className="draw-image-links">{result.sourceUrl && <a href={result.sourceUrl} target="_blank" rel="noreferrer">Source</a>}{result.creatorUrl && <a href={result.creatorUrl} target="_blank" rel="noreferrer">Creator</a>}{result.licenseUrl && <a href={result.licenseUrl} target="_blank" rel="noreferrer">License</a>}</div>
-              <button className="button button-quiet" disabled={imageInsertBusy !== null || !result.license} title={!result.license ? "This result has no license metadata and cannot be inserted by default." : "Embed this image and its attribution in the drawing"} onClick={() => void insertOpenverseImage(result)}>{imageInsertBusy === result.id ? "Adding…" : "Add to drawing"}</button>
-            </div>
-          </article>)}
-          {!imageSearchBusy && imageQuery && !imageResults.length && !imageSearchError && <p>No matching images found. Try a broader search.</p>}
-        </div>
-        {imageResults.length >= 12 && imagePage < 20 && <button className="button button-quiet" disabled={imageSearchBusy} onClick={() => void searchImages(undefined, imagePage + 1, true)}>{imageSearchBusy ? "Loading…" : "Load more"}</button>}
-        <p className="draw-image-disclaimer">Search provided by <a href="https://openverse.org/" target="_blank" rel="noreferrer">Openverse</a>; Draw is not endorsed or certified by Openverse. Images are embedded for offline editing. Openverse indexes third-party license claims; verify each item's rights and attribution requirements before reuse. See <a href="https://docs.openverse.org/terms_of_service/" target="_blank" rel="noreferrer">Openverse's terms</a>.</p>
-      </section>
-    </div>}
-    {creditsOpen && <div className="draw-confirmation-backdrop" role="presentation">
-      <section className="draw-confirmation" role="dialog" aria-modal="true" aria-labelledby="draw-image-credits-title">
-        <h2 id="draw-image-credits-title">Image credits</h2>
-        {!imageCredits.length && <p>No Openverse images are in this drawing.</p>}
-        <div className="draw-image-credit-list">{imageCredits.map(({ id, attribution }) => <article key={id}>
-          <strong>{attribution.title}</strong><span>{attribution.creator ?? "Creator not listed"}</span>
-          <span>{attribution.license ? `${attribution.license.toUpperCase()}${attribution.licenseVersion ? ` ${attribution.licenseVersion}` : ""}` : "License not listed"}</span>
-          <small>{attribution.verification === "unverified" ? "File supplied claim (unverified). Verify it with a trusted source." : "Openverse listing metadata; licensing claims are not independently verified."}</small>
-          <div className="draw-image-links">{isSafeHttpsUrl(attribution.sourceUrl) && <a href={attribution.sourceUrl} target="_blank" rel="noreferrer">Source</a>}{isSafeHttpsUrl(attribution.creatorUrl) && <a href={attribution.creatorUrl} target="_blank" rel="noreferrer">Creator</a>}{isSafeHttpsUrl(attribution.licenseUrl) && <a href={attribution.licenseUrl} target="_blank" rel="noreferrer">License</a>}</div>
-        </article>)}</div>
-        {imageCredits.length > 0 && <button className="button button-quiet" onClick={() => {
-          const report = imageCredits.map(({ attribution }) => `${attribution.title}\nAttribution status: ${attribution.verification === "unverified" ? "File supplied claim (unverified)" : "Openverse listing metadata; not independently verified"}\nCreator: ${attribution.creator ?? "Not listed"}${isSafeHttpsUrl(attribution.creatorUrl) ? ` (${attribution.creatorUrl})` : ""}\nSource: ${isSafeHttpsUrl(attribution.sourceUrl) ? attribution.sourceUrl : "Not listed"}\nLicense: ${attribution.license ? `${attribution.license.toUpperCase()} ${attribution.licenseVersion ?? ""}`.trim() : "Not listed"}${isSafeHttpsUrl(attribution.licenseUrl) ? ` (${attribution.licenseUrl})` : ""}\n${attribution.attribution ?? ""}`).join("\n\n");
-          download(new Blob([report], { type: "text/plain;charset=utf-8" }), filename(doc.document.title, "credits.txt"));
-        }}>Download credits report</button>}
-        <p className="draw-confirmation-expiry">Verify each item's license and any requirements for sharing adaptations or commercial use.</p>
-        <div className="draw-confirmation-actions"><button className="button button-quiet" onClick={() => setCreditsOpen(false)}>Close</button></div>
-      </section>
-    </div>}
+        <p>Google Images opens in a new tab. Copy the image address from the source site, then paste it below. Search results do not grant permission to reuse an image.</p>
+        <form className="draw-web-search" onSubmit={(event) => { event.preventDefault(); void insertWebImage(); }}>
+          <label htmlFor="draw-web-image-url">Image URL</label>
+          <div><input id="draw-web-image-url" type="url" value={webImageUrl} onChange={(event) => setWebImageUrl(event.target.value)} placeholder="https://example.com/image.png" required /><button className="button" disabled={!canWrite || imageInsertBusy || !webImageUrl.trim()} type="submit">{imageInsertBusy ? "Adding…" : "Add image"}</button></div>
+        </form>
+        <p>Direct PNG or JPEG, up to 2 MiB. If the source blocks import, download it and choose From your device. Images are embedded for offline editing.</p>
+      </>}
+      {imageSearchError && <p role="alert" className="draw-image-error">{imageSearchError}</p>}
+    </dialog>
     <div className="workspace">
       <section className="canvas-area" aria-label="Drawing canvas">
-    <div className="editor-shell"><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onCurrentEditorChange} onLibraryChange={onCurrentLibraryChange} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS}
+    <div className="editor-shell" onClickCapture={(event) => {
+      const target = event.target as Element;
+      const label = target.closest("label");
+      if (target.matches('input[name="editor-current-shape"][aria-label="Insert image"]') || label?.querySelector('input[name="editor-current-shape"][aria-label="Insert image"]')) {
+        event.preventDefault(); event.stopPropagation(); openImagePicker();
+      }
+    }} onKeyDownCapture={(event) => {
+      const target = event.target as Element;
+      if (target.matches('input[name="editor-current-shape"][aria-label="Insert image"]') && (event.key === " " || event.key === "Enter")) {
+        event.preventDefault(); event.stopPropagation(); openImagePicker();
+      }
+    }}><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onCurrentEditorChange} onLibraryChange={onCurrentLibraryChange} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS}
       renderTopRightUI={renderCanvasToolbar}>{DRAW_MENU}</Excalidraw></div>
       </section>
     </div>
-    {libraryManagerOpen && <div className="draw-confirmation-backdrop" role="presentation">
-      <section className="draw-confirmation draw-library-manager" role="dialog" aria-modal="true" aria-labelledby="draw-library-title">
-        <h2 id="draw-library-title">Workspace library</h2>
-        <p>Saved items stay in <strong>{workspaces.find((item) => item.id === activeWorkspaceId)?.name ?? "this workspace"}</strong>. Insert a copy to add editable shapes and labels to the canvas.</p>
-        {!libraryItems.length ? <p className="draw-library-empty">No saved items yet. Select diagram elements and choose <strong>Add selection to library</strong>.</p> : <div className="draw-library-list">{libraryItems.map((item) => <article className="draw-library-row" key={item.id}>
-          <div><strong>{item.name ?? "Untitled library item"}</strong><small>{item.elements.length} elements{Object.keys(item.assets ?? {}).length ? ` · ${Object.keys(item.assets).length} image assets` : ""}</small></div>
-          <button className="button" onClick={() => insertLibraryItem(item)}>Insert</button>
-          <button className="button" onClick={() => void renameLibraryItem(item)}>Rename</button>
-          <button className="button button-danger-quiet" onClick={() => void removeLibraryItem(item)}>Remove</button>
-        </article>)}</div>}
-        <div className="draw-confirmation-actions"><button className="button button-quiet" onClick={() => setLibraryManagerOpen(false)}>Close</button></div>
-      </section>
-    </div>}
     {confirmation && <div className="draw-confirmation-backdrop" role="presentation">
       <section className="draw-confirmation" role="dialog" aria-modal="true" aria-labelledby="draw-confirmation-title" aria-describedby="draw-confirmation-copy">
         <h2 id="draw-confirmation-title">{confirmation.action === "open_document" ? "Open a Draw document?" : confirmation.action === "delete_canvas" ? "Delete this canvas?" : confirmation.action === "delete_workspace" ? "Delete this workspace?" : "Delete a library item?"}</h2>
@@ -2180,7 +2081,7 @@ export default function App() {
           const raw = await exportLegacyDocumentRecovery();
           if (raw !== null) download(new Blob([raw], { type: "application/json" }), "draw-recovery.json");
         } catch (error) { setMessage(`Could not download recovery data: ${error instanceof Error ? error.message : String(error)}`); }
-      })()}>Download recovery data</button>
+      })()}>Download recovery backup (JSON)</button>
       <button className="button button-primary" disabled={recoveryBusy || !canWrite} onClick={() => void (async () => {
         setRecoveryBusy(true);
         try {

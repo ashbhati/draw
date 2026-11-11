@@ -13,7 +13,7 @@ npm install --global @ashbhati/draw
 draw start
 ```
 
-`draw start` serves the production app on `http://127.0.0.1:4173` and opens the local browser when started from an interactive terminal. Use `draw start --no-open` to open the URL yourself, or `draw start --port 4300` to choose a different port. Keep the terminal process running while you use Draw. Draw autosaves the active workspace in the current browser on this device. Autosave is the local working copy; use **Save** (the download icon) to create a portable editable `.draw` file. Use **Open** (the open-file icon) to import a `.draw` file as a separate workspace, and **Export** to create a flattened PNG or JPEG for sharing.
+`draw start` serves the production app on `http://127.0.0.1:4173` and opens the local browser when started from an interactive terminal. Use `draw start --no-open` to open the URL yourself, or `draw start --port 4300` to choose a different port. Keep the terminal process running while you use Draw. Draw autosaves the active workspace in the current browser on this device. Autosave is the local working copy; use **Save** (the floppy-disk icon) to create a portable editable `.draw` file. Use **Open** (the open-file icon) to import a `.draw` file as a separate workspace, and **Export** to create a flattened PNG or JPEG for sharing.
 
 The `.draw` file preserves editable elements, canvas settings, and embedded images. PNG and JPEG files do not preserve editable data. Save `.draw` files in a folder you back up; browser autosave is separate, stays in that browser profile and device, and is not a substitute for saving a portable file. If Draw cannot load its autosave, use its recovery panel to export the quarantined working copy or start a fresh workspace. See [Autosave recovery](docs/AUTOSAVE_RECOVERY.md).
 
@@ -30,9 +30,11 @@ npm run dev
 
 Open <http://127.0.0.1:5173>. Draw organizes work into **Workspaces**, one per project, with one infinite editable board in each workspace. Use the workspace dropdown to see and select the active project. Use the icon buttons to create, rename, or delete a workspace; their accessible names and tooltips explain each action. Deleting a workspace asks for confirmation and removes its board, reusable library, and local history. The Blackboard and Whiteboard choices change the active board's appearance.
 
-Use **Save** to download the active editable document. **Open** imports that file into a new workspace, leaving the current project intact. PNG and JPEG exports are flattened images for sharing and cannot be edited as Draw objects.
+Use **Save** to download the active editable document using the workspace name (for example, `Project 1` downloads as `Project-1.draw`). PNG/JPEG exports use the workspace name too. **Open** imports that file into a new workspace, leaving the current project intact. PNG and JPEG exports are flattened images for sharing and cannot be edited as Draw objects.
 
-The reusable library is scoped to the current workspace. Select diagram elements and choose **Add selection to library** to save them with their bound labels and referenced image assets. Choose **Manage library** to insert a fresh editable copy, rename an item, or remove it. Library contents persist in this browser on this device and do not sync between devices.
+Use the editor's image icon to choose **From your device** or **From the web**. Web search opens Google Images in a separate tab without an API key. Copy a direct PNG/JPEG image address from its source and paste it into **Image URL**. Draw fetches it anonymously in your browser (up to 2 MiB / 16 megapixels) and embeds its bytes for offline use and `.draw` reopening. Sites may block direct import with CORS; download the image and use **From your device** in that case. Google results do not establish reuse rights. This is a search-tab-and-import flow, not an embedded Google results gallery.
+
+The library UI has been removed. Existing library data and legacy MCP library tools remain available for compatibility; no stored items are deleted by this UI change.
 
 ## Connect an MCP client
 
@@ -136,7 +138,9 @@ The MCP tool schemas and behavior are described above. The source development br
 
 `.draw` is a versioned JSON document containing editable scene elements, view state, background metadata, and embedded assets. `plan.draw` is the initial planning canvas and remains available to open in Draw.
 
-The **Images** picker and the MCP image tools use the [Openverse API](https://api.openverse.org/v1/). Each inserted image stores its creator, source, and license metadata beside the embedded bytes. **Image credits** provides an attribution report. Draw identifies Openverse as the search source and is not endorsed by Openverse. The API is rate limited, and [Openverse's terms](https://docs.openverse.org/terms_of_service/) prohibit scraping. Openverse indexes third-party claims; verify the item page and license terms before sharing or commercial use. File-supplied attribution is shown as unverified, URLs are restricted to HTTPS, and fetched requests time out. The online picker needs network access; saved images remain available offline.
+The legacy MCP image tools use the [Openverse API](https://api.openverse.org/v1/) and preserve attribution metadata beside embedded bytes. The human image tool uses local files or web URLs instead. Openverse metadata is still retained in existing documents; file-supplied claims are unverified. Verify third-party licensing before reuse. Google Images is opened externally because [Google's Custom Search JSON API](https://developers.google.com/custom-search/v1/overview) is closed to new customers and is scheduled to end January 1, 2027. No Google key or paid search proxy is required.
+
+**Download recovery backup (JSON)** appears only when quarantined autosave data is available. It exports the preserved damaged record for recovery, not the current drawing. Use **Save** for the current editable `.draw` file.
 
 Switching between Blackboard and Whiteboard adapts Draw's default chalk and its V1 yellow accent for contrast. Other custom colors are preserved.
 
