@@ -238,6 +238,9 @@ export default function App() {
   }, []);
 
   const setDocument = useCallback((next: DrawDocument) => {
+    // A bridge read can arrive before React mounts the replacement editor.
+    // Never read the departing editor into the incoming document.
+    if (activeDocumentIdRef.current !== next.document.id) apiRef.current = null;
     docRef.current = next;
     activeDocumentIdRef.current = next.document.id;
     setDoc(next);
@@ -1700,8 +1703,18 @@ export default function App() {
   const handleBridgeFlush = useCallback(async (event: BridgeFlush) => {
     const api = apiRef.current;
     const current = docRef.current;
-    if (!api || !current || !editorSecret.current || event.clientId !== clientId.current || !writerOwned.current) return;
+    if (!current || !editorSecret.current || event.clientId !== clientId.current || !writerOwned.current) return;
     try {
+      if (!api || api.getAppState().isLoading) {
+        // During a workspace transition, the persisted incoming snapshot is
+        // authoritative until its editor is available. There are no live edits
+        // on that new editor to flush yet.
+        await fetch(`/__draw/api/document/flush/${encodeURIComponent(event.id)}`, {
+          method: "POST", headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
+          body: JSON.stringify({ id: event.id, clientId: clientId.current, clientIdentity: event.clientIdentity, document: current }),
+        });
+        return;
+      }
       const state = api.getAppState() as any;
       const elements = api.getSceneElementsIncludingDeleted() as any[];
       const files = api.getFiles();
@@ -1890,7 +1903,7 @@ export default function App() {
     });
   }, [editorDocumentId, initialData]);
   const onCurrentEditorChange = useCallback((elements: readonly any[], appState: any, files: any) => {
-    if (activeDocumentIdRef.current !== editorDocumentId) return;
+    if (activeDocumentIdRef.current !== editorDocumentId || appState.isLoading) return;
     onChange(elements, appState, files);
   }, [editorDocumentId, onChange]);
   const onCurrentLibraryChange = useCallback((items: LibraryItems) => {

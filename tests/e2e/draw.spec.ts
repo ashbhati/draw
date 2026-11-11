@@ -986,6 +986,25 @@ test("Open .draw restores a downloaded file that remains editable through a seco
   }).toBe(true);
 });
 
+test("fresh reads during import preserve the incoming workspace viewport", async ({ page }) => {
+  const incoming = await freshBridgeDocument(page);
+  incoming.document.title = "Incoming viewport";
+  incoming.document.canvas.viewport = { x: -123, y: 87, zoom: 1.7 };
+  await page.locator('input[type="file"][accept^=".draw"]').setInputFiles({
+    name: "incoming.draw", mimeType: "application/vnd.draw+json", buffer: Buffer.from(JSON.stringify(incoming)),
+  });
+  let sawIncoming = false;
+  for (let index = 0; index < 10; index += 1) {
+    const snapshot = await freshBridgeDocument(page);
+    if (snapshot.document.title === "Incoming viewport") {
+      sawIncoming = true;
+      expect(snapshot.document.canvas.viewport).toEqual(incoming.document.canvas.viewport);
+    }
+  }
+  expect(sawIncoming).toBe(true);
+  await expect.poll(async () => (await readLocalDocument(page))?.document.canvas.viewport).toEqual(incoming.document.canvas.viewport);
+});
+
 test("malformed .draw files leave the current canvas and local autosave untouched", async ({ page }) => {
   const create = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
