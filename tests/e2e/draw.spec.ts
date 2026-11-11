@@ -229,30 +229,16 @@ async function readLocalDocument(page: Page) {
   }));
 }
 
-async function openWorkspaceMenu(page: Page) {
-  await page.getByRole("button", { name: "Saved workspaces" }).click();
-  return page.getByRole("menu", { name: "Saved workspaces" });
-}
-
 async function currentWorkspaceId(page: Page) {
-  const menu = await openWorkspaceMenu(page);
-  const active = menu.locator('[role="menuitemradio"][aria-checked="true"]');
-  const id = await active.getAttribute("data-workspace-id");
-  await page.keyboard.press("Escape");
-  if (!id) throw new Error("The active workspace is not available in the workspace list.");
-  return id;
+  return page.getByRole("combobox", { name: "Saved workspaces" }).inputValue();
 }
-
 async function workspaceCount(page: Page) {
-  const menu = await openWorkspaceMenu(page);
-  const count = await menu.getByRole("menuitemradio").count();
-  await page.keyboard.press("Escape");
-  return count;
+  return page.getByRole("combobox", { name: "Saved workspaces" }).locator("option").count();
 }
-
 async function selectWorkspace(page: Page, id: string) {
-  const menu = await openWorkspaceMenu(page);
-  await menu.locator(`[role="menuitemradio"][data-workspace-id="${id}"]`).click();
+  const picker = page.getByRole("combobox", { name: "Saved workspaces" });
+  await picker.focus();
+  await picker.selectOption(id);
 }
 
 async function countWarmImagePixels(page: Page, image: Buffer): Promise<number> {
@@ -2710,20 +2696,17 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
   }
 });
 
-test("workspace menu dismisses on Tab and outside click without stealing focus", async ({ page }) => {
-  const trigger = page.getByRole("button", { name: "Saved workspaces" });
-  const menu = page.getByRole("menu", { name: "Saved workspaces" });
-  await trigger.click();
-  await expect(menu.getByRole("menuitemradio", { name: "My workspace" })).toBeFocused();
+test("workspace combobox and action controls share sizing and keyboard focus", async ({ page }) => {
+  const picker = page.getByRole("combobox", { name: "Saved workspaces" });
+  await expect(picker.locator("option:checked")).toHaveText("My workspace");
+  await picker.focus();
   await page.keyboard.press("Tab");
   await expect(page.getByRole("button", { name: "New workspace" })).toBeFocused();
-  await expect(menu).toHaveCount(0);
-
-  await trigger.click();
-  await expect(menu).toBeVisible();
-  await page.getByLabel("Drawing title").click();
-  await expect(menu).toHaveCount(0);
-  await expect(page.getByLabel("Drawing title")).toBeFocused();
+  for (const name of ["New workspace", "Rename workspace", "Delete workspace"]) {
+    const button = page.getByRole("button", { name, exact: true });
+    expect((await button.boundingBox())?.height).toBe(32);
+    await expect(button.locator("svg")).toHaveCount(1);
+  }
 });
 
 test("workspaces create, switch, rename, delete, and survive reload with one board each", async ({ page }) => {
@@ -2735,18 +2718,8 @@ test("workspaces create, switch, rename, delete, and survive reload with one boa
   await expect(page.getByRole("button", { name: "New workspace" })).toHaveAttribute("title", "Create a new workspace");
   await expect(page.getByRole("button", { name: "Rename workspace" })).toHaveAttribute("title", "Rename the selected workspace");
   await expect(page.getByRole("button", { name: "Delete workspace" })).toHaveAttribute("title", "Delete the selected workspace and its drawing");
-  await expect(page.getByRole("button", { name: "Saved workspaces" })).toHaveAttribute("title", "Choose a saved workspace");
-  await expect(page.locator(".workspace-current-name")).toHaveText("My workspace");
-  await page.getByRole("button", { name: "Saved workspaces" }).click();
-  const menu = page.getByRole("menu", { name: "Saved workspaces" });
-  const activeOption = menu.getByRole("menuitemradio", { name: "My workspace" });
-  await expect(activeOption).toBeFocused();
-  await page.keyboard.press("End");
-  await expect(menu.getByRole("menuitemradio").last()).toBeFocused();
-  await page.keyboard.press("Home");
-  await expect(activeOption).toBeFocused();
-  await page.keyboard.press("Escape");
-  await expect(page.getByRole("button", { name: "Saved workspaces" })).toBeFocused();
+  await expect(page.getByRole("combobox", { name: "Saved workspaces" })).toHaveAttribute("title", "Choose the active workspace");
+  await expect(page.getByRole("combobox", { name: "Saved workspaces" }).locator("option:checked")).toHaveText("My workspace");
   await page.getByLabel("Drawing title").fill("Alpha notes");
   await expect.poll(async () => (await readLocalDocument(page))?.document.title).toBe("Alpha notes");
 
@@ -2759,11 +2732,11 @@ test("workspaces create, switch, rename, delete, and survive reload with one boa
   await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
   await selectWorkspace(page, originalWorkspaceId);
   await expect(page.getByLabel("Drawing title")).toHaveValue("Alpha notes");
-  await expect(page.getByRole("button", { name: "Saved workspaces" })).toBeFocused();
+  await expect(page.getByRole("combobox", { name: "Saved workspaces" })).toBeFocused();
 
   page.once("dialog", (dialog) => dialog.accept("Research workspace"));
   await page.getByRole("button", { name: "Rename workspace" }).click();
-  await expect(page.locator(".workspace-current-name")).toHaveText("Research workspace");
+  await expect(page.getByRole("combobox", { name: "Saved workspaces" }).locator("option:checked")).toHaveText("Research workspace");
   await page.getByRole("button", { name: "New workspace" }).click();
   await expect.poll(() => workspaceCount(page)).toBe(3);
   page.once("dialog", (dialog) => dialog.accept());
