@@ -2115,6 +2115,8 @@ test("a human pairs an MCP host, the secret stays out of tool output, and revoca
   expect(pairingSecret).toMatch(/^[a-f\d]{64}$/i);
   const mcp = await startStdioMcp(baseURL, directory, pairingSecret);
   try {
+    const discovery = await mcp.request("tools/list", {});
+    expect(discovery.result.tools.map((tool: { name: string }) => tool.name)).toContain("pair_mcp_client");
     const pairing = mcp.call("pair_mcp_client", {});
     await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
     const visibleFingerprint = await page.locator("section[aria-labelledby='draw-mcp-pairing-title'] code").innerText();
@@ -2134,7 +2136,7 @@ test("a human pairs an MCP host, the secret stays out of tool output, and revoca
 
     const clientRow = page.locator(".mcp-client-row").filter({ hasText: publicResult.clientIdentity });
     await expect(clientRow).toBeVisible();
-    await page.getByRole("button", { name: "Close" }).click();
+    await page.getByRole("button", { name: "Close", exact: true }).click();
     // Pairing-secret requests are intentionally rate-limited to one per five seconds.
     await page.waitForTimeout(5_000);
     await page.getByRole("button", { name: "MCP clients" }).click();
@@ -2151,7 +2153,7 @@ test("a human pairs an MCP host, the secret stays out of tool output, and revoca
     expect(replacementPublicResult.clientIdentity).not.toBe(publicResult.clientIdentity);
     await expect(clientRow).toContainText("revoked");
 
-    await page.getByRole("button", { name: "Close" }).click();
+    await page.getByRole("button", { name: "Close", exact: true }).click();
     await page.waitForTimeout(5_000);
     await page.getByRole("button", { name: "MCP clients" }).click();
     const secondPairingSecret = await page.locator(".mcp-pairing-secret code").innerText();
@@ -2210,7 +2212,7 @@ test("revoking an MCP client cancels its pending command without overwriting a l
     await page.getByRole("button", { name: "Approve client" }).click();
     expect((await pairing).result.isError).not.toBe(true);
     credential = JSON.parse(await readFile(mcp.credentialPath, "utf8"));
-    await page.getByRole("button", { name: "Close" }).click();
+    await page.getByRole("button", { name: "Close", exact: true }).click();
     const initial = await currentBridgeDocument(page);
     await page.route("**/__draw/api/commands/*/ack", async (route) => {
       didIntercept = true;
@@ -2269,7 +2271,7 @@ test("revoking an MCP client cancels its pending command without overwriting a l
     data: command,
   });
   expect(retry.status()).toBe(401);
-  await page.getByRole("button", { name: "Close" }).click();
+  await page.getByRole("button", { name: "Close", exact: true }).click();
   const savedFile = page.waitForEvent("download");
   await page.getByRole("button", { name: "Save", exact: true }).click();
   const saved = JSON.parse(await readFile(await (await savedFile).path(), "utf8"));
@@ -2304,7 +2306,7 @@ test("revocation rolls back in place and retains the selected human scene and un
     await page.getByRole("button", { name: "Approve client" }).click();
     expect((await pairing).result.isError).not.toBe(true);
     const credential = JSON.parse(await readFile(mcp.credentialPath, "utf8"));
-    await page.getByRole("button", { name: "Close" }).click();
+    await page.getByRole("button", { name: "Close", exact: true }).click();
 
     const beforeFixture = JSON.parse((await mcp.call("get_current_canvas", {})).result.content[0].text);
     const fixtureResponse = await mcp.call("create_diagram", {
@@ -3237,4 +3239,23 @@ test("a malformed saved library is downloadable while its drawing and autosave r
   await page.getByRole("button", { name: "Delete workspace", exact: true }).click();
   await expect(page.getByRole("button", { name: "Library recovery backups", exact: true })).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Library recovery", exact: true })).toHaveCount(0);
+});
+
+test("MCP clients dialog closes from its sticky heading and with Escape", async ({ page }) => {
+  await page.goto("/");
+  await connectEditorToMcp(page);
+  await page.getByRole("button", { name: "MCP clients" }).click();
+
+  const dialog = page.getByRole("dialog", { name: "MCP clients" });
+  await expect(dialog).toBeVisible();
+  const closeButton = dialog.getByRole("button", { name: "Close MCP clients" });
+  await expect(closeButton).toBeVisible();
+  await closeButton.click();
+  await expect(dialog).toBeHidden();
+  await expect(page.locator(".mcp-pairing-secret")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "MCP clients" }).click();
+  await expect(dialog).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
 });

@@ -158,6 +158,20 @@ export default function App() {
   const [mcpClients, setMcpClients] = useState<McpPairedClient[]>([]);
   const [mcpPairingRequest, setMcpPairingRequest] = useState<McpPairingRequest | null>(null);
   const [mcpPairingError, setMcpPairingError] = useState("");
+  const closeMcpManagement = useCallback(() => {
+    setMcpManagementOpen(false);
+    setMcpPairingSecret("");
+  }, []);
+  useEffect(() => {
+    if (!mcpManagementOpen || mcpPairingRequest) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeMcpManagement();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [closeMcpManagement, mcpManagementOpen, mcpPairingRequest]);
   const [autosaveBlocked, setAutosaveBlocked] = useState(false);
   const autosaveBlockedRef = useRef(autosaveBlocked);
   autosaveBlockedRef.current = autosaveBlocked;
@@ -2034,9 +2048,12 @@ export default function App() {
         </div>
       </section>
     </div>}
-    {mcpManagementOpen && <div className="draw-confirmation-backdrop" role="presentation">
+    {mcpManagementOpen && <div className="draw-confirmation-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeMcpManagement(); }}>
       <section className="draw-confirmation" role="dialog" aria-modal="true" aria-labelledby="draw-mcp-clients-title">
-        <h2 id="draw-mcp-clients-title">MCP clients</h2>
+        <div className="mcp-dialog-heading">
+          <h2 id="draw-mcp-clients-title">MCP clients</h2>
+          <button className="button button-quiet mcp-dialog-close" type="button" aria-label="Close MCP clients" title="Close" onClick={closeMcpManagement}>×</button>
+        </div>
         <p>Copy this one-time pairing secret into the MCP host’s protected configuration as <code>DRAW_MCP_PAIRING_SECRET</code>. It expires in five minutes and can be used once. Then call its Draw pairing tool. Draw will ask you to approve the host name and fingerprint.</p>
         {mcpPairingSecret && <div className="mcp-pairing-secret"><code>{mcpPairingSecret}</code><button className="button button-quiet" onClick={() => void navigator.clipboard.writeText(mcpPairingSecret)}>Copy secret</button></div>}
         {mcpPairingError && <p role="alert">{mcpPairingError}</p>}
@@ -2046,7 +2063,7 @@ export default function App() {
           <span><strong>{client.name}</strong><small>{client.clientIdentity} · {client.revokedAt ? "revoked" : new Date(client.expiresAt).toLocaleDateString()}</small></span>
           {!client.revokedAt && <button className="button button-quiet" onClick={() => void revokeMcpClient(client.clientIdentity)}>Revoke</button>}
         </div>)}
-        <div className="draw-confirmation-actions"><button className="button button-quiet" onClick={() => { setMcpManagementOpen(false); setMcpPairingSecret(""); }}>Close</button></div>
+        <div className="draw-confirmation-actions"><button className="button button-quiet" onClick={closeMcpManagement}>Close</button></div>
       </section>
     </div>}
     {mcpPairingRequest && <div className="draw-confirmation-backdrop" role="presentation">

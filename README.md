@@ -69,7 +69,21 @@ For contributors using the Vite bridge, see [Development MCP setup](#development
 
 ### Development MCP setup
 
-When running from source, start `npm run dev` yourself in a trusted terminal. Type its one-minute launch code into Draw's **Connect MCP** dialog. Configure the client with `npm run mcp` and `cwd` set to the repository; the development bridge uses loopback HTTP and requires the Draw tab to remain open. Its localhost pairing surface is intended only for trusted local development, not as the production MCP transport.
+When running from source, start `npm run dev` yourself in a trusted terminal. Type its one-minute launch code into Draw's **Connect MCP** dialog. Configure the MCP client with an explicit repository path so it starts the host from the same checkout as the dev server, even when the agent itself is running from another project directory:
+
+```json
+{
+  "mcpServers": {
+    "draw": {
+      "command": "npm",
+      "args": ["--prefix", "/absolute/path/to/draw", "run", "mcp"],
+      "env": { "DRAW_MCP_BASE_URL": "http://127.0.0.1:5173" }
+    }
+  }
+}
+```
+
+Replace `/absolute/path/to/draw` with the root of the exact Draw checkout serving the page; the MCP client inherits its own working directory, so plain `npm run mcp` can accidentally start a different, older Draw copy. Before entering a pairing secret, confirm that the MCP host advertises `pair_mcp_client` in addition to the normal Draw tools. If that tool is missing, correct `--prefix` and reconnect the MCP server. The development bridge uses loopback HTTP and requires the Draw tab to remain open. Its localhost pairing surface is intended only for trusted local development, not as the production MCP transport.
 
 The bridge requires the paired capability on document reads, confirmations, and commands, and separately requires the active editor-tab secret for editor sync and acknowledgements. In the Vite development bridge, unpaired loopback traffic can invalidate a pending pairing secret or trigger a temporary pairing lockout. Use only trusted local MCP hosts while running the development server. The packaged runtime restricts MCP routes to its private Unix socket; same-OS-user processes remain trusted.
 
