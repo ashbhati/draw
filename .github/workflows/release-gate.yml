@@ -25,5 +25,13 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
-      - run: npx playwright install --with-deps chromium
+      - name: Install Playwright Chromium and system dependencies
+        run: |
+          npx playwright install --with-deps chromium || {
+            echo "::warning::Combined browser and OS dependency install failed; retrying Chromium without apt dependencies."
+            npx playwright install chromium
+          }
+      - name: Verify Playwright Chromium launches
+        run: |
+          node --input-type=module -e 'import { chromium } from "@playwright/test"; const browser = await chromium.launch(); await browser.close(); console.log("Playwright Chromium launched successfully");'
       - run: npm run test:release
