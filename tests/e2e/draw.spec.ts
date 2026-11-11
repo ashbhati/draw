@@ -24,9 +24,10 @@ async function startStdioMcp(baseURL: string, documentDir: string, pairingSecret
     await chmod(credentialPath, 0o600);
   }
   if (launchCwd && mockOpenverse) throw new Error("The npm-prefix MCP launch does not use the Openverse test preloader.");
-  if (launchCwd && !process.env.npm_execpath) throw new Error("Run the E2E suite through npm to exercise the npm-prefix MCP launch.");
+  const npmCli = process.env.npm_execpath;
+  const launchCommand = launchCwd && !npmCli ? "npm" : process.execPath;
   const args = launchCwd
-    ? [process.env.npm_execpath!, "--silent", "--prefix", process.cwd(), "run", "mcp"]
+    ? [...(npmCli ? [npmCli] : []), "--silent", "--prefix", process.cwd(), "run", "mcp"]
     : ["--import", "tsx/esm", "src/integrations/mcp-server.ts"];
   if (mockOpenverse) {
     const fixtureId = "123e4567-e89b-12d3-a456-426614174000";
@@ -36,7 +37,7 @@ async function startStdioMcp(baseURL: string, documentDir: string, pairingSecret
     await writeFile(preloaderPath, `const fixture = ${fixture};\nlet metadataReads = 0;\nconst originalFetch = globalThis.fetch;\nglobalThis.fetch = async (input, init) => {\n const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);\n if (url.origin !== "https://api.openverse.org") return originalFetch(input, init);\n if (url.pathname === "/v1/images/") return new Response(JSON.stringify({ results: [fixture] }), { status: 200, headers: { "content-type": "application/json" } });\n if (url.pathname === "/v1/images/" + fixture.id + "/") { metadataReads += 1; return new Response(JSON.stringify({ ...fixture, title: metadataReads === 1 ? fixture.title : "Changed metadata on retry" }), { status: 200, headers: { "content-type": "application/json" } }); }\n if (url.pathname === "/v1/images/" + fixture.id + "/thumb/") return new Response(Buffer.from(fixture.pngBase64, "base64"), { status: 200, headers: { "content-type": "image/png" } });\n return new Response("not found", { status: 404 });\n};\n`);
     args.unshift("--import", preloaderPath);
   }
-  const child = spawn(process.execPath, args, {
+  const child = spawn(launchCommand, args, {
     cwd: launchCwd ?? process.cwd(),
     env: { ...process.env, DRAW_MCP_BASE_URL: new URL(baseURL).origin, DRAW_MCP_DOCUMENT_DIR: documentDir, DRAW_MCP_CLIENT_CREDENTIAL_PATH: credentialPath, ...(pairingSecret ? { DRAW_MCP_PAIRING_SECRET: pairingSecret } : {}) },
     stdio: ["pipe", "pipe", "pipe"],
@@ -3320,6 +3321,7 @@ test("MCP clients dialog keeps keyboard focus, scroll state, and canvas selectio
         scrollTop: element.scrollTop,
         scrollHeight: element.scrollHeight,
         clientHeight: element.clientHeight,
+        dialogBackground: getComputedStyle(element).backgroundColor,
         headingBackground: getComputedStyle(heading).backgroundColor,
       };
     });
@@ -3327,7 +3329,8 @@ test("MCP clients dialog keeps keyboard focus, scroll state, and canvas selectio
     expect(scrollState.scrollHeight).toBeGreaterThan(scrollState.clientHeight);
     expect(scrollState.headingTop - scrollState.dialogTop).toBeGreaterThanOrEqual(0);
     expect(scrollState.headingTop - scrollState.dialogTop).toBeLessThanOrEqual(2);
-    expect(scrollState.headingBackground).toBe("rgb(251, 250, 247)");
+    expect(scrollState.dialogBackground).not.toBe("rgba(0, 0, 0, 0)");
+    expect(scrollState.headingBackground).toBe(scrollState.dialogBackground);
     const closeBox = await closeButton.boundingBox();
     expect(closeBox).not.toBeNull();
     expect(closeBox!.y).toBeGreaterThanOrEqual(0);
