@@ -1022,7 +1022,7 @@ test("a mounted read-only tab with an older library view cannot clear a newer li
   await staleTab.goto("/");
   await staleTab.locator(".excalidraw canvas").first().waitFor();
   await expect(staleTab.getByText(/reload this tab to edit/i)).toBeVisible();
-  await expect(staleTab.getByRole("button", { name: "Manage library (0)" })).toBeDisabled();
+  await expect(staleTab.getByRole("button", { name: /Manage library/ })).toHaveCount(0);
 
   const createdResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
     operation: "create_diagram",
@@ -1044,7 +1044,7 @@ test("a mounted read-only tab with an older library view cannot clear a newer li
   } });
   expect(addedResponse.ok(), await addedResponse.text()).toBeTruthy();
 
-  await expect(staleTab.getByRole("button", { name: "Manage library (0)" })).toBeDisabled();
+  await expect(staleTab.getByRole("button", { name: /Manage library/ })).toHaveCount(0);
   await staleTab.waitForTimeout(150);
   const storedLibrary = await staleTab.evaluate(async () => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -1688,86 +1688,74 @@ test("embedded image assets survive autosave and editable Draw save/reopen", asy
   }).toBe(true);
 });
 
-test("Openverse picker previews license metadata and embeds an offline-editable image with a credits report", async ({ page }) => {
-  const id = "123e4567-e89b-12d3-a456-426614174000";
-  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jJ5sAAAAASUVORK5CYII=", "base64");
-  await page.route("https://api.openverse.org/v1/images/**", async (route) => {
-    const url = new URL(route.request().url());
-    if (url.pathname.endsWith("/thumb/")) {
-      await route.fulfill({ status: 200, contentType: "image/png", body: png });
-      return;
-    }
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ results: [{
-      id, title: "Chalk arrow", creator: "Draw Artist", creator_url: "https://artist.example/", foreign_landing_url: "https://source.example/chalk-arrow",
-      license: "by", license_version: "4.0", license_url: "https://creativecommons.org/licenses/by/4.0/", attribution: "Draw Artist, CC BY 4.0",
-      source: "Example Archive", width: 1, height: 1, filetype: "png",
-    }] }) });
-  });
-  await page.getByRole("button", { name: "Images", exact: true }).click();
-  await expect(page.getByRole("link", { name: "Openverse", exact: true })).toHaveAttribute("href", "https://openverse.org/");
-  await page.getByLabel("Search images").fill("chalk arrow");
-  await page.getByRole("button", { name: "Search", exact: true }).click();
-  await expect(page.getByText("Chalk arrow", { exact: true })).toBeVisible();
-  await expect(page.getByText("License: BY 4.0")).toBeVisible();
-  await expect(page.getByRole("link", { name: "Source" })).toHaveAttribute("href", "https://source.example/chalk-arrow");
-  await page.getByRole("button", { name: "Add to drawing" }).click();
-
-  await expect.poll(async () => {
-    const current = await freshBridgeDocument(page);
-    const imageElement = current.document.elements.find((element: any) => element.type === "image");
-    return Boolean(imageElement && current.document.assets[imageElement.fileId]?.attribution?.license === "by");
-  }).toBe(true);
+test("image tool offers device and Google web import, embeds bytes, and saves with the workspace name", async ({ page }) => {
+  // Exercise Excalidraw's file-input fallback, which Chrome automation can supply.
+  await page.addInitScript(() => { delete (window as any).showOpenFilePicker; });
+  await page.reload(); await waitForBridge(page);
+  await expect(page.getByRole("button", { name: "Images", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Image credits", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Add selection to library|Manage library/ })).toHaveCount(0);
+  await expect(page.locator(".default-sidebar-trigger")).not.toBeVisible();
+  const png = Buffer.from(await page.evaluate(() => {
+    const canvas = document.createElement("canvas"); canvas.width = 20; canvas.height = 20;
+    const context = canvas.getContext("2d")!; context.fillStyle = "#cc4411"; context.fillRect(0, 0, 20, 20);
+    return canvas.toDataURL("image/png").split(",")[1];
+  }), "base64");
+  await page.route("https://images.example/robot.png", (route) => route.fulfill({ contentType: "image/png", body: png }));
+  await page.locator("label").filter({ has: page.getByRole("radio", { name: "Insert image", exact: true }) }).click();
+  const dialog = page.getByRole("dialog", { name: "Insert image" });
+  await expect(dialog).toBeVisible();
+  const chooser = page.waitForEvent("filechooser");
+  await dialog.getByRole("button", { name: "From your device" }).click();
+  await (await chooser).setFiles({ name: "local.png", mimeType: "image/png", buffer: png });
+  await page.keyboard.press("Escape");
+  await page.locator("label").filter({ has: page.getByRole("radio", { name: "Insert image", exact: true }) }).click();
+  await dialog.getByRole("button", { name: "From the web" }).click();
+  await page.getByLabel("Search Google Images", { exact: true }).fill("robot & chalk");
+  await page.context().route("https://www.google.com/**", (route) => route.fulfill({ contentType: "text/html", body: "<h1>Search</h1>" }));
+  const popupWait = page.waitForEvent("popup");
+  await dialog.getByRole("button", { name: /Search Google Images/ }).click();
+  const popup = await popupWait;
+  await popup.waitForLoadState();
+  expect(new URL(popup.url()).searchParams.get("q")).toBe("robot & chalk");
+  expect(new URL(popup.url()).searchParams.get("udm")).toBe("2");
+  await popup.close();
+  await page.getByLabel("Image URL", { exact: true }).fill("https://images.example/robot.png");
+  await dialog.getByRole("button", { name: "Add image", exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.some((el: any) => el.customData?.drawSourceUrl === "https://images.example/robot.png")).toBe(true);
   const saved = await readLocalDocument(page);
-  const imageElement = saved.document.elements.find((element: any) => element.type === "image");
-  expect(saved.document.assets[imageElement.fileId]).toMatchObject({ dataURL: expect.stringMatching(/^data:image\/png;base64,/), attribution: { provider: "Openverse", providerId: id, license: "by", creator: "Draw Artist" } });
-
-  await page.getByRole("button", { name: "Image credits" }).click();
-  await expect(page.getByRole("heading", { name: "Image credits" })).toBeVisible();
-  const reportWait = page.waitForEvent("download");
-  await page.getByRole("button", { name: "Download credits report" }).click();
-  const report = await reportWait;
-  const reportText = await readFile(await report.path(), "utf8");
-  expect(reportText).toContain("Chalk arrow");
-  expect(reportText).toContain("https://creativecommons.org/licenses/by/4.0/");
-  await page.getByRole("button", { name: "Close" }).last().click();
-
-  const drawWait = page.waitForEvent("download");
+  const image = saved.document.elements.find((el: any) => el.customData?.drawSourceUrl);
+  expect(saved.document.assets[image.fileId].dataURL).toMatch(/^data:image\/png;base64,/);
+  page.once("dialog", (dialog) => dialog.accept("Project 1"));
+  await page.getByRole("button", { name: "Rename workspace", exact: true }).click();
+  const wait = page.waitForEvent("download");
   await page.getByRole("button", { name: "Save", exact: true }).click();
-  const drawDownload = await drawWait;
-  const drawFile = JSON.parse(await readFile(await drawDownload.path(), "utf8"));
-  expect(drawFile.document.assets[imageElement.fileId].attribution.providerId).toBe(id);
+  const downloaded = await wait;
+  expect(downloaded.suggestedFilename()).toBe("Project-1.draw");
+  const file = JSON.parse(await readFile(await downloaded.path(), "utf8"));
+  expect(file.document.assets[image.fileId].dataURL).toBe(saved.document.assets[image.fileId].dataURL);
   await page.reload();
   await waitForBridge(page);
-  await expect.poll(async () => (await readLocalDocument(page))?.document.assets[imageElement.fileId]?.attribution?.verification).toBe("openverse-index");
-  page.once("dialog", (dialog) => dialog.accept());
-  await page.locator('input[type="file"][accept^=".draw"]').setInputFiles({ name: "genuine-openverse.draw", mimeType: "application/vnd.draw+json", buffer: Buffer.from(JSON.stringify(drawFile)) });
-  await expect.poll(async () => (await readLocalDocument(page))?.document.assets[imageElement.fileId]?.attribution?.verification).toBe("unverified");
+  await expect.poll(async () => (await readLocalDocument(page))?.document.assets[image.fileId]?.dataURL).toBe(saved.document.assets[image.fileId].dataURL);
+  await page.locator('input[type="file"][accept^=".draw"]').setInputFiles({ name: downloaded.suggestedFilename(), mimeType: "application/vnd.draw+json", buffer: Buffer.from(JSON.stringify(file)) });
+  await expect.poll(async () => (await freshBridgeDocument(page)).document.elements.some((el: any) => el.customData?.drawSourceUrl === "https://images.example/robot.png")).toBe(true);
+});
 
-  const hostileAttribution = {
-    ...drawFile.document.assets[imageElement.fileId].attribution,
-    title: "Untrusted file claim", license: "cc0", verification: "verified",
-    sourceUrl: "javascript:alert(document.domain)", creatorUrl: "http://evil.example/phish", licenseUrl: "data:text/html,evil",
-  };
-  drawFile.document.assets[imageElement.fileId].attribution = hostileAttribution;
-  const imageInFile = drawFile.document.elements.find((element: any) => element.type === "image");
-  imageInFile.customData.drawAttribution = hostileAttribution;
-  page.once("dialog", (dialog) => dialog.accept());
-  await page.locator('input[type="file"][accept^=".draw"]').setInputFiles({ name: "openverse-image.draw", mimeType: "application/vnd.draw+json", buffer: Buffer.from(JSON.stringify(drawFile)) });
-  await expect.poll(async () => {
-    const reopened = await freshBridgeDocument(page);
-    const reopenedImage = reopened.document.elements.find((element: any) => element.type === "image");
-    return reopenedImage && reopened.document.assets[reopenedImage.fileId]?.attribution;
-  }).toMatchObject({ providerId: id, title: "Untrusted file claim", verification: "unverified" });
-  const normalized = await freshBridgeDocument(page);
-  const normalizedImage = normalized.document.elements.find((element: any) => element.type === "image");
-  expect(normalized.document.assets[normalizedImage.fileId].attribution).not.toHaveProperty("sourceUrl");
-  expect(normalized.document.assets[normalizedImage.fileId].attribution).not.toHaveProperty("creatorUrl");
-  await page.getByRole("button", { name: "Image credits" }).click();
-  await expect(page.getByText(/file supplied claim \(unverified\)/i)).toBeVisible();
-  await expect(page.getByRole("link", { name: "Source" })).toHaveCount(0);
-  await expect(page.getByRole("link", { name: "Creator" })).toHaveCount(0);
-  await expect(page.getByRole("link", { name: "License" })).toHaveCount(0);
-
+test("web image import reports blocked sources and Escape restores toolbar focus", async ({ page }) => {
+  await page.route("https://images.example/blocked.png", (route) => route.abort("failed"));
+  await page.locator("label").filter({ has: page.getByRole("radio", { name: "Insert image", exact: true }) }).click();
+  const dialog = page.getByRole("dialog", { name: "Insert image" });
+  await dialog.getByRole("button", { name: "From the web" }).click();
+  await dialog.getByLabel("Image URL").fill("https://images.example/blocked.png");
+  await dialog.getByRole("button", { name: "Add image", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toContainText("From your device");
+  await page.keyboard.press("Escape");
+  await expect(dialog).not.toBeVisible();
+  await expect(page.getByRole("radio", { name: "Insert image", exact: true })).toBeFocused();
+  await page.keyboard.press("Space");
+  await expect(dialog).toBeVisible();
+  await page.keyboard.press("Escape");
 });
 
 test("paired MCP Openverse image claims remain unverified after save and reload", async ({ page }) => {
@@ -3020,7 +3008,7 @@ test("stdio MCP library follows the active workspace across A to B and back", as
     const bEmpty = await result(await mcp.call("list_workspace_library", { documentId: bDocument.documentId }));
     expect(bEmpty.workspaceId).toBe(b.activeWorkspaceId);
     expect(bEmpty.items).toEqual([]);
-    await expect(page.getByRole("button", { name: "Manage library (0)" })).toBeVisible();
+    await expect(page.getByRole("button", { name: /Manage library/ })).toHaveCount(0);
 
     const bDiagram = await result(await mcp.call("create_diagram", {
       documentId: bDocument.documentId, expectedDocumentRevision: bDocument.documentRevision,
@@ -3055,127 +3043,12 @@ test("stdio MCP library follows the active workspace across A to B and back", as
       documentId: latestA.documentId, expectedDocumentRevision: latestA.documentRevision,
       idempotencyKey: "right-project-insert", itemId: "workspace-a-item",
     }));
-    await expect(page.getByRole("button", { name: "Manage library (1)" })).toBeVisible();
-    await page.getByRole("button", { name: "Manage library (1)" }).click();
-    await expect(page.getByRole("dialog", { name: "Workspace library" })).toContainText("Project A library item");
-    await expect(page.getByRole("dialog", { name: "Workspace library" })).not.toContainText("Project B library item");
+    expect(restoredLibrary.items.map((item: any) => item.name)).toContain("Project A library item");
+    expect(restoredLibrary.items.map((item: any) => item.name)).not.toContain("Project B library item");
   } finally {
     await mcp.close();
     await rm(directory, { recursive: true, force: true });
   }
-});
-
-test("library conflicts show a library notice without changing the saved document status", async ({ page, baseURL }) => {
-  if (!baseURL) throw new Error("Playwright baseURL is required for the library conflict test.");
-  const directory = await mkdtemp(join(tmpdir(), "draw-e2e-library-conflict-status-"));
-  const mcp = await startStdioMcp(baseURL, directory);
-  try {
-    const result = async (response: any) => {
-      expect(response.error, JSON.stringify(response.error)).toBeUndefined();
-      expect(response.result?.isError, response.result?.content?.[0]?.text).not.toBe(true);
-      return JSON.parse(response.result.content[0].text);
-    };
-    let current = await result(await mcp.call("get_current_canvas", { offset: 0, limit: 250 }));
-    const created = await result(await mcp.call("create_diagram", {
-      documentId: current.documentId, expectedDocumentRevision: current.documentRevision,
-      idempotencyKey: "conflict-status-create", nodes: [{ id: "conflict-node", label: "Conflict test", x: 140, y: 120 }], edges: [],
-    }));
-    current = await result(await mcp.call("get_current_canvas", { offset: 0, limit: 250 }));
-    expect(Number.isSafeInteger(current.documentRevision), JSON.stringify(current)).toBe(true);
-    let library = await result(await mcp.call("list_workspace_library", { documentId: current.documentId }));
-    await result(await mcp.call("add_selection_to_workspace_library", {
-      documentId: current.documentId, expectedDocumentRevision: current.documentRevision,
-      expectedLibraryRevision: library.libraryRevision, idempotencyKey: "conflict-status-seed",
-      itemId: "conflict-status-seed", elementIds: [created.nodes["conflict-node"]], name: "Initial item",
-    }));
-    current = await result(await mcp.call("get_current_canvas", { offset: 0, limit: 250 }));
-    expect(Number.isSafeInteger(current.documentRevision), JSON.stringify(current)).toBe(true);
-    const catalog = await result(await mcp.call("list_workspaces", {}));
-    await page.evaluate(async ({ workspaceId }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open("draw-local");
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-      });
-      try {
-        const tx = db.transaction("workspaceLibrary", "readwrite");
-        const store = tx.objectStore("workspaceLibrary");
-        const row = await new Promise<any>((resolve, reject) => {
-          const request = store.get(workspaceId);
-          request.onsuccess = () => resolve(request.result);
-          request.onerror = () => reject(request.error);
-        });
-        row.items.push({ id: "agent-added-item", created: Date.now(), name: "Agent item", elements: [{ id: "agent-shape", type: "rectangle" }], assets: {} });
-        row.revision += 1;
-        store.put(row, workspaceId);
-        await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); });
-      } finally { db.close(); }
-    }, { workspaceId: catalog.activeWorkspaceId });
-
-    const selected = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
-      operation: "set_selection", input: {
-        documentId: current.documentId, expectedDocumentRevision: current.documentRevision,
-        idempotencyKey: "conflict-status-selection", ids: [created.nodes["conflict-node"]],
-      },
-    } });
-    expect(selected.ok(), await selected.text()).toBeTruthy();
-    await page.getByRole("button", { name: "Add selection to library" }).click();
-    await expect(page.getByText(/Could not save the library item: The workspace library changed/i)).toBeVisible();
-    await expect(page.locator(".save-indicator")).toHaveText("Saved on this device");
-  } finally {
-    await mcp.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("workspace library items add with labels, persist, insert as editable elements, and can be renamed and removed", async ({ page }) => {
-  const createdResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
-    operation: "create_diagram",
-    input: { idempotencyKey: "e2e-library-create-flow", nodes: [{ id: "library-source", label: "Reusable step", x: 120, y: 120 }], edges: [] },
-  } });
-  expect(createdResponse.ok(), await createdResponse.text()).toBeTruthy();
-  const created = await createdResponse.json();
-  const sourceShapeId = created.result.nodes["library-source"];
-  const current = await freshBridgeDocument(page);
-  const selectedResponse = await page.request.post(commandApi, { headers: mcpAuthHeaders(), data: {
-    operation: "set_selection",
-    input: { idempotencyKey: "e2e-library-select-source", documentId: current.document.id, expectedDocumentRevision: current.document.documentRevision, ids: [sourceShapeId] },
-  } });
-  expect(selectedResponse.ok(), await selectedResponse.text()).toBeTruthy();
-  await expect.poll(async () => (await freshBridgeDocument(page)).document.appState.selectedElementIds?.[sourceShapeId]).toBe(true);
-  await page.getByRole("button", { name: "Add selection to library" }).click();
-  const manager = page.getByRole("dialog", { name: "Workspace library" });
-  await expect(manager).toBeVisible();
-  await expect(manager.getByText("Reusable item 1")).toBeVisible();
-  await expect(manager.getByText("2 elements")).toBeVisible();
-  page.once("dialog", (dialog) => dialog.accept("Evaluation node"));
-  await manager.getByRole("button", { name: "Rename" }).click();
-  await expect(manager.getByText("Evaluation node")).toBeVisible();
-  await manager.getByRole("button", { name: "Close" }).click();
-  await page.reload();
-  await page.locator(".topbar").waitFor();
-  await page.getByRole("button", { name: "Manage library (1)" }).click();
-  const reloadedManager = page.getByRole("dialog", { name: "Workspace library" });
-  await expect(reloadedManager.getByText("Evaluation node")).toBeVisible();
-  await reloadedManager.getByRole("button", { name: "Close" }).click();
-
-  await page.getByRole("button", { name: "Manage library (1)" }).click();
-  const insertManager = page.getByRole("dialog", { name: "Workspace library" });
-  await insertManager.getByRole("button", { name: "Insert" }).click();
-  await expect(insertManager).toBeHidden();
-  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.filter((element: any) => element.type === "rectangle")).toHaveLength(2);
-  await page.reload();
-  await page.locator(".topbar").waitFor();
-  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.filter((element: any) => element.type === "rectangle")).toHaveLength(2);
-  const persistedInsert = await readLocalDocument(page);
-  const inserted = persistedInsert.document.elements.find((element: any) => element.type === "text" && element.originalText === "Reusable step" && element.id !== created.result.nodeLabels["library-source"]);
-  expect(inserted).toBeTruthy();
-  expect(persistedInsert.document.elements.some((element: any) => element.id === inserted.id && element.containerId !== created.result.nodes["library-source"])).toBe(true);
-
-  await page.getByRole("button", { name: "Manage library (1)" }).click();
-  page.once("dialog", (dialog) => dialog.accept());
-  await page.getByRole("dialog", { name: "Workspace library" }).getByRole("button", { name: "Remove" }).click();
-  await expect(page.getByRole("button", { name: "Manage library (0)" })).toBeVisible();
 });
 
 test("quarantined autosave can be exported while new edits resume autosaving in a fresh workspace", async ({ page }) => {
@@ -3200,7 +3073,7 @@ test("quarantined autosave can be exported while new edits resume autosaving in 
   const recovery = page.getByRole("region", { name: "Workspace recovery" });
   await expect(recovery).toBeVisible();
   const downloadWait = page.waitForEvent("download");
-  await recovery.getByRole("button", { name: "Download recovery data" }).click();
+  await recovery.getByRole("button", { name: "Download recovery backup (JSON)" }).click();
   const downloaded = await downloadWait;
   const path = await downloaded.path();
   expect(path).toBeTruthy();
@@ -3227,7 +3100,7 @@ test("quarantined autosave can be exported while new edits resume autosaving in 
   await page.reload();
   await expect(page.getByLabel("Drawing title")).toHaveValue("Autosave restored");
   const retainedWait = page.waitForEvent("download");
-  await page.getByRole("button", { name: "Download recovery data" }).click();
+  await page.getByRole("button", { name: "Download recovery backup (JSON)" }).click();
   const retained = await retainedWait;
   expect(JSON.parse(await readFile((await retained.path())!, "utf8"))).toEqual(raw);
   const normalized = (elements: any[]) => elements.map((element) => ({ ...element, boundElements: element.boundElements ?? [] }));

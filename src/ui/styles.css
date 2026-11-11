@@ -51,3 +51,14 @@
 .workspace-action:hover{background:#f1f0ff;color:#5753c9}.workspace-action-danger:hover{background:#fff0ee;color:#b3322a}
 .workspace-action:focus-visible,.project-toolbar .workspace-combobox:focus-visible{outline:2px solid #6965db;outline-offset:1px}.workspace-action:disabled,.workspace-combobox:disabled{opacity:.45;cursor:default}
 @media(max-width:420px){.project-toolbar .workspace-combobox{min-width:120px;max-width:150px}.workspace-controls{gap:2px}}
+
+/* File actions use the same quiet, rounded outline icons as the editor tools. */
+.file-action svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.file-action:hover{background:#f1f0ff;border-color:#d7d5ef;color:#5753c9}.file-action:focus-visible{outline-color:#6965db}
+.editor-shell .default-sidebar-trigger{display:none}
+.draw-image-source{width:min(620px,94vw);border:1px solid #e2e2e8;background:#fff}
+.draw-image-source:not([open]){display:none}.draw-image-source::backdrop{background:#10131088}
+.draw-image-source-actions{display:flex;gap:8px;margin:14px 0 20px}.draw-image-source .button[aria-pressed="true"]{background:#f1f0ff;border-color:#6965db;color:#5753c9}
+.draw-image-source p{font-size:13px;color:#65636b;line-height:1.5}.draw-web-search{display:grid;gap:8px;margin-top:20px}.draw-web-search label{font-size:13px;font-weight:600}.draw-web-search>div{display:flex;gap:8px}.draw-web-search input{min-width:0;flex:1;border:1px solid #d8d5df;border-radius:6px;padding:8px;font-size:13px}.draw-web-search input:focus-visible{outline:2px solid #6965db}
+@media(max-width:600px){.draw-web-search>div{flex-direction:column}}
+.editor-shell label:has(>.default-sidebar-trigger),.excalidraw [data-testid="addToLibrary"]{display:none}
