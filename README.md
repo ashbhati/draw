@@ -76,14 +76,14 @@ When running from source, start `npm run dev` yourself in a trusted terminal. Ty
   "mcpServers": {
     "draw": {
       "command": "npm",
-      "args": ["--prefix", "/absolute/path/to/draw", "run", "mcp"],
+      "args": ["--silent", "--prefix", "/absolute/path/to/draw", "run", "mcp"],
       "env": { "DRAW_MCP_BASE_URL": "http://127.0.0.1:5173" }
     }
   }
 }
 ```
 
-Replace `/absolute/path/to/draw` with the root of the exact Draw checkout and revision serving the page; the MCP client inherits its own working directory, so plain `npm run mcp` can accidentally start a different, older Draw copy. Before entering a pairing secret, inspect the client's tool list (`tools/list` in MCP) and confirm it includes `pair_mcp_client`, `get_current_canvas`, `create_elements`, `list_workspaces`, `save_document`, and `export_image`. If any expected V2 tools are missing, correct `--prefix` and reconnect before pairing. The development bridge uses loopback HTTP and requires the Draw tab to remain open. Its localhost pairing surface is intended only for trusted local development, not as the production MCP transport.
+Replace `/absolute/path/to/draw` with the root of the exact Draw checkout and revision serving the page; the MCP client inherits its own working directory, so plain `npm run mcp` can accidentally start a different, older Draw copy. Record the checkout revision with `git -C /absolute/path/to/draw rev-parse HEAD`, and restart the Vite server and reconnect MCP after changing checkouts. Before entering a pairing secret, inspect the client's tool list (`tools/list` in MCP) and confirm it includes `pair_mcp_client`, `get_current_canvas`, `create_elements`, `list_workspaces`, `save_document`, and `export_image`. If any expected V2 tools are missing, correct `--prefix` and reconnect before pairing. The development bridge uses loopback HTTP and requires the Draw tab to remain open. Its localhost pairing surface is intended only for trusted local development, not as the production MCP transport.
 
 The bridge requires the paired capability on document reads, confirmations, and commands, and separately requires the active editor-tab secret for editor sync and acknowledgements. In the Vite development bridge, unpaired loopback traffic can invalidate a pending pairing secret or trigger a temporary pairing lockout. Use only trusted local MCP hosts while running the development server. The packaged runtime restricts MCP routes to its private Unix socket; same-OS-user processes remain trusted.
 
@@ -107,7 +107,7 @@ From a source checkout, use an explicit absolute repository path so the MCP host
   "mcpServers": {
     "draw": {
       "command": "npm",
-      "args": ["--prefix", "/absolute/path/to/draw", "run", "mcp"],
+      "args": ["--silent", "--prefix", "/absolute/path/to/draw", "run", "mcp"],
       "env": {
         "DRAW_MCP_BASE_URL": "http://127.0.0.1:5173",
         "DRAW_MCP_DOCUMENT_DIR": "/absolute/path/to/a/dedicated/draw-documents-folder"

@@ -161,7 +161,10 @@ export default function App() {
   const mcpClientsTrigger = useRef<HTMLButtonElement>(null);
   const mcpClientsClose = useRef<HTMLButtonElement>(null);
   const mcpClientsDialog = useRef<HTMLElement>(null);
+  const mcpPairingDialog = useRef<HTMLElement>(null);
+  const mcpPairingDeny = useRef<HTMLButtonElement>(null);
   const mcpManagementWasOpen = useRef(false);
+  const mcpPairingWasOpen = useRef(false);
   const closeMcpManagement = useCallback(() => {
     setMcpManagementOpen(false);
     setMcpPairingSecret("");
@@ -176,17 +179,30 @@ export default function App() {
     }
   }, [mcpManagementOpen]);
   useEffect(() => {
-    if (!mcpManagementOpen || mcpPairingRequest) return;
+    if (mcpPairingRequest) {
+      mcpPairingDeny.current?.focus();
+      mcpPairingWasOpen.current = true;
+    } else if (mcpPairingWasOpen.current) {
+      mcpPairingWasOpen.current = false;
+      if (mcpManagementOpen) mcpClientsClose.current?.focus();
+      else mcpClientsTrigger.current?.focus();
+    }
+  }, [mcpManagementOpen, mcpPairingRequest]);
+  useEffect(() => {
+    const dialog = mcpPairingRequest
+      ? mcpPairingDialog.current
+      : mcpManagementOpen
+        ? mcpClientsDialog.current
+        : null;
+    if (!dialog) return;
     const handleDialogKeys = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
-        closeMcpManagement();
+        if (!mcpPairingRequest) closeMcpManagement();
         return;
       }
       if (event.key !== "Tab") return;
-      const dialog = mcpClientsDialog.current;
-      if (!dialog) return;
       const focusable = Array.from(dialog.querySelectorAll<HTMLElement>('button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'));
       if (focusable.length === 0) { event.preventDefault(); event.stopPropagation(); return; }
       const first = focusable[0];
@@ -2103,14 +2119,14 @@ export default function App() {
       </section>
     </div>}
     {mcpPairingRequest && <div className="draw-confirmation-backdrop" role="presentation">
-      <section className="draw-confirmation" role="dialog" aria-modal="true" aria-labelledby="draw-mcp-pairing-title">
+      <section ref={mcpPairingDialog} className="draw-confirmation" role="dialog" aria-modal="true" aria-labelledby="draw-mcp-pairing-title">
         <h2 id="draw-mcp-pairing-title">Approve MCP client?</h2>
         <p><strong>{mcpPairingRequest.name}</strong> is requesting access to this Draw instance.</p>
         <p>Client fingerprint: <code>{mcpPairingRequest.fingerprint}</code></p>
         {mcpPairingRequest.replacesName && <p role="alert">Approving this host will revoke the existing paired client “{mcpPairingRequest.replacesName}” with the same fingerprint.</p>}
         <p className="draw-confirmation-expiry">Approve only if this matches the host you are pairing. The request expires in two minutes.</p>
         <div className="draw-confirmation-actions">
-          <button className="button button-quiet" onClick={() => void respondToMcpPairing(false)}>Deny</button>
+          <button ref={mcpPairingDeny} className="button button-quiet" onClick={() => void respondToMcpPairing(false)}>Deny</button>
           <button className="button button-primary" onClick={() => void respondToMcpPairing(true)}>Approve client</button>
         </div>
       </section>
