@@ -236,7 +236,9 @@ async function workspaceCount(page: Page) {
   return page.getByRole("combobox", { name: "Saved workspaces" }).locator("option").count();
 }
 async function selectWorkspace(page: Page, id: string) {
-  await page.getByRole("combobox", { name: "Saved workspaces" }).selectOption(id);
+  const picker = page.getByRole("combobox", { name: "Saved workspaces" });
+  await picker.focus();
+  await picker.selectOption(id);
 }
 
 async function countWarmImagePixels(page: Page, image: Buffer): Promise<number> {
