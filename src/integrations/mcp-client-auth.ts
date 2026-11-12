@@ -3,11 +3,9 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 
-const PAIRING_TTL_MS = 5 * 60_000;
-const CREDENTIAL_TTL_MS = 365 * 24 * 60 * 60_000;
-const LOCKOUT_MS = 15 * 60_000;
-const MAX_FAILED_ATTEMPTS = 5;
-const PAIRING_CODE_REISSUE_MS = 5_000;
+const PAIRING_REQUEST_TTL_MS = 2 * 60_000;
+const PAIRING_REQUEST_THROTTLE_MS = 5_000;
+const LEGACY_CREDENTIAL_TTL_MS = 365 * 24 * 60 * 60_000;
 
 export type PairedMcpClient = {
   clientIdentity: string;
@@ -15,7 +13,8 @@ export type PairedMcpClient = {
   fingerprint: string;
   secretHash: string;
   createdAt: number;
-  expiresAt: number;
+  expiresAt?: number;
+  persistentAccess?: true;
   revokedAt: number | null;
 };
 
@@ -38,12 +37,11 @@ export type McpPairingRequest = {
   replacesName?: string;
 };
 
-export type PairedMcpCredential = { clientIdentity: string; capability: string; expiresAt: number };
+export type PairedMcpCredential = { clientIdentity: string; capability: string; expiresAt?: number };
 export type McpPairingResolution = { credential: PairedMcpCredential; replacedClientIdentity?: string };
 
 export type McpClientAuthManager = {
-  issuePairingCode: () => Promise<string | null>;
-  beginPairing: (code: unknown, name: unknown, fingerprint: unknown) => Promise<McpPairingRequest>;
+  beginPairing: (name: unknown, fingerprint: unknown) => Promise<McpPairingRequest>;
   cancelPairing: (requestId: string) => Promise<boolean>;
   resolvePairing: (requestId: string, approved: boolean) => Promise<McpPairingResolution | null>;
   authenticate: (clientIdentity: unknown, capability: unknown) => boolean;
@@ -53,14 +51,27 @@ export type McpClientAuthManager = {
 
 export type McpClientAuthOptions = {
   now?: () => number;
-  generatePairingCode?: () => string;
   generateIdentity?: () => string;
   generateCapability?: () => string;
   generateRequestId?: () => string;
-  pairingCodeTtlMs?: number;
-  maxFailedAttempts?: number;
+  pairingRequestTtlMs?: number;
+  pairingRequestThrottleMs?: number;
   store?: McpClientAuthStore;
 };
+
+export class McpPairingRateLimitError extends Error {
+  constructor() {
+    super("Please wait a few seconds before requesting another MCP approval.");
+    this.name = "McpPairingRateLimitError";
+  }
+}
+
+export class McpPairingPendingError extends Error {
+  constructor() {
+    super("An MCP approval is already pending. Approve or deny it in Draw before requesting another.");
+    this.name = "McpPairingPendingError";
+  }
+}
 
 function emptyState(): McpClientAuthState {
   return { failedAttempts: 0, lockedUntil: 0, clients: [] };
@@ -74,7 +85,9 @@ function normalizeState(value: unknown): McpClientAuthState {
     if (typeof client !== "object" || client === null || typeof client.clientIdentity !== "string" ||
       typeof client.name !== "string" || typeof client.fingerprint !== "string" ||
       typeof client.secretHash !== "string" || !/^[a-f\d]{64}$/i.test(client.secretHash) || !Number.isFinite(client.createdAt) ||
-      !Number.isFinite(client.expiresAt) || (client.revokedAt !== null && !Number.isFinite(client.revokedAt))) {
+      (client.expiresAt !== undefined && !Number.isFinite(client.expiresAt)) ||
+      (client.persistentAccess !== undefined && client.persistentAccess !== true) ||
+      (client.revokedAt !== null && !Number.isFinite(client.revokedAt))) {
       throw new Error("MCP client credential store is invalid.");
     }
     return { ...client };
@@ -119,24 +132,57 @@ function constantTimeHexEqual(left: string, right: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+function activeClient(client: PairedMcpClient | undefined, currentTime: number): client is PairedMcpClient {
+  return Boolean(client && client.revokedAt === null && (client.persistentAccess === true || client.expiresAt === undefined || client.expiresAt > currentTime));
+}
+
 function genericPairingError(): Error {
-  return new Error("Pairing is unavailable. Check the code and retry from Draw.");
+  return new Error("Pairing is unavailable. Check that Draw is open and try again.");
 }
 
 export async function createMcpClientAuthManager(options: McpClientAuthOptions = {}): Promise<McpClientAuthManager> {
   const now = options.now ?? Date.now;
-  const makeCode = options.generatePairingCode ?? (() => randomBytes(32).toString("hex").toUpperCase());
   const makeIdentity = options.generateIdentity ?? (() => randomBytes(16).toString("hex"));
   const makeCapability = options.generateCapability ?? (() => randomBytes(32).toString("hex"));
   const makeRequestId = options.generateRequestId ?? (() => randomBytes(16).toString("hex"));
-  const pairingTtl = options.pairingCodeTtlMs ?? PAIRING_TTL_MS;
-  const maxFailedAttempts = options.maxFailedAttempts ?? MAX_FAILED_ATTEMPTS;
+  const pairingRequestTtl = options.pairingRequestTtlMs ?? PAIRING_REQUEST_TTL_MS;
+  const pairingRequestThrottle = options.pairingRequestThrottleMs ?? PAIRING_REQUEST_THROTTLE_MS;
   const store = options.store ?? createFileMcpClientAuthStore();
-  let state = normalizeState(await store.load());
-  let pairingCode: string | null = null;
-  let pairingExpiresAt = 0;
-  let lastPairingCodeIssuedAt: number | null = null;
+  const loadedState = normalizeState(await store.load());
+  const currentTime = now();
+  let migratedPersistentAccess = false;
+  let state: McpClientAuthState = {
+    failedAttempts: 0,
+    lockedUntil: 0,
+    clients: loadedState.clients.map((client) => {
+      const needsLegacyExpiry = client.expiresAt === undefined;
+      const needsPersistentMarker = client.revokedAt === null && client.persistentAccess !== true &&
+        (client.expiresAt === undefined || client.expiresAt > currentTime);
+      if (needsLegacyExpiry || needsPersistentMarker) {
+        migratedPersistentAccess = true;
+        return {
+          ...client,
+          // Keep a finite expiry for compatibility with older Draw releases.
+          // Current releases honor persistentAccess and ignore this fallback.
+          ...(needsLegacyExpiry ? { expiresAt: currentTime + LEGACY_CREDENTIAL_TTL_MS } : {}),
+          ...(needsPersistentMarker ? { persistentAccess: true as const } : {}),
+        };
+      }
+      return client;
+    }),
+  };
+  if (migratedPersistentAccess || loadedState.failedAttempts !== 0 || loadedState.lockedUntil !== 0) {
+    try {
+      await store.save(state);
+    } catch (error) {
+      console.warn(
+        `Draw could not persist MCP client ${migratedPersistentAccess ? "migration" : "legacy authentication cleanup"}. The normalized state remains available in memory; check that the credential store is writable.`,
+        error,
+      );
+    }
+  }
   let pending: McpPairingRequest | null = null;
+  let lastPairingDecisionAt: number | null = null;
   let queue = Promise.resolve();
 
   const serialize = <T>(action: () => Promise<T>): Promise<T> => {
@@ -146,62 +192,26 @@ export async function createMcpClientAuthManager(options: McpClientAuthOptions =
   };
 
   return {
-    issuePairingCode() {
+    beginPairing(name, fingerprint) {
       return serialize(async () => {
         const currentTime = now();
-        if (pending && pending.expiresAt <= currentTime) pending = null;
-        if (state.lockedUntil && currentTime >= state.lockedUntil) {
-          state = { ...state, failedAttempts: 0, lockedUntil: 0 };
-          await store.save(state);
+        if (pending && pending.expiresAt <= currentTime) {
+          pending = null;
+          lastPairingDecisionAt = currentTime;
         }
-        if (currentTime < state.lockedUntil || pending && pending.expiresAt > currentTime) return null;
-        if (lastPairingCodeIssuedAt !== null && currentTime - lastPairingCodeIssuedAt < PAIRING_CODE_REISSUE_MS) return null;
-        if (pairingCode && currentTime < pairingExpiresAt) {
-          lastPairingCodeIssuedAt = currentTime;
-          return pairingCode;
-        }
-        const candidate = makeCode();
-        if (!/^[A-F\d]{64}$/i.test(candidate)) return null;
-        pairingCode = candidate.toUpperCase();
-        pairingExpiresAt = currentTime + pairingTtl;
-        lastPairingCodeIssuedAt = currentTime;
-        return pairingCode;
-      });
-    },
-    beginPairing(code, name, fingerprint) {
-      return serialize(async () => {
-        const currentTime = now();
-        if (state.lockedUntil && currentTime >= state.lockedUntil) {
-          state = { ...state, failedAttempts: 0, lockedUntil: 0 };
-          await store.save(state);
-        }
-        if (pending && pending.expiresAt <= currentTime) pending = null;
-        if (currentTime < state.lockedUntil) throw genericPairingError();
         // A concurrent retry while a host is awaiting human approval must not
-        // consume the pending request, invalidate another code, or add strikes.
-        if (pending) throw genericPairingError();
-        const supplied = typeof code === "string" ? code.toUpperCase() : "";
-        const matches = pairingCode !== null && supplied.length === pairingCode.length && /^[A-F\d]{64}$/i.test(supplied) && constantTimeHexEqual(sha256(supplied), sha256(pairingCode));
+        // replace the pending request or trigger another confirmation dialog.
+        if (pending) throw new McpPairingPendingError();
         const validShape = typeof name === "string" && name.trim().length > 0 && name.trim().length <= 100 &&
           typeof fingerprint === "string" && /^[a-f\d]{64}$/i.test(fingerprint);
-        if (!matches || currentTime >= pairingExpiresAt || !validShape) {
-          if (!matches || !validShape || currentTime >= pairingExpiresAt) {
-            state = { ...state, failedAttempts: state.failedAttempts + 1 };
-            if (state.failedAttempts >= maxFailedAttempts) {
-              state = { ...state, failedAttempts: maxFailedAttempts, lockedUntil: currentTime + LOCKOUT_MS };
-            }
-            await store.save(state);
-          }
-          pairingCode = null;
-          pairingExpiresAt = 0;
-          throw genericPairingError();
+        if (!validShape) throw genericPairingError();
+        if (lastPairingDecisionAt !== null && currentTime - lastPairingDecisionAt < pairingRequestThrottle) {
+          throw new McpPairingRateLimitError();
         }
-        pairingCode = null;
-        pairingExpiresAt = 0;
-        const existing = state.clients.find((client) => client.fingerprint === fingerprint.toLowerCase() && client.revokedAt === null && client.expiresAt > currentTime);
+        const existing = state.clients.find((client) => client.fingerprint === fingerprint.toLowerCase() && activeClient(client, currentTime));
         pending = {
           requestId: makeRequestId(), name: name.trim(), fingerprint: fingerprint.toLowerCase(),
-          expiresAt: currentTime + 2 * 60_000,
+          expiresAt: currentTime + pairingRequestTtl,
           ...(existing ? { replacesName: existing.name } : {}),
         };
         return { ...pending };
@@ -211,42 +221,51 @@ export async function createMcpClientAuthManager(options: McpClientAuthOptions =
       return serialize(async () => {
         if (!pending || pending.requestId !== requestId) return false;
         pending = null;
+        lastPairingDecisionAt = now();
         return true;
       });
     },
     resolvePairing(requestId, approved) {
       return serialize(async () => {
         if (!pending || pending.requestId !== requestId || pending.expiresAt <= now()) {
-          if (pending?.requestId === requestId) pending = null;
+          if (pending?.requestId === requestId) {
+            pending = null;
+            lastPairingDecisionAt = now();
+          }
           throw genericPairingError();
         }
         const request = pending;
         pending = null;
-        if (!approved) return null;
+        const decisionTime = now();
+        lastPairingDecisionAt = decisionTime;
+        if (!approved) {
+          return null;
+        }
         const clientIdentity = makeIdentity();
         const capability = makeCapability();
         if (!/^[A-F\d]{64}$/i.test(capability) || state.clients.some((client) => client.clientIdentity === clientIdentity)) {
           throw new Error("Could not create a unique MCP client credential.");
         }
-        const expiresAt = now() + CREDENTIAL_TTL_MS;
-        const replacedClient = state.clients.find((client) => client.fingerprint === request.fingerprint && client.revokedAt === null && client.expiresAt > now());
-        state = {
+        const replacedClient = state.clients.find((client) => client.fingerprint === request.fingerprint && activeClient(client, now()));
+        const nextState = {
           ...state,
           failedAttempts: 0,
           lockedUntil: 0,
-          clients: [...state.clients.map((client) => client.fingerprint === request.fingerprint && client.revokedAt === null && client.expiresAt > now() ? { ...client, revokedAt: now() } : client), {
+          clients: [...state.clients.map((client) => client.fingerprint === request.fingerprint && activeClient(client, now()) ? { ...client, revokedAt: now() } : client), {
             clientIdentity,
             name: request.name,
             fingerprint: request.fingerprint,
             secretHash: sha256(capability),
-            createdAt: now(),
-            expiresAt,
+            createdAt: decisionTime,
+            expiresAt: decisionTime + LEGACY_CREDENTIAL_TTL_MS,
+            persistentAccess: true as const,
             revokedAt: null,
           }],
         };
-        await store.save(state);
+        await store.save(nextState);
+        state = nextState;
         return {
-          credential: { clientIdentity, capability, expiresAt },
+          credential: { clientIdentity, capability },
           ...(replacedClient ? { replacedClientIdentity: replacedClient.clientIdentity } : {}),
         };
       });
@@ -255,7 +274,7 @@ export async function createMcpClientAuthManager(options: McpClientAuthOptions =
       const identity = typeof clientIdentity === "string" ? clientIdentity : "";
       const supplied = typeof capability === "string" ? capability : "";
       const client = state.clients.find((entry) => entry.clientIdentity === identity);
-      const isActive = Boolean(client && client.revokedAt === null && client.expiresAt > now());
+      const isActive = activeClient(client, now());
       const expectedHash = isActive ? client!.secretHash : "0".repeat(64);
       const matches = constantTimeHexEqual(expectedHash, sha256(supplied));
       return isActive && matches;

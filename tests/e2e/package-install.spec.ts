@@ -19,13 +19,12 @@ async function unusedPort(): Promise<number> {
   return port;
 }
 
-async function startInstalledMcp(bin: string, runtimeDirectory: string, configHome: string, pairingSecret: string, cwd: string) {
+async function startInstalledMcp(bin: string, runtimeDirectory: string, configHome: string, cwd: string) {
   const child = spawn(process.execPath, [bin, "mcp"], {
     cwd,
     env: {
       ...process.env,
       DRAW_RUNTIME_DIR: runtimeDirectory,
-      DRAW_MCP_PAIRING_SECRET: pairingSecret,
       DRAW_MCP_CLIENT_NAME: "Installed package Chrome E2E",
       DRAW_MCP_DOCUMENT_DIR: join(configHome, "documents"),
       XDG_CONFIG_HOME: configHome,
@@ -134,10 +133,7 @@ test("installed npm package serves the production app and MCP edits it over loca
     await page.getByLabel("Launch code").fill(code);
     await page.getByRole("button", { name: "Connect", exact: true }).click();
     await expect(page.getByRole("button", { name: "MCP connected" })).toBeVisible();
-    await page.getByRole("button", { name: "MCP clients" }).click();
-    const pairingSecret = await page.locator(".mcp-pairing-secret code").innerText();
-    expect(pairingSecret).toMatch(/^[a-f\d]{64}$/i);
-    mcp = await startInstalledMcp(bin, join(root, "run"), configHome, pairingSecret, neutralCwd);
+    mcp = await startInstalledMcp(bin, join(root, "run"), configHome, neutralCwd);
     const pairing = mcp.tool("pair_mcp_client", {});
     await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
     await page.getByRole("button", { name: "Approve client" }).click();
@@ -156,6 +152,12 @@ test("installed npm package serves the production app and MCP edits it over loca
     expect(changed.result.isError).not.toBe(true);
     const verified = JSON.parse((await mcp.tool("get_current_canvas", {})).result.content[0].text);
     expect(JSON.stringify(verified)).toContain("Created by installed Draw CLI");
+
+    await mcp.close();
+    mcp = await startInstalledMcp(bin, join(root, "run"), configHome, neutralCwd);
+    const afterHostRestart = JSON.parse((await mcp.tool("get_current_canvas", {})).result.content[0].text);
+    expect(afterHostRestart.documentId).toBe(current.documentId);
+    expect(JSON.stringify(afterHostRestart)).toContain("Created by installed Draw CLI");
 
     runtimeProcess.kill("SIGTERM");
     await new Promise<void>((resolve) => {

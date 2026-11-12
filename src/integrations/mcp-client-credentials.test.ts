@@ -20,6 +20,22 @@ describe("local MCP host credentials", () => {
     }
   });
 
+  it("continues to read a legacy host credential after its local one-year deadline", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "draw-mcp-host-legacy-expiry-"));
+    const path = join(directory, "client.json");
+    try {
+      await writeLocalMcpCredential({
+        installationId: "legacy-host",
+        clientIdentity: "paired-id",
+        capability: "9".repeat(64),
+        expiresAt: Date.now() - 1,
+      }, path);
+      expect(await readLocalMcpCredential(path)).toMatchObject({ clientIdentity: "paired-id", capability: "9".repeat(64) });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("fails closed on malformed stored credentials", async () => {
     const directory = await mkdtemp(join(tmpdir(), "draw-mcp-host-invalid-"));
     const path = join(directory, "client.json");

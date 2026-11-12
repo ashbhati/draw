@@ -32,7 +32,7 @@ function createBridgeHarness(options: DrawMcpBridgeOptions = {}, config: { mode?
     store: { load: async () => ({ ...authState }), save: async (state: { failedAttempts: number; lockedUntil: number }) => { authState = { ...state }; } },
   } };
   const bridgePlugin = createDrawMcpPlugin({ ...options, ...injectedAuth, mcpClientAuthForTests: options.mcpClientAuthForTests ?? {
-    generatePairingCode: () => "a".repeat(64), generateIdentity: () => "paired-client", generateCapability: () => "b".repeat(64), generateRequestId: () => "pair-request-1",
+    generateIdentity: () => "paired-client", generateCapability: () => "b".repeat(64), generateRequestId: () => "pair-request-1",
     store: { load: async () => structuredClone(mcpState), save: async (state: typeof mcpState) => { mcpState = structuredClone(state); } },
   } });
   const server = {
@@ -150,22 +150,27 @@ describe("Draw MCP Vite bridge", () => {
   it("pairs only after approval by the active authenticated editor and keeps revocation separate from the editor lease", async () => {
     const bridge = createBridgeHarness();
     expect((await bridge.registerClient("pairing-tab")).response.status).toBe(200);
-    const secretResponse = await bridge.editorRequest("pairing-tab", "POST", "/__draw/api/mcp/pairing-secret", {});
-    expect(secretResponse.status).toBe(200);
     const pairing = bridge.request("POST", "/__draw/api/mcp/pair", {
-      pairingSecret: secretResponse.body.pairingSecret,
       clientName: "Claude Code",
       fingerprint: "9".repeat(64),
     }, "127.0.0.1", {}, false);
     await new Promise((resolve) => setImmediate(resolve));
     const requestEvent = bridge.events.find((event) => event.event === "draw:mcp-pairing-required");
     expect(requestEvent?.data).toMatchObject({ clientId: "pairing-tab", name: "Claude Code", fingerprint: "9".repeat(64) });
+    const duplicatePairing = await bridge.request("POST", "/__draw/api/mcp/pair", {
+      clientName: "Other host", fingerprint: "8".repeat(64),
+    }, "127.0.0.1", {}, false);
+    expect(duplicatePairing.status).toBe(409);
+    expect(duplicatePairing.body.error).toMatch(/approval.*already pending/i);
     expect((await bridge.request("POST", `/__draw/api/mcp/pairings/${requestEvent!.data.requestId}/respond`, { clientId: "pairing-tab", approved: true }, "127.0.0.1", {}, false)).status).toBe(401);
     expect((await bridge.editorRequest("pairing-tab", "POST", `/__draw/api/mcp/pairings/${requestEvent!.data.requestId}/respond`, { clientId: "pairing-tab", approved: true })).body.status).toBe("APPROVED");
     const paired = await pairing;
     expect(paired.status).toBe(200);
     expect(paired.body.clientIdentity).toBe("paired-client");
     expect(paired.body.capability).toBe("b".repeat(64));
+    expect((await bridge.request("POST", "/__draw/api/mcp/pair", {
+      clientName: "Too soon", fingerprint: "7".repeat(64),
+    }, "127.0.0.1", {}, false)).status).toBe(429);
     expect((await bridge.request("GET", "/__draw/api/document", undefined, "127.0.0.1", {
       "x-draw-client-identity": paired.body.clientIdentity, authorization: `Bearer ${paired.body.capability}`,
     })).status).toBe(404);
@@ -177,16 +182,50 @@ describe("Draw MCP Vite bridge", () => {
     expect((await bridge.editorRequest("pairing-tab", "PUT", "/__draw/api/document", { clientId: "pairing-tab", document: createEmptyDocument("Editor remains connected") })).status).toBe(200);
   });
 
-  it("does not consume a pairing code when no editor is connected", async () => {
+  it("finishes the host request promptly when saving an approved pairing fails", async () => {
+    const bridge = createBridgeHarness({
+      mcpClientAuthForTests: {
+        generateIdentity: () => "unsaved-client",
+        generateCapability: () => "c".repeat(64),
+        store: {
+          load: async () => ({ failedAttempts: 0, lockedUntil: 0, clients: [] }),
+          save: async () => { throw new Error("credential store is read-only"); },
+        },
+      },
+    });
+    await bridge.registerClient("storage-error-tab");
+    const hostPairing = bridge.request("POST", "/__draw/api/mcp/pair", {
+      clientName: "Storage error host", fingerprint: "d".repeat(64),
+    }, "127.0.0.1", {}, false);
+    await new Promise((resolve) => setImmediate(resolve));
+    const pairingEvent = bridge.events.find((event) => event.event === "draw:mcp-pairing-required");
+    if (!pairingEvent) throw new Error("The pairing prompt was not emitted.");
+
+    const editorResponse = await bridge.editorRequest("storage-error-tab", "POST", `/__draw/api/mcp/pairings/${pairingEvent.data.requestId}/respond`, {
+      clientId: "storage-error-tab", approved: true,
+    });
+    expect(editorResponse.status).toBe(500);
+    expect(editorResponse.body.error).toMatch(/could not save|persist/i);
+    await expect(hostPairing).resolves.toMatchObject({ status: 410, body: { error: expect.stringMatching(/denied|expired/i) } });
+  });
+
+  it("requires the editor connection before a host can request approval", async () => {
     const bridge = createBridgeHarness();
     const unavailable = await bridge.request("POST", "/__draw/api/mcp/pair", {
-      pairingSecret: "a".repeat(64), clientName: "MCP host", fingerprint: "9".repeat(64),
+      clientName: "MCP host", fingerprint: "9".repeat(64),
     }, "127.0.0.1", {}, false);
     expect(unavailable.status).toBe(409);
     expect((await bridge.registerClient("connected-tab")).response.status).toBe(200);
-    const code = await bridge.editorRequest("connected-tab", "POST", "/__draw/api/mcp/pairing-secret", {});
-    expect(code.status).toBe(200);
-    expect(code.body.pairingSecret).toMatch(/^[a-f\d]{64}$/i);
+    const pairing = bridge.request("POST", "/__draw/api/mcp/pair", {
+      clientName: "MCP host", fingerprint: "9".repeat(64),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const requestEvent = bridge.events.find((event) => event.event === "draw:mcp-pairing-required");
+    expect(requestEvent?.data).toMatchObject({ clientId: "connected-tab", name: "MCP host" });
+    await bridge.editorRequest("connected-tab", "POST", `/__draw/api/mcp/pairings/${requestEvent!.data.requestId}/respond`, {
+      clientId: "connected-tab", approved: false,
+    });
+    expect((await pairing).status).toBe(410);
   });
 
   it("binds pending commands and flushes to the authenticated MCP identity and cancels them on revocation", async () => {
@@ -247,9 +286,8 @@ describe("Draw MCP Vite bridge", () => {
     });
     expect(confirmation.status).toBe(202);
 
-    const pairingSecret = await bridge.editorRequest("editor-tab", "POST", "/__draw/api/mcp/pairing-secret", {});
     const replacementPairing = bridge.request("POST", "/__draw/api/mcp/pair", {
-      pairingSecret: pairingSecret.body.pairingSecret, clientName: "Replacement host", fingerprint: "a".repeat(64),
+      clientName: "Replacement host", fingerprint: "a".repeat(64),
     }, "127.0.0.1", {}, false);
     await new Promise((resolve) => setImmediate(resolve));
     const pairingEvent = bridge.events.filter(({ event }) => event === "draw:mcp-pairing-required").slice(-1)[0]?.data;

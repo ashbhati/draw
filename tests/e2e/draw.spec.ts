@@ -17,10 +17,13 @@ function mcpAuthHeaders() {
   return { "x-draw-client-identity": clientIdentity, authorization: `Bearer ${capability}` };
 }
 
-async function startStdioMcp(baseURL: string, documentDir: string, pairingSecret?: string, mockOpenverse = false, launchCwd?: string) {
+async function startStdioMcp(baseURL: string, documentDir: string, pairFresh = false, mockOpenverse = false, launchCwd?: string) {
   const credentialPath = join(documentDir, "mcp-client-credential.json");
-  if (!pairingSecret) {
-    await writeFile(credentialPath, JSON.stringify({ installationId: "draw-e2e-mcp-host", clientIdentity: process.env.DRAW_E2E_MCP_CLIENT_ID, capability: process.env.DRAW_E2E_MCP_CLIENT_SECRET, expiresAt: Date.now() + 60 * 60_000 }), { mode: 0o600 });
+  if (!pairFresh) {
+    // Simulate a credential file from the old one-year grant format. Draw
+    // migrates its matching active server record; the host trusts Draw's
+    // current authorization state rather than enforcing this stale deadline.
+    await writeFile(credentialPath, JSON.stringify({ installationId: "draw-e2e-mcp-host", clientIdentity: process.env.DRAW_E2E_MCP_CLIENT_ID, capability: process.env.DRAW_E2E_MCP_CLIENT_SECRET, expiresAt: Date.now() - 1 }), { mode: 0o600 });
     await chmod(credentialPath, 0o600);
   }
   if (launchCwd && mockOpenverse) throw new Error("The npm-prefix MCP launch does not use the Openverse test preloader.");
@@ -39,7 +42,7 @@ async function startStdioMcp(baseURL: string, documentDir: string, pairingSecret
   }
   const child = spawn(launchCommand, args, {
     cwd: launchCwd ?? process.cwd(),
-    env: { ...process.env, DRAW_MCP_BASE_URL: new URL(baseURL).origin, DRAW_MCP_DOCUMENT_DIR: documentDir, DRAW_MCP_CLIENT_CREDENTIAL_PATH: credentialPath, ...(pairingSecret ? { DRAW_MCP_PAIRING_SECRET: pairingSecret } : {}) },
+    env: { ...process.env, DRAW_MCP_BASE_URL: new URL(baseURL).origin, DRAW_MCP_DOCUMENT_DIR: documentDir, DRAW_MCP_CLIENT_CREDENTIAL_PATH: credentialPath },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let output = "";
@@ -1881,7 +1884,7 @@ test("stdio MCP searches Openverse, inserts by provider ID, and saves a reopenab
   if (!baseURL) throw new Error("Playwright baseURL is required for the MCP image insertion test.");
   const current = await freshBridgeDocument(page);
   const documentDir = await mkdtemp(join(tmpdir(), "draw-openverse-mcp-"));
-  const mcp = await startStdioMcp(baseURL, documentDir, undefined, true);
+  const mcp = await startStdioMcp(baseURL, documentDir, false, true);
   try {
     const available = await mcp.request("tools/list", {});
     const toolNames = available.result.tools.map((tool: any) => tool.name);
@@ -2114,7 +2117,7 @@ test("selection-only export reports an empty selection when the image format cha
   expect(await unexpectedDownload).toBe(false);
 });
 
-test("a human pairs an MCP host, the secret stays out of tool output, and revocation blocks it", async ({ page, baseURL }) => {
+test("a human approves an MCP host once, its access persists, and revocation blocks it", async ({ page, baseURL }) => {
   if (!baseURL) throw new Error("Playwright baseURL is required for the MCP pairing test.");
   const directory = await mkdtemp(join(tmpdir(), "draw-mcp-pairing-e2e-"));
   const secondDirectory = await mkdtemp(join(tmpdir(), "draw-mcp-pairing-second-e2e-"));
@@ -2124,14 +2127,15 @@ test("a human pairs an MCP host, the secret stays out of tool output, and revoca
   await connectEditorToMcp(page);
   await expect(page.getByRole("button", { name: "MCP clients" })).toBeVisible();
   await page.getByRole("button", { name: "MCP clients" }).click();
-  const pairingSecret = await page.locator(".mcp-pairing-secret code").innerText();
-  expect(pairingSecret).toMatch(/^[a-f\d]{64}$/i);
-  const mcp = await startStdioMcp(baseURL, directory, pairingSecret);
+  const mcp = await startStdioMcp(baseURL, directory, true);
   try {
     const discovery = await mcp.request("tools/list", {});
     expect(discovery.result.tools.map((tool: { name: string }) => tool.name)).toContain("pair_mcp_client");
     const pairing = mcp.call("pair_mcp_client", {});
     await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
+    const pairingDialog = page.locator("section[aria-labelledby='draw-mcp-pairing-title']");
+    await expect(pairingDialog.locator(".draw-mcp-pairing-warning")).toContainText("Unverified local process");
+    await expect(pairingDialog.locator(".draw-mcp-pairing-warning")).toContainText("name can be spoofed");
     const denyButton = page.getByRole("button", { name: "Deny", exact: true });
     const approveButton = page.getByRole("button", { name: "Approve client", exact: true });
     await expect(denyButton).toBeFocused();
@@ -2144,30 +2148,30 @@ test("a human pairs an MCP host, the secret stays out of tool output, and revoca
     await expect(denyButton).toBeFocused();
     await page.keyboard.press("Escape");
     await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
-    const visibleFingerprint = await page.locator("section[aria-labelledby='draw-mcp-pairing-title'] code").innerText();
+    const visibleFingerprint = await pairingDialog.locator(".draw-mcp-pairing-fingerprint code").innerText();
     expect(visibleFingerprint).toMatch(/^[a-f\d]{64}$/i);
     await approveButton.click();
     const paired = await pairing;
     await expect(page.getByRole("dialog", { name: "MCP clients" }).getByRole("button", { name: "Close MCP clients" })).toBeFocused();
     expect(paired.result.isError).not.toBe(true);
     const publicResult = JSON.parse(paired.result.content[0].text);
-    expect(publicResult).toMatchObject({ paired: true, fingerprint: visibleFingerprint });
-    expect(paired.result.content[0].text).not.toContain(pairingSecret);
+    expect(publicResult).toMatchObject({ paired: true, access: "active_until_revoked", fingerprint: visibleFingerprint });
     const credential = JSON.parse(await readFile(mcp.credentialPath, "utf8"));
     expect(credential.capability).toMatch(/^[a-f\d]{64}$/i);
     expect(credential.clientIdentity).toBe(publicResult.clientIdentity);
+    expect(credential).not.toHaveProperty("expiresAt");
     expect((await stat(mcp.credentialPath)).mode & 0o777).toBe(0o600);
     expect(paired.result.content[0].text).not.toContain(credential.capability);
     expect((await mcp.call("get_current_canvas", {})).result.isError).not.toBe(true);
 
     const clientRow = page.locator(".mcp-client-row").filter({ hasText: publicResult.clientIdentity });
     await expect(clientRow).toBeVisible();
+    await expect(clientRow).toContainText("active · revoke anytime");
     await page.getByRole("button", { name: "Close", exact: true }).click();
-    // Pairing-secret requests are intentionally rate-limited to one per five seconds.
+    // Approval requests are rate-limited so a local process cannot flood the owner.
     await page.waitForTimeout(5_000);
     await page.getByRole("button", { name: "MCP clients" }).click();
-    const replacementSecret = await page.locator(".mcp-pairing-secret code").innerText();
-    const sameHostMcp = await startStdioMcp(baseURL, directory, replacementSecret);
+    const sameHostMcp = await startStdioMcp(baseURL, directory, true);
     replacementMcp = sameHostMcp;
     const replacementPairing = sameHostMcp.call("pair_mcp_client", {});
     await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
@@ -2182,8 +2186,7 @@ test("a human pairs an MCP host, the secret stays out of tool output, and revoca
     await page.getByRole("button", { name: "Close", exact: true }).click();
     await page.waitForTimeout(5_000);
     await page.getByRole("button", { name: "MCP clients" }).click();
-    const secondPairingSecret = await page.locator(".mcp-pairing-secret code").innerText();
-    const mcp2 = await startStdioMcp(baseURL, secondDirectory, secondPairingSecret);
+    const mcp2 = await startStdioMcp(baseURL, secondDirectory, true);
     secondMcp = mcp2;
     const secondPairing = mcp2.call("pair_mcp_client", {});
     await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
@@ -2229,10 +2232,10 @@ test("revoking an MCP client cancels its pending command without overwriting a l
   try {
     await page.goto("/");
     await connectEditorToMcp(page);
-    await page.waitForTimeout(5_000);
     await page.getByRole("button", { name: "MCP clients" }).click();
-    const pairingSecret = await page.locator(".mcp-pairing-secret code").innerText();
-    mcp = await startStdioMcp(baseURL, directory, pairingSecret);
+    mcp = await startStdioMcp(baseURL, directory, true);
+    // A prior successful pairing may have completed in the shared Vite worker.
+    await page.waitForTimeout(5_000);
     const pairing = mcp.call("pair_mcp_client", {});
     await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
     await page.getByRole("button", { name: "Approve client" }).click();
@@ -2323,10 +2326,8 @@ test("revocation rolls back in place and retains the selected human scene and un
     page.on("request", (request) => {
       if (request.url().endsWith("/__draw/api/mcp/clients")) editorSecret = request.headers()["x-draw-editor-secret"] ?? editorSecret;
     });
-    await page.waitForTimeout(5_000);
     await page.getByRole("button", { name: "MCP clients" }).click();
-    const pairingSecret = await page.locator(".mcp-pairing-secret code").innerText();
-    mcp = await startStdioMcp(baseURL, directory, pairingSecret);
+    mcp = await startStdioMcp(baseURL, directory, true);
     const pairing = mcp.call("pair_mcp_client", {});
     await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
     await page.getByRole("button", { name: "Approve client" }).click();
@@ -2597,7 +2598,7 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
   if (!baseURL) throw new Error("Playwright baseURL is required for the MCP integration test.");
   const directory = await mkdtemp(join(tmpdir(), "draw-mcp-e2e-"));
   const launchCwd = await mkdtemp(join(tmpdir(), "draw-mcp-other-cwd-"));
-  const mcp = await startStdioMcp(baseURL, directory, undefined, false, launchCwd);
+  const mcp = await startStdioMcp(baseURL, directory, false, false, launchCwd);
   try {
     await page.locator(".excalidraw canvas").first().waitFor();
     await expect.poll(async () => (await (await page.request.get("/__draw/api/health")).json())).toMatchObject({ ok: true });
@@ -2794,6 +2795,17 @@ test("real stdio MCP tools create, edit, undo, save, reopen, export, and reject 
 test("workspace combobox and action controls share sizing and keyboard focus", async ({ page }) => {
   const picker = page.getByRole("combobox", { name: "Saved workspaces" });
   await expect(picker.locator("option:checked")).toHaveText("My workspace");
+  const exportScope = page.getByRole("combobox", { name: "Export scope" });
+  const exportFormat = page.getByRole("combobox", { name: "Image export format" });
+  expect((await exportScope.boundingBox())?.width).toBeGreaterThanOrEqual(140);
+  expect((await exportFormat.boundingBox())?.width).toBeGreaterThanOrEqual(84);
+  for (const dropdown of [picker, exportScope, exportFormat]) {
+    await expect(dropdown).toHaveClass(/toolbar-select/);
+    const dropdownStyle = await dropdown.evaluate((element) => getComputedStyle(element));
+    expect(dropdownStyle.appearance).toBe("none");
+    expect(Number.parseFloat(dropdownStyle.paddingRight)).toBeGreaterThanOrEqual(28);
+    expect(dropdownStyle.backgroundImage).not.toBe("none");
+  }
   await picker.focus();
   await page.keyboard.press("Tab");
   await expect(page.getByRole("button", { name: "New workspace" })).toBeFocused();
@@ -2801,6 +2813,18 @@ test("workspace combobox and action controls share sizing and keyboard focus", a
     const button = page.getByRole("button", { name, exact: true });
     expect((await button.boundingBox())?.height).toBe(32);
     await expect(button.locator("svg")).toHaveCount(1);
+  }
+  const connectButton = page.locator(".mcp-toolbar-button").first();
+  const connectionLabel = await connectButton.getAttribute("aria-label");
+  expect(["Connect MCP", "MCP connected"]).toContain(connectionLabel);
+  await expect(connectButton).toHaveAttribute("title", connectionLabel === "MCP connected" ? "Editor connected to the local MCP bridge" : "Connect this editor to the local MCP bridge");
+  await expect(connectButton.locator("svg")).toHaveCount(1);
+  expect((await connectButton.innerText()).trim()).toBe("");
+  for (const [name, title] of [["MCP clients", "Manage connected MCP clients"]]) {
+    const button = page.getByRole("button", { name, exact: true });
+    await expect(button).toHaveAttribute("title", title);
+    await expect(button.locator("svg")).toHaveCount(1);
+    expect((await button.innerText()).trim()).toBe("");
   }
 });
 
@@ -3305,19 +3329,17 @@ test("MCP clients dialog keeps keyboard focus, scroll state, and canvas selectio
 
     const trigger = page.getByRole("button", { name: "MCP clients", exact: true });
     let clientsRequests = 0;
-    let pairingSecretRequests = 0;
     page.on("request", (request) => {
       if (request.url().endsWith("/__draw/api/mcp/clients")) clientsRequests += 1;
-      if (request.url().endsWith("/__draw/api/mcp/pairing-secret")) pairingSecretRequests += 1;
     });
     await trigger.evaluate((button) => { button.click(); button.click(); });
 
     const dialog = page.getByRole("dialog", { name: "MCP clients" });
     await expect(dialog).toBeVisible();
     expect(clientsRequests).toBe(1);
-    expect(pairingSecretRequests).toBe(1);
-    const secret = dialog.locator(".mcp-pairing-secret");
-    await expect(secret).toBeVisible();
+    await expect(dialog).toContainText("Agents using the same Draw connection share its access");
+    await expect(dialog).toContainText("pair_mcp_client");
+    await expect(dialog).toContainText("The host name is supplied by the local process and is not verified");
     const closeButton = dialog.getByRole("button", { name: "Close MCP clients" });
     await expect(closeButton).toBeVisible();
     await expect(closeButton).toBeFocused();
@@ -3326,7 +3348,6 @@ test("MCP clients dialog keeps keyboard focus, scroll state, and canvas selectio
     await expect(closeButton).toBeFocused();
     await page.mouse.click(850, 10);
     await expect(dialog).toBeVisible();
-    await expect(secret).toBeVisible();
 
     await dialog.evaluate((element) => {
       const filler = document.createElement("div");
@@ -3372,7 +3393,6 @@ test("MCP clients dialog keeps keyboard focus, scroll state, and canvas selectio
     await closeButton.click();
     await expect(dialog).toBeHidden();
     await expect(trigger).toBeFocused();
-    await expect(secret).toHaveCount(0);
 
     await trigger.click();
     await expect(dialog).toBeVisible();

@@ -39,8 +39,7 @@ The library UI has been removed. Existing library data and legacy MCP library to
 ## Connect an MCP client
 
 1. Start Draw with `draw start` and keep that terminal open. The terminal shows a random, one-use editor launch code. Type it into Draw's **Connect MCP** dialog. The code expires after one minute and is never returned over HTTP or included in a URL.
-2. In Draw, open **MCP clients** and copy the one-time pairing secret into your MCP client's protected environment configuration as `DRAW_MCP_PAIRING_SECRET`.
-3. Configure the MCP client to run Draw's packaged MCP host:
+2. Configure your MCP host to run Draw's packaged MCP server. No pairing secret or credential needs to be added to its configuration:
 
 ```json
 {
@@ -50,18 +49,18 @@ The library UI has been removed. Existing library data and legacy MCP library to
       "args": ["mcp"],
       "env": {
         "DRAW_MCP_DOCUMENT_DIR": "/absolute/path/to/a/dedicated/draw-documents-folder",
-        "DRAW_MCP_PAIRING_SECRET": "paste-the-one-time-secret-here"
+        "DRAW_MCP_CLIENT_NAME": "Herdr Draw"
       }
     }
   }
 }
 ```
 
-4. Ask the agent to call `pair_mcp_client`. Draw displays the host name and fingerprint and waits for your approval. The tool takes no secret argument. After approval, remove `DRAW_MCP_PAIRING_SECRET` from the host configuration. The MCP host stores its capability in `~/.config/draw/mcp-client-credential.json` with mode `0600`; set `DRAW_MCP_CLIENT_CREDENTIAL_PATH` to another absolute, user-owned path if desired. Set `DRAW_MCP_CLIENT_NAME` to label the host.
+3. Ask the agent to call `pair_mcp_client`. Draw displays the claimed host name and fingerprint for your approval. The name is supplied by the local process and is not verified; approve only a request you initiated and whose fingerprint you can verify on the host. After approval, the MCP host stores its capability in `~/.config/draw/mcp-client-credential.json` with mode `0600`; it remains authorized until you revoke it in Draw's **MCP clients** dialog. Set `DRAW_MCP_CLIENT_CREDENTIAL_PATH` to another absolute, user-owned path if desired.
 
 The app and MCP host communicate through a Unix domain socket in a per-user directory (mode `0700`; socket mode `0600`). On macOS it is under `~/Library/Application Support/Draw/run`; on Linux it is under `$XDG_RUNTIME_DIR/draw` or `~/.local/run/draw`. The MCP API is not exposed over loopback HTTP. This protects against other OS accounts and unauthenticated loopback clients. Processes running as the same OS user are inside Draw's trust boundary; do not run untrusted MCP hosts as your account. Keep Draw running with the document open while the agent works. Agent edits target the active document in the authenticated editor tab, so you can immediately inspect and continue editing them.
 
-Pairing secrets expire and are consumed once. Secret issuance is throttled to once every five seconds. Revoking a host in Draw blocks its future requests and cancels its pending bridge work. The MCP client's stored capability is separate from the editor launch code and pairing secret.
+An MCP host is the configured connection in an MCP app such as Herdr, not an individual Codex or Claude conversation. Agents using the same configured host share its Draw access. Draw asks for approval once per host; its credential survives MCP host and Draw restarts and remains active until revoked. Revoking a host in Draw blocks its future requests and cancels its pending bridge work. Draw itself must be running, and its editor tab connected, while an agent works. The editor launch code authenticates that tab and is separate from the host's persistent authorization.
 
 To upgrade, run `npm install --global @ashbhati/draw@latest`. To uninstall, run `npm uninstall --global @ashbhati/draw`. Your `.draw` files and local browser autosave are not removed by uninstalling the package.
 
@@ -83,9 +82,9 @@ When running from source, start `npm run dev` yourself in a trusted terminal. Ty
 }
 ```
 
-Replace `/absolute/path/to/draw` with the root of the exact Draw checkout and revision serving the page; the MCP client inherits its own working directory, so plain `npm run mcp` can accidentally start a different, older Draw copy. If Vite uses a loopback port other than `5173`, set `DRAW_MCP_BASE_URL` to that server's actual origin. Record the checkout revision with `git -C /absolute/path/to/draw rev-parse HEAD`, and restart the Vite server and reconnect MCP after changing checkouts. Before entering a pairing secret, inspect the client's tool list (`tools/list` in MCP) and confirm it includes `pair_mcp_client`, `get_current_canvas`, `create_elements`, `list_workspaces`, `save_document`, and `export_image`. If any expected V2 tools are missing, correct `--prefix` and reconnect before pairing. The development bridge uses loopback HTTP and requires the Draw tab to remain open. Its localhost pairing surface is intended only for trusted local development, not as the production MCP transport.
+Replace `/absolute/path/to/draw` with the root of the exact Draw checkout and revision serving the page; the MCP client inherits its own working directory, so plain `npm run mcp` can accidentally start a different, older Draw copy. If Vite uses a loopback port other than `5173`, set `DRAW_MCP_BASE_URL` to that server's actual origin. Record the checkout revision with `git -C /absolute/path/to/draw rev-parse HEAD`, and restart the Vite server and reconnect MCP after changing checkouts. Before pairing, inspect the client's tool list (`tools/list` in MCP) and confirm it includes `pair_mcp_client`, `get_current_canvas`, `create_elements`, `list_workspaces`, `save_document`, and `export_image`. If any expected V2 tools are missing, correct `--prefix` and reconnect before pairing. The development bridge uses loopback HTTP and requires the Draw tab to remain open. Its localhost pairing surface is intended only for trusted local development, not as the production MCP transport.
 
-The bridge requires the paired capability on document reads, confirmations, and commands, and separately requires the active editor-tab secret for editor sync and acknowledgements. In the Vite development bridge, unpaired loopback traffic can invalidate a pending pairing secret or trigger a temporary pairing lockout. Use only trusted local MCP hosts while running the development server. The packaged runtime restricts MCP routes to its private Unix socket; same-OS-user processes remain trusted.
+The bridge requires the paired capability on document reads, confirmations, and commands, and separately requires the active editor-tab secret for editor sync and acknowledgements. In the Vite development bridge, any local process that can reach the loopback route can request an approval prompt. The prompt does not authenticate the process: its name can be spoofed, so approval is only as trustworthy as your judgment that you initiated the pairing and verified the displayed fingerprint. Use only trusted local MCP hosts while running the development server. The packaged runtime restricts MCP routes to its private Unix socket; same-OS-user processes remain trusted.
 
 ## Verify
 
@@ -137,7 +136,7 @@ Available tools:
 - `create_workspace`, `rename_workspace`, `select_workspace`, `create_canvas`, `rename_canvas`, `duplicate_canvas`, and `select_canvas`: manage project organization and editable boards. For compatibility with earlier MCP clients, `create_canvas` and `duplicate_canvas` create a new workspace containing one board; the result reports the actual workspace and canvas IDs. `rename_canvas` renames the board and its document title; `select_canvas` selects its owning workspace. Every mutation takes the latest `expectedCatalogRevision` and a stable `idempotencyKey`; retry an identical intent with the same key.
 - `import_draw_file_as_canvas`: validate a `.draw` file from `DRAW_MCP_DOCUMENT_DIR` and create a new workspace with one board and an independent document ID. The existing workspace and source file remain intact.
 - `delete_canvas` is unsupported because a board is the whole contents of a workspace. Use `delete_workspace` instead; its one-time confirmation covers the board, workspace library, and local history. A denial, stale request, or expired token leaves saved data intact.
-- `pair_mcp_client`: pair the local MCP host after the human copies Draw's one-time secret into protected host configuration. The tool accepts no pairing code and does not return the capability to the model.
+- `pair_mcp_client`: request a visible approval in Draw for this MCP host. After approval, the host stores its credential locally. The tool does not return the capability to the model.
 - `list_workspace_library` and `read_workspace_library_item`: inspect workspace library items and their current `libraryRevision`.
 - `add_selection_to_workspace_library`, `rename_workspace_library_item`, and `delete_workspace_library_item`: mutate library items using `expectedLibraryRevision` and `idempotencyKey`. Same-key/same-payload retries return the stored result; a changed payload conflicts. Delete requires one-use owner approval in Draw, and an approved retry returns its stored result.
 - `insert_workspace_library_item`: insert a fresh editable copy using the document revision and idempotency key.

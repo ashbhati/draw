@@ -8,7 +8,6 @@ import { loadDrawFileSnapshot, writeNewArtifact } from "./mcp-file-access";
 import { assertInlineArtifactSize } from "./mcp-result-limits";
 import { shouldRequireOpenConfirmation } from "../document/open-safety";
 import { serializeDrawFile } from "../document/document";
-import { readConfiguredPairingSecret } from "./mcp-pairing-config";
 import { requestDrawIpc } from "../runtime/ipc-client";
 import { drawStartRequiredError } from "./mcp-transport-error";
 import { fetchOpenverseImage, getOpenverseImageMetadata, imageAttributionFromOpenverseResult, OPENVERSE_REQUEST_TIMEOUT_MS, searchOpenverseImages, type OpenverseAttribution } from "./openverse";
@@ -191,8 +190,8 @@ const ipcSocketPath = process.env.DRAW_MCP_SOCKET_PATH;
 async function bridgeRequest(path: string, init?: RequestInit, options: { pairing?: boolean; timeoutMs?: number } = {}): Promise<any> {
   const pairing = options.pairing ?? false;
   const credential = pairing ? null : await readLocalMcpCredential();
-  if (!pairing && (!credential?.clientIdentity || !credential.capability || (credential.expiresAt ?? 0) <= Date.now())) {
-    throw new Error("This MCP host is not paired with Draw. In Draw, open MCP clients, copy the one-time pairing secret into protected host configuration, then call pair_mcp_client.");
+  if (!pairing && (!credential?.clientIdentity || !credential.capability)) {
+    throw new Error("This MCP host is not paired with Draw. Call pair_mcp_client, then approve the request in Draw.");
   }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? requestTimeoutMs);
@@ -219,6 +218,9 @@ async function bridgeRequest(path: string, init?: RequestInit, options: { pairin
     }
     const ok = status >= 200 && status < 300;
     if (!ok) {
+      if (status === 401 && !pairing && credential) {
+        throw new Error("Draw no longer authorizes this MCP host. It may have been revoked or expired in an older Draw release. Open Draw and call pair_mcp_client to request access again.");
+      }
       const message = typeof body?.error === "string" ? body.error : `Draw bridge returned HTTP ${status}.`;
       throw new Error(message);
     }
@@ -248,22 +250,21 @@ function createServer() {
   const server = new McpServer({ name: "draw", version: "0.1.0" });
 
   server.registerTool("pair_mcp_client", {
-    description: "Pair this MCP host with Draw. First copy Draw's one-time MCP pairing secret into protected host configuration as DRAW_MCP_PAIRING_SECRET. The tool submits that secret, a stable host fingerprint, and a configured client name; Draw asks the human owner to approve. The capability is saved locally with restrictive permissions and is never returned to the model.",
+    description: "Connect this MCP host to Draw. This starts a visible approval request in Draw; after the owner approves, the host stores its credential locally and remains connected until revoked. Agents using the same MCP host share its access. The credential is never returned to the model.",
     inputSchema: z.object({}).strict(),
   }, async () => {
-    const pairingSecret = readConfiguredPairingSecret();
     const local = await getLocalMcpIdentity();
     const fingerprint = createHash("sha256").update(local.installationId).digest("hex");
     const clientName = process.env.DRAW_MCP_CLIENT_NAME?.trim() || "Draw MCP client";
     const paired = await bridgeRequest("/__draw/api/mcp/pair", {
       method: "POST",
-      body: JSON.stringify({ pairingSecret, clientName, fingerprint }),
+      body: JSON.stringify({ clientName, fingerprint }),
     }, { pairing: true, timeoutMs: pairingTimeoutMs });
-    if (typeof paired.clientIdentity !== "string" || typeof paired.capability !== "string" || typeof paired.expiresAt !== "number") {
+    if (typeof paired.clientIdentity !== "string" || typeof paired.capability !== "string") {
       throw new Error("Draw returned an invalid MCP pairing result.");
     }
-    await writeLocalMcpCredential({ ...local, clientIdentity: paired.clientIdentity, capability: paired.capability, expiresAt: paired.expiresAt });
-    return textResult({ paired: true, clientIdentity: paired.clientIdentity, expiresAt: paired.expiresAt, fingerprint });
+    await writeLocalMcpCredential({ ...local, clientIdentity: paired.clientIdentity, capability: paired.capability, expiresAt: undefined });
+    return textResult({ paired: true, clientIdentity: paired.clientIdentity, access: "active_until_revoked", fingerprint });
   });
 
   server.registerTool(

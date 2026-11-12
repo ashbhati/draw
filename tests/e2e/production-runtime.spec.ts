@@ -1,19 +1,18 @@
 import { expect, test } from "@playwright/test";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PRODUCTION_E2E_RUNTIME_ROOT } from "./production-runtime-constants";
 
 type Pending = { resolve: (value: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
 
-async function startMcpHost(socketPath: string, configHome: string, pairingSecret: string) {
+async function startMcpHost(socketPath: string, configHome: string) {
   const child = spawn(process.execPath, ["--import", "tsx/esm", "src/integrations/mcp-server.ts"], {
     cwd: process.cwd(),
     env: {
       ...process.env,
       DRAW_MCP_SOCKET_PATH: socketPath,
-      DRAW_MCP_PAIRING_SECRET: pairingSecret,
       DRAW_MCP_CLIENT_NAME: "Draw production E2E",
       DRAW_MCP_DOCUMENT_DIR: join(configHome, "documents"),
       XDG_CONFIG_HOME: configHome,
@@ -70,7 +69,7 @@ async function startMcpHost(socketPath: string, configHome: string, pairingSecre
   };
 }
 
-test("packaged production app pairs and edits the active canvas through private MCP IPC", async ({ page }) => {
+test("packaged production app pairs through private IPC and keeps host access after host restart", async ({ page }) => {
   test.setTimeout(60_000);
   const configHome = await mkdtemp(join(tmpdir(), "draw-production-mcp-e2e-"));
   let mcp: Awaited<ReturnType<typeof startMcpHost>> | undefined;
@@ -81,10 +80,7 @@ test("packaged production app pairs and edits the active canvas through private 
     await page.getByRole("button", { name: "Connect", exact: true }).click();
     await expect(page.getByRole("button", { name: "MCP connected" })).toBeVisible();
 
-    await page.getByRole("button", { name: "MCP clients" }).click();
-    const pairingSecret = await page.locator(".mcp-pairing-secret code").innerText();
-    expect(pairingSecret).toMatch(/^[a-f\d]{64}$/i);
-    mcp = await startMcpHost(join(PRODUCTION_E2E_RUNTIME_ROOT, "run", "bridge.sock"), configHome, pairingSecret);
+    mcp = await startMcpHost(join(PRODUCTION_E2E_RUNTIME_ROOT, "run", "bridge.sock"), configHome);
 
     const pairing = mcp.tool("pair_mcp_client", {});
     await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
@@ -92,10 +88,11 @@ test("packaged production app pairs and edits the active canvas through private 
     await page.getByRole("button", { name: "Approve client" }).click();
     const pairingResult = await pairing;
     expect(pairingResult.result.isError).not.toBe(true);
+    const pairedClient = JSON.parse(pairingResult.result.content[0].text);
 
     const untrustedLoopbackRead = await page.request.get("/__draw/api/document?flush=1");
     expect(untrustedLoopbackRead.status()).toBe(403);
-    const untrustedLoopbackPair = await page.request.post("/__draw/api/mcp/pair", { data: { pairingSecret: "wrong" } });
+    const untrustedLoopbackPair = await page.request.post("/__draw/api/mcp/pair", { data: { clientName: "Untrusted", fingerprint: "f".repeat(64) } });
     expect(untrustedLoopbackPair.status()).toBe(403);
 
     const initialMessage = await mcp.tool("get_current_canvas", {});
@@ -113,6 +110,26 @@ test("packaged production app pairs and edits the active canvas through private 
     const fresh = JSON.parse(freshMessage.result.content[0].text);
     expect(JSON.stringify(fresh)).toContain("Created through private IPC");
     expect(fresh.documentId).toBe(initial.documentId);
+
+    await mcp.close();
+    mcp = await startMcpHost(join(PRODUCTION_E2E_RUNTIME_ROOT, "run", "bridge.sock"), configHome);
+    const afterHostRestart = JSON.parse((await mcp.tool("get_current_canvas", {})).result.content[0].text);
+    expect(afterHostRestart.documentId).toBe(initial.documentId);
+    expect(JSON.stringify(afterHostRestart)).toContain("Created through private IPC");
+
+    const credentialPath = join(configHome, "draw", "mcp-client-credential.json");
+    const legacyHostCredential = JSON.parse(await readFile(credentialPath, "utf8"));
+    await writeFile(credentialPath, JSON.stringify({ ...legacyHostCredential, expiresAt: Date.now() - 1 }));
+    const expiredLegacyLocalDeadline = await mcp.tool("get_current_canvas", {});
+    expect(expiredLegacyLocalDeadline.result.isError).not.toBe(true);
+
+    await page.getByRole("button", { name: "MCP clients" }).click();
+    const clientRow = page.locator(".mcp-client-row").filter({ hasText: pairedClient.clientIdentity });
+    await clientRow.getByRole("button", { name: "Revoke" }).click();
+    await expect(clientRow).toContainText("revoked");
+    const staleHostCall = await mcp.tool("get_current_canvas", {});
+    expect(staleHostCall.result.isError).toBe(true);
+    expect(staleHostCall.result.content[0].text).toContain("Draw no longer authorizes this MCP host");
   } finally {
     await mcp?.close();
     await rm(configHome, { recursive: true, force: true });

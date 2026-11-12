@@ -42,7 +42,7 @@ type BridgeConfirmation = {
 type McpPairingRequest = { requestId: string; clientId: string; name: string; fingerprint: string; expiresAt: number; replacesName?: string };
 type McpClientRevokedEvent = { clientIdentity: string };
 type McpCommandRevokedEvent = { id: string; clientId: string; clientIdentity: string };
-type McpPairedClient = { clientIdentity: string; name: string; fingerprint: string; createdAt: number; expiresAt: number; revokedAt: number | null };
+type McpPairedClient = { clientIdentity: string; name: string; fingerprint: string; createdAt: number; expiresAt?: number; persistentAccess?: true; revokedAt: number | null };
 const DEFAULT_COLOR: Record<DrawBackgroundPreset, string> = { blackboard: "#18191a", white: "#ffffff" };
 const EDITOR_UI_OPTIONS = {
   canvasActions: { loadScene: false, saveToActiveFile: false, export: false, toggleTheme: false, changeViewBackgroundColor: false },
@@ -155,7 +155,6 @@ export default function App() {
   const [connectError, setConnectError] = useState("");
   const [mcpManagementOpen, setMcpManagementOpen] = useState(false);
   const [mcpManagementOpening, setMcpManagementOpening] = useState(false);
-  const [mcpPairingSecret, setMcpPairingSecret] = useState("");
   const [mcpClients, setMcpClients] = useState<McpPairedClient[]>([]);
   const [mcpPairingRequest, setMcpPairingRequest] = useState<McpPairingRequest | null>(null);
   const [mcpPairingError, setMcpPairingError] = useState("");
@@ -169,7 +168,6 @@ export default function App() {
   const mcpPairingWasOpen = useRef(false);
   const closeMcpManagement = useCallback(() => {
     setMcpManagementOpen(false);
-    setMcpPairingSecret("");
   }, []);
   useEffect(() => {
     if (mcpManagementOpen) {
@@ -770,17 +768,10 @@ export default function App() {
     mcpManagementOpeningRef.current = true;
     setMcpManagementOpening(true);
     try {
-      const headers = { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current };
       const clientsResponse = await fetch("/__draw/api/mcp/clients", { headers: { "x-draw-editor-secret": editorSecret.current }, cache: "no-store" });
       const clientsResult = await clientsResponse.json();
       if (!clientsResponse.ok) throw new Error(clientsResult.error ?? "Could not list paired MCP clients.");
       setMcpClients(clientsResult.clients ?? []);
-      const secretResponse = await fetch("/__draw/api/mcp/pairing-secret", { method: "POST", headers, body: JSON.stringify({}), cache: "no-store" });
-      const secretResult = await secretResponse.json();
-      if (!secretResponse.ok) {
-        setMcpPairingSecret("");
-        setMcpPairingError(secretResult.error ?? "Could not create an MCP pairing secret.");
-      } else setMcpPairingSecret(secretResult.pairingSecret);
       setMcpManagementOpen(true);
     } catch (error) {
       setMcpPairingError(error instanceof Error ? error.message : "Could not prepare MCP pairing.");
@@ -800,9 +791,9 @@ export default function App() {
         headers: { "content-type": "application/json", "x-draw-editor-secret": editorSecret.current ?? "" },
         body: JSON.stringify({ clientId: clientId.current, approved }),
       });
-      if (!response.ok) throw new Error("This MCP pairing request expired or the active Draw tab changed.");
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : "This MCP pairing request expired or the active Draw tab changed.");
       setMcpPairingRequest(null);
-      setMcpPairingSecret("");
       if (approved) setMessage(`Paired MCP client “${pending.name}”.`);
       else setMessage("MCP pairing was denied.");
       if (approved && editorSecret.current) {
@@ -2036,7 +2027,7 @@ export default function App() {
         <div className="brand"><span className="brand-mark">D</span><span className="brand-name">draw</span></div>
         <nav className="workspace-toolbar" aria-label="Workspace management">
           <div className="workspace-controls" role="group" aria-label="Workspace controls">
-            <select className="workspace-combobox" aria-label="Saved workspaces" title="Choose the active workspace" value={activeWorkspaceId} disabled={!canWrite} onChange={(event) => void selectWorkspace(event.target.value)}>
+            <select className="workspace-combobox toolbar-select" aria-label="Saved workspaces" title="Choose the active workspace" value={activeWorkspaceId} disabled={!canWrite} onChange={(event) => void selectWorkspace(event.target.value)}>
               {workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}
             </select>
             <button className="workspace-action" aria-label="New workspace" title="Create a new workspace" disabled={!canWrite} onClick={() => void createNewWorkspace()}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg></button>
@@ -2048,8 +2039,8 @@ export default function App() {
       <span className="toolbar-divider leading-divider" aria-hidden="true" />
       <div className="toolbar-actions">
         <span className={`save-indicator ${status}`}><i />{statusText}</span>
-        <button className="button button-quiet" disabled={!canWrite} onClick={() => { setConnectError(""); setConnectOpen(true); }} title="Pair this editor with the local MCP bridge">{editorConnected ? "MCP connected" : "Connect MCP"}</button>
-        <button ref={mcpClientsTrigger} className="button button-quiet" disabled={!canWrite || mcpManagementOpening} aria-busy={mcpManagementOpening} onClick={() => void openMcpManagement()} title="Pair or revoke local MCP clients">MCP clients</button>
+        <button className={`button button-quiet mcp-toolbar-button${editorConnected ? " connected" : ""}`} aria-label={editorConnected ? "MCP connected" : "Connect MCP"} disabled={!canWrite} onClick={() => { setConnectError(""); setConnectOpen(true); }} title={editorConnected ? "Editor connected to the local MCP bridge" : "Connect this editor to the local MCP bridge"}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.07 0l3-3A5 5 0 0 0 13 2.93l-1.72 1.71M14 11a5 5 0 0 0-7.07 0l-3 3A5 5 0 0 0 11 21.07l1.71-1.72" /></svg></button>
+        <button ref={mcpClientsTrigger} className="button button-quiet mcp-toolbar-button" aria-label="MCP clients" disabled={!canWrite || mcpManagementOpening} aria-busy={mcpManagementOpening} onClick={() => void openMcpManagement()} title="Manage connected MCP clients"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" /></svg></button>
         <span className="toolbar-divider file-actions-divider" aria-hidden="true" />
         <button className="button button-quiet file-action" aria-label="Open" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open a .draw file as a new workspace" : "Close the other Draw tab to open files here"}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v2M3 7v13h17l2-10H7L3 20" /></svg></button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
@@ -2062,7 +2053,7 @@ export default function App() {
         })()}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4" /></svg></button>}
         <button className="button button-quiet file-action" aria-label="Save" onClick={saveFile} title="Save the editable .draw file"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 3h12l4 4v14H3V3h2Zm2 0v6h10V3M7 21v-8h10v8" /></svg></button>
         <span className="toolbar-divider export-divider" aria-hidden="true" />
-        <div className="export-group"><button className="button button-quiet export-main file-action" aria-label="Export image" disabled={exportScope === "selection" && !selectionAvailable} title={exportScope === "selection" && !selectionAvailable ? "Select one or more objects to export a selection" : "Export a shareable image"} onClick={() => void exportImage("image/png")}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M14 3h7v7M10 14 21 3M19 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h6" /></svg></button><select aria-label="Export scope" value={exportScope} onChange={(event) => setExportScope(event.target.value as "canvas" | "selection")}><option value="canvas">Whole drawing</option><option value="selection">Selection only</option></select><select aria-label="Image export format" value="image/png" onChange={(event) => void exportImage(event.target.value as "image/png" | "image/jpeg")}><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option></select></div>
+        <div className="export-group"><button className="button button-quiet export-main file-action" aria-label="Export image" disabled={exportScope === "selection" && !selectionAvailable} title={exportScope === "selection" && !selectionAvailable ? "Select one or more objects to export a selection" : "Export a shareable image"} onClick={() => void exportImage("image/png")}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M14 3h7v7M10 14 21 3M19 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h6" /></svg></button><select className="toolbar-select" aria-label="Export scope" value={exportScope} onChange={(event) => setExportScope(event.target.value as "canvas" | "selection")}><option value="canvas">Whole drawing</option><option value="selection">Selection only</option></select><select className="toolbar-select" aria-label="Image export format" value="image/png" onChange={(event) => void exportImage(event.target.value as "image/png" | "image/jpeg")}><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option></select></div>
       </div>
     </header>
     <dialog ref={imageDialog} className="draw-image-picker draw-image-source" aria-labelledby="draw-image-picker-title" onCancel={(event) => { event.preventDefault(); closeImagePicker(); }}>
@@ -2139,23 +2130,23 @@ export default function App() {
           <h2 id="draw-mcp-clients-title">MCP clients</h2>
           <button ref={mcpClientsClose} className="button button-quiet mcp-dialog-close" type="button" aria-label="Close MCP clients" title="Close" onClick={closeMcpManagement}>×</button>
         </div>
-        <p>Copy this one-time pairing secret into the MCP host’s protected configuration as <code>DRAW_MCP_PAIRING_SECRET</code>. It expires in five minutes and can be used once. Then call its Draw pairing tool. Draw will ask you to approve the host name and fingerprint.</p>
-        {mcpPairingSecret && <div className="mcp-pairing-secret"><code>{mcpPairingSecret}</code><button className="button button-quiet" onClick={() => void navigator.clipboard.writeText(mcpPairingSecret)}>Copy secret</button></div>}
+        <p>An MCP host is the agent connection configured in a host app such as Herdr, not an individual Codex or Claude conversation. Agents using the same Draw connection share its access. To connect one, configure Draw in the host and ask an agent to call <code>pair_mcp_client</code>; Draw will ask you to approve the host. The host name is supplied by the local process and is not verified; approve only requests you initiated and whose fingerprint you can verify. Approved access stays active until you revoke it. Draw must be running and this editor tab connected while the agent works.</p>
         {mcpPairingError && <p role="alert">{mcpPairingError}</p>}
-        <h3>Paired hosts</h3>
-        {mcpClients.length === 0 && <p>No MCP clients have been paired.</p>}
+        <h3>Connected MCP hosts</h3>
+        {mcpClients.length === 0 && <p>No MCP hosts are connected. Start pairing from the agent or MCP host you want to authorize.</p>}
         {mcpClients.map((client) => <div className="mcp-client-row" key={client.clientIdentity}>
-          <span><strong>{client.name}</strong><small>{client.clientIdentity} · {client.revokedAt ? "revoked" : new Date(client.expiresAt).toLocaleDateString()}</small></span>
+          <span><strong>{client.name}</strong><small>{client.clientIdentity} · {client.revokedAt ? "revoked" : client.persistentAccess !== true && client.expiresAt !== undefined && client.expiresAt <= Date.now() ? `expired ${new Date(client.expiresAt).toLocaleDateString()}` : "active · revoke anytime"}</small></span>
           {!client.revokedAt && <button className="button button-quiet" onClick={() => void revokeMcpClient(client.clientIdentity)}>Revoke</button>}
         </div>)}
         <div className="draw-confirmation-actions"><button className="button button-quiet" onClick={closeMcpManagement}>Close</button></div>
       </section>
     </div>}
     {mcpPairingRequest && <div className="draw-confirmation-backdrop" role="presentation">
-      <section ref={mcpPairingDialog} className="draw-confirmation" role="dialog" aria-modal="true" aria-labelledby="draw-mcp-pairing-title">
+      <section ref={mcpPairingDialog} className="draw-confirmation" role="dialog" aria-modal="true" aria-labelledby="draw-mcp-pairing-title" aria-describedby="draw-mcp-pairing-warning">
         <h2 id="draw-mcp-pairing-title">Approve MCP client?</h2>
-        <p><strong>{mcpPairingRequest.name}</strong> is requesting access to this Draw instance.</p>
-        <p>Client fingerprint: <code>{mcpPairingRequest.fingerprint}</code></p>
+        <p id="draw-mcp-pairing-warning" className="draw-mcp-pairing-warning">Unverified local process: Draw cannot verify the process behind this request, and its name can be spoofed. Approve only if you initiated pairing and can verify this fingerprint with your MCP host.</p>
+        <p><strong>Claimed host name:</strong> {mcpPairingRequest.name}</p>
+        <p className="draw-mcp-pairing-fingerprint"><strong>Fingerprint (verify it on the host):</strong><code>{mcpPairingRequest.fingerprint}</code></p>
         {mcpPairingRequest.replacesName && <p role="alert">Approving this host will revoke the existing paired client “{mcpPairingRequest.replacesName}” with the same fingerprint.</p>}
         <p className="draw-confirmation-expiry">Approve only if this matches the host you are pairing. The request expires in two minutes.</p>
         <div className="draw-confirmation-actions">

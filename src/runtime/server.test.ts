@@ -40,18 +40,15 @@ describe("production Draw runtime", () => {
       const response = await fetch(new URL(path, server.url), init);
       expect(response.status, `${path} must not be callable over loopback HTTP`).toBe(403);
     }
-    for (const path of ["/__draw/api/mcp/clients", "/__draw/api/mcp/pairing-secret"]) {
-      const response = await fetch(new URL(path, server.url), {
-        method: path.endsWith("pairing-secret") ? "POST" : "GET",
-        headers: path.endsWith("pairing-secret") ? { "content-type": "application/json" } : {},
-        ...(path.endsWith("pairing-secret") ? { body: "{}" } : {}),
-      });
-      expect(response.status, `${path} must require the active editor secret`).toBe(401);
-      expect(await response.text()).not.toContain("clientIdentity");
-    }
+    const clients = await fetch(new URL("/__draw/api/mcp/clients", server.url));
+    expect(clients.status).toBe(401);
+    expect(await clients.text()).not.toContain("clientIdentity");
+    expect((await fetch(new URL("/__draw/api/mcp/pairing-secret", server.url), {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+    })).status).toBe(404);
   });
 
-  it("rejects loopback pairing attempts before touching paired-client lockout state", async () => {
+  it("rejects loopback pairing attempts before loading paired-client state", async () => {
     let loadCount = 0;
     let saveCount = 0;
     let state: McpClientAuthState = { failedAttempts: 0, lockedUntil: 0, clients: [] };
@@ -66,7 +63,7 @@ describe("production Draw runtime", () => {
     const initializedLoads = loadCount;
     for (let attempt = 0; attempt < 6; attempt += 1) {
       const response = await fetch(new URL("/__draw/api/mcp/pair", server.url), {
-        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ pairingSecret: "wrong" }),
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clientName: "Untrusted", fingerprint: "a".repeat(64) }),
       });
       expect(response.status).toBe(403);
     }
