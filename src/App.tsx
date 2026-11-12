@@ -13,7 +13,7 @@ import {
 import { isSafeHttpsUrl } from "./document/attribution";
 import { composeBackgroundSvg, hasSelectedExportElements, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorForBackgroundPreset } from "./export/background-recolor";
-import { listWorkspaceLibraryRecoveries, exportWorkspaceLibraryRecovery, createFreshWorkspaceFromRecovery, exportLegacyDocumentRecovery, loadLegacyDocumentRecovery, addWorkspaceLibraryItem, saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createWorkspaceWithCanvas, createCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, listCanvases, listWorkspaces, loadCanvasDocument, loadWorkspaceLibrary, loadWorkspaceLibraryState, renameWorkspace, renameWorkspaceLibraryItem, saveWorkspaceLibrary, setActiveCanvas, type DrawCanvas, type DrawLibraryItem, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
+import { listWorkspaceLibraryRecoveries, exportWorkspaceLibraryRecovery, createFreshWorkspaceFromRecovery, exportLegacyDocumentRecovery, loadLegacyDocumentRecovery, addWorkspaceLibraryItem, saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createWorkspaceWithCanvas, createCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, listCanvases, listWorkspaces, loadCanvasDocument, loadWorkspaceLibrary, loadWorkspaceLibraryState, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, saveWorkspaceLibrary, setActiveCanvas, type DrawCanvas, type DrawLibraryItem, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
 import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, reloadLibraryAfterConflict, resolveLibraryWorkspaceFromCatalog, shouldPersistLibraryChange } from "./ui/draw-library";
 import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
@@ -425,8 +425,21 @@ export default function App() {
   const autosave = useMemo(() => createDebouncedSaver<DrawDocument>(async (value) => {
     if (!writerOwned.current) return;
     const outcome = await saveCurrentDocument(value);
+    if (activeDocumentIdRef.current !== value.document.id) return;
     if (outcome.saved) setStatus("saved");
-    else if (activeDocumentIdRef.current === value.document.id) {
+    else {
+      const latestInEditor = docRef.current;
+      if (!latestInEditor || latestInEditor.document.id !== value.document.id) return;
+      if (latestInEditor.document.documentRevision > value.document.documentRevision
+        || latestInEditor.document.viewRevision > value.document.viewRevision
+        || latestInEditor.document.documentRevision === value.document.documentRevision
+          && latestInEditor.document.viewRevision === value.document.viewRevision
+          && JSON.stringify(latestInEditor) !== JSON.stringify(value)) return;
+      // During a workspace switch the active pointer can move before the
+      // departing editor finishes its last onChange callback. That stale write
+      // is expected and must not mark the newly selected drawing as damaged.
+      const current = await loadCurrentDocument();
+      if (activeDocumentIdRef.current !== value.document.id || current?.document.id !== value.document.id) return;
       // A rejected write is actionable only while the submitted document is
       // still active. A switched or deleted canvas is expected to be stale.
       setStatus("error");
@@ -478,7 +491,8 @@ export default function App() {
           if (!workspaceItems.length) {
             if (lock.acquired) {
               if (stored) {
-                const created = await createWorkspaceWithCanvas("My workspace", stored.document.title || "Untitled drawing", stored);
+                const workspaceName = stored.document.title || "My workspace";
+                const created = await createWorkspaceWithCanvas(workspaceName, workspaceName, stored);
                 await setActiveCanvas(created.canvas.id);
                 stored = created.document;
                 workspaceItems = [created.workspace];
@@ -917,8 +931,18 @@ export default function App() {
     const current = workspaces.find((item) => item.id === activeWorkspaceId);
     const name = window.prompt("Workspace name", current?.name ?? "My workspace");
     if (name === null) return;
-    try { await renameWorkspace(activeWorkspaceId, name); await refreshWorkspaceList(); }
-    catch (error) { setMessage(`Could not rename workspace: ${error instanceof Error ? error.message : String(error)}`); }
+    try {
+      await settleEditorBeforeSwitch();
+      const renamed = await renameWorkspace(activeWorkspaceId, name);
+      await renameCanvas(activeCanvasId, renamed.name);
+      const renamedDocument = await loadCanvasDocument(activeCanvasId);
+      if (renamedDocument) {
+        setDocument(renamedDocument);
+        await syncBridgeDocument(renamedDocument);
+      }
+      await refreshWorkspaceList();
+      setStatus("saved");
+    } catch (error) { setMessage(`Could not rename workspace: ${error instanceof Error ? error.message : String(error)}`); }
   };
 
   const removeActiveWorkspace = async () => {

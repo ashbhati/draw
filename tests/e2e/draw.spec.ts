@@ -245,6 +245,14 @@ async function selectWorkspace(page: Page, id: string) {
   await picker.focus();
   await picker.selectOption(id);
 }
+async function renameActiveWorkspace(page: Page, name: string) {
+  page.once("dialog", (dialog) => dialog.accept(name));
+  await page.getByRole("button", { name: "Rename workspace" }).click();
+  await expect(page.getByRole("combobox", { name: "Saved workspaces" }).locator("option:checked")).toHaveText(name);
+}
+async function expectActiveWorkspaceName(page: Page, name: string) {
+  await expect(page.getByRole("combobox", { name: "Saved workspaces" }).locator("option:checked")).toHaveText(name);
+}
 
 async function countWarmImagePixels(page: Page, image: Buffer): Promise<number> {
   return page.evaluate(async (bytes) => {
@@ -885,7 +893,7 @@ test("Open .draw restores a downloaded file that remains editable through a seco
   expect(createResponse.ok(), await createResponse.text()).toBeTruthy();
   const created = await createResponse.json();
 
-  await page.getByLabel("Drawing title").fill("Portable Asset Round Trip");
+  await renameActiveWorkspace(page, "Portable Asset Round Trip");
   await page.getByRole("button", { name: "Whiteboard", exact: true }).click();
   await page.getByRole("button", { name: "Zoom in" }).click();
   const canvas = page.locator(".excalidraw canvas").last();
@@ -930,7 +938,7 @@ test("Open .draw restores a downloaded file that remains editable through a seco
   expect(Object.values(firstFile.document.assets).length).toBeGreaterThan(0);
   expect(firstFile.document.elements.filter((element: any) => element.type === "image")).toHaveLength(1);
 
-  await page.getByLabel("Drawing title").fill("Changed before opening saved file");
+  await renameActiveWorkspace(page, "Changed before opening saved file");
   await page.getByRole("button", { name: "Blackboard", exact: true }).click();
   await page.getByRole("button", { name: "Zoom out" }).click();
   const changedBeforeOpen = await freshBridgeDocument(page);
@@ -1037,7 +1045,7 @@ test("a second tab is read-only while the first tab owns local autosave", async 
   await secondTab.locator(".excalidraw canvas").first().waitFor();
 
   await expect(secondTab.getByText(/reload this tab to edit/i)).toBeVisible();
-  await expect(secondTab.getByLabel("Drawing title")).toBeDisabled();
+  await expect(secondTab.getByRole("combobox", { name: "Saved workspaces" })).toBeDisabled();
   await expect(secondTab.getByRole("button", { name: "Whiteboard", exact: true })).toBeDisabled();
 });
 
@@ -1090,13 +1098,13 @@ test("a mounted read-only tab with an older library view cannot clear a newer li
   await staleTab.close();
 });
 
-test("title edits flush to IndexedDB on pagehide and survive reload", async ({ page }) => {
-  await page.getByLabel("Drawing title").fill("Pagehide preserved");
+test("workspace rename is saved with its editable document and survives reload", async ({ page }) => {
+  await renameActiveWorkspace(page, "Pagehide preserved");
   await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
   await expect.poll(async () => (await readLocalDocument(page))?.document.title).toBe("Pagehide preserved");
   await page.reload();
   await page.locator(".topbar").waitFor();
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Pagehide preserved");
+  await expectActiveWorkspaceName(page, "Pagehide preserved");
 });
 
 test("coalesces a pointer drag to a bounded number of whole-document bridge writes", async ({ page }) => {
@@ -2798,6 +2806,9 @@ test("workspace combobox and action controls share sizing and keyboard focus", a
 
 test("workspaces create, switch, rename, delete, and survive reload with one board each", async ({ page }) => {
   const originalWorkspaceId = await currentWorkspaceId(page);
+  await expect(page.getByLabel("Drawing title")).toHaveCount(0);
+  await expect(page.locator(".topbar").getByRole("combobox", { name: "Saved workspaces" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Export image" })).toBeVisible();
   await expect(page.locator('nav select[aria-label="Canvas"]')).toHaveCount(0);
   await expect(page.getByRole("button", { name: "New canvas" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Open", exact: true })).toHaveAttribute("title", /Open a \.draw file/);
@@ -2807,18 +2818,18 @@ test("workspaces create, switch, rename, delete, and survive reload with one boa
   await expect(page.getByRole("button", { name: "Delete workspace" })).toHaveAttribute("title", "Delete the selected workspace and its drawing");
   await expect(page.getByRole("combobox", { name: "Saved workspaces" })).toHaveAttribute("title", "Choose the active workspace");
   await expect(page.getByRole("combobox", { name: "Saved workspaces" }).locator("option:checked")).toHaveText("My workspace");
-  await page.getByLabel("Drawing title").fill("Alpha notes");
+  await renameActiveWorkspace(page, "Alpha notes");
   await expect.poll(async () => (await readLocalDocument(page))?.document.title).toBe("Alpha notes");
 
   await page.getByRole("button", { name: "New workspace" }).click();
   await expect.poll(() => workspaceCount(page)).toBe(2);
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
+  await expectActiveWorkspaceName(page, "New workspace");
   await page.reload();
   await page.locator(".topbar").waitFor();
   await expect.poll(() => workspaceCount(page)).toBe(2);
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
+  await expectActiveWorkspaceName(page, "New workspace");
   await selectWorkspace(page, originalWorkspaceId);
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Alpha notes");
+  await expectActiveWorkspaceName(page, "Alpha notes");
   await expect(page.getByRole("combobox", { name: "Saved workspaces" })).toBeFocused();
 
   page.once("dialog", (dialog) => dialog.accept("Research workspace"));
@@ -2829,24 +2840,29 @@ test("workspaces create, switch, rename, delete, and survive reload with one boa
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "Delete workspace" }).click();
   await expect.poll(() => workspaceCount(page)).toBe(2);
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Alpha notes");
+  await expectActiveWorkspaceName(page, "Research workspace");
 });
 
 test("pending autosave is preserved when switching workspaces", async ({ page }) => {
   const originalWorkspaceId = await currentWorkspaceId(page);
-  await page.getByLabel("Drawing title").fill("Pending board edit");
-  await expect(page.locator(".save-indicator.saving")).toBeVisible();
+  await page.locator('.excalidraw label[title^="Rectangle"]').click();
+  const board = await page.locator(".excalidraw canvas").last().boundingBox();
+  if (!board) throw new Error("The active canvas is unavailable.");
+  await page.mouse.move(board.x + board.width / 2 - 60, board.y + board.height / 2 - 35);
+  await page.mouse.down();
+  await page.mouse.move(board.x + board.width / 2 + 60, board.y + board.height / 2 + 35, { steps: 2 });
+  await page.mouse.up();
   await page.getByRole("button", { name: "New workspace" }).click();
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
+  await expectActiveWorkspaceName(page, "New workspace");
   await selectWorkspace(page, originalWorkspaceId);
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Pending board edit");
+  await expect.poll(async () => (await readLocalDocument(page))?.document.elements.length).toBe(1);
   await expect(page.getByText("Saved on this device")).toBeVisible();
   await expect(page.getByText(/reload the page to continue/i)).toHaveCount(0);
 });
 
 test("deleting a workspace removes its board and library state", async ({ page }) => {
   await page.getByRole("button", { name: "New workspace" }).click();
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Untitled drawing");
+  await expectActiveWorkspaceName(page, "New workspace");
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "Delete workspace" }).click();
   await expect.poll(() => workspaceCount(page)).toBe(1);
@@ -2907,14 +2923,14 @@ test("opening a .draw file creates a separate editable workspace", async ({ page
   const importInput = page.locator('input[type="file"][accept^=".draw"]');
   await importInput.setInputFiles({ name: "reference.draw", mimeType: "application/vnd.draw+json", buffer: Buffer.from(JSON.stringify(source)) });
   await expect.poll(() => workspaceCount(page)).toBe(countBefore + 1);
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Imported reference");
+  await expectActiveWorkspaceName(page, "Imported reference");
   const importedWorkspaceId = await currentWorkspaceId(page);
   expect(importedWorkspaceId).not.toBe(oldWorkspaceId);
   const imported = await readLocalDocument(page);
   expect(imported.document.id).not.toBe("portable-source-id");
   expect(imported.document.elements).toEqual(before.document.elements);
   await selectWorkspace(page, oldWorkspaceId);
-  await expect(page.getByLabel("Drawing title")).toHaveValue(before.document.title);
+  await expectActiveWorkspaceName(page, before.document.title);
   expect((await readLocalDocument(page)).document.elements).toEqual(before.document.elements);
 });
 
@@ -2942,7 +2958,7 @@ test("V1 current-document data migrates into the default workspace without losin
   }, legacy);
   await page.reload();
   await page.locator(".topbar").waitFor();
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Migrated V1 diagram");
+  await expectActiveWorkspaceName(page, "Migrated V1 diagram");
   await expect.poll(() => workspaceCount(page)).toBe(1);
   await expect(page.locator('nav select[aria-label="Canvas"]')).toHaveCount(0);
   const migrated = await readLocalDocument(page);
@@ -2978,14 +2994,14 @@ test("stdio MCP manages workspaces with durable replay, safe imports, and human-
     expect(created.activeDocument.document.id).toBeTruthy();
     const retry = await result(await mcp.call("create_workspace", createArgs));
     expect(retry.activeWorkspaceId).toBe(created.activeWorkspaceId);
-    await page.getByLabel("Drawing title").fill("Human edited agent workspace");
+    await renameActiveWorkspace(page, "Human edited agent workspace");
     await expect.poll(async () => (await readLocalDocument(page))?.document.title).toBe("Human edited agent workspace");
     const afterFirstCreate = await result(await mcp.call("list_workspaces", {}));
     const humanWorkspace = await result(await mcp.call("create_workspace", {
       expectedCatalogRevision: afterFirstCreate.catalogRevision, idempotencyKey: "mcp-human-workspace-e2e", name: "Human workspace",
     }));
     expect(humanWorkspace.activeWorkspaceId).not.toBe(created.activeWorkspaceId);
-    await page.getByLabel("Drawing title").fill("Current human canvas");
+    await renameActiveWorkspace(page, "Current human canvas");
     await expect.poll(async () => (await readLocalDocument(page))?.document.title).toBe("Current human canvas");
     const currentCanvas = page.locator(".excalidraw canvas").last();
     const currentBounds = await currentCanvas.boundingBox();
@@ -3006,7 +3022,7 @@ test("stdio MCP manages workspaces with durable replay, safe imports, and human-
     expect(safeReplay.activeDocument.document.title).toBe("Current human canvas");
     expect(safeReplay.activeDocument.document.elements).toHaveLength(1);
     expect(await readLocalDocument(page)).toEqual(currentBeforeReplay);
-    await expect(page.getByLabel("Drawing title")).toHaveValue("Current human canvas");
+    await expectActiveWorkspaceName(page, "Current human canvas");
     const conflict = await mcp.call("create_workspace", { ...createArgs, name: "Changed intent" });
     expect(conflict.result?.isError).toBe(true);
     const beforeImport = await result(await mcp.call("list_workspaces", {}));
@@ -3044,7 +3060,7 @@ test("stdio MCP manages workspaces with durable replay, safe imports, and human-
     expect(spoofedConfirmation.ok(), await spoofedConfirmation.text()).toBeTruthy();
     await expect(page.getByRole("dialog", { name: "Delete this workspace?" })).toBeVisible();
     const spoofDialogText = await page.getByRole("dialog").innerText();
-    expect(spoofDialogText).toContain("Agent project");
+    expect(spoofDialogText).toContain("Human edited agent workspace");
     expect(spoofDialogText).not.toContain("Forged target");
     expect(spoofDialogText).not.toContain("Forged project");
     expect(spoofDialogText).toContain("1 canvas(es)");
@@ -3177,7 +3193,6 @@ test("quarantined autosave can be exported while new edits resume autosaving in 
   const path = await downloaded.path();
   expect(path).toBeTruthy();
   expect(JSON.parse(await readFile(path!, "utf8"))).toEqual(raw);
-  await page.getByLabel("Drawing title").fill("New edits kept safely");
   await page.locator('.excalidraw label[title^="Rectangle"]').click();
   const board = await page.locator(".excalidraw canvas").last().boundingBox();
   if (!board) throw new Error("Recovery board is unavailable");
@@ -3193,11 +3208,11 @@ test("quarantined autosave can be exported while new edits resume autosaving in 
   expect(draftDocument.document.elements).toHaveLength(1);
   await recovery.getByRole("button", { name: "Enable autosave in new workspace" }).click();
   await expect(recovery).toBeHidden();
-  await expect(page.getByLabel("Drawing title")).toHaveValue("New edits kept safely");
-  await page.getByLabel("Drawing title").fill("Autosave restored");
+  await expectActiveWorkspaceName(page, "Untitled drawing");
+  await renameActiveWorkspace(page, "Autosave restored");
   await expect(page.locator(".save-indicator")).toHaveText("Saved on this device");
   await page.reload();
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Autosave restored");
+  await expectActiveWorkspaceName(page, "Autosave restored");
   const retainedWait = page.waitForEvent("download");
   await page.getByRole("button", { name: "Download recovery backup (JSON)" }).click();
   const retained = await retainedWait;
@@ -3241,7 +3256,7 @@ test("a malformed saved library is downloadable while its drawing and autosave r
     db.close();
   }, { document, rawLibrary });
   await page.reload();
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Preserved drawing");
+  await expectActiveWorkspaceName(page, "Preserved project");
   const notice = page.getByRole("region", { name: "Library recovery", exact: true });
   await expect(notice).toBeVisible();
   const backupWait = page.waitForEvent("download");
@@ -3249,10 +3264,10 @@ test("a malformed saved library is downloadable while its drawing and autosave r
   const backup = await backupWait;
   expect(JSON.parse(await readFile((await backup.path())!, "utf8")).raw).toEqual(rawLibrary);
   await notice.getByRole("button", { name: "Dismiss library notice" }).click();
-  await page.getByLabel("Drawing title").fill("Still autosaving");
+  await renameActiveWorkspace(page, "Still autosaving");
   await expect(page.locator(".save-indicator")).toHaveText("Saved on this device");
   await page.reload();
-  await expect(page.getByLabel("Drawing title")).toHaveValue("Still autosaving");
+  await expectActiveWorkspaceName(page, "Still autosaving");
   expect((await readLocalDocument(page)).document.elements).toMatchObject([{ id: "library-recovery-shape", type: "rectangle" }]);
   await page.getByRole("button", { name: "Dismiss library notice" }).click();
   page.once("dialog", (dialog) => dialog.accept());

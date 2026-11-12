@@ -199,7 +199,10 @@ function quarantineWorkspaceLibrary(meta: IDBObjectStore, workspaceId: string, r
 function autosaveSceneAndMetadata(document: DrawDocument): string {
   const { appState: _appState, ...metadata } = document.document;
   const { viewport: _viewport, ...canvas } = metadata.canvas;
-  return JSON.stringify({ ...document, document: { ...metadata, canvas } });
+  const elements = metadata.elements.map((element) => Array.isArray(element.boundElements) && element.boundElements.length === 0
+    ? { ...element, boundElements: null }
+    : element);
+  return JSON.stringify({ ...document, document: { ...metadata, elements, canvas } });
 }
 
 function openDatabase(): Promise<IDBDatabase> {
@@ -255,7 +258,7 @@ function openDatabase(): Promise<IDBDatabase> {
               const now = Date.now();
               documents.put(doc, documentKey(doc.document.id));
               documents.put(doc, CURRENT_DOCUMENT_KEY);
-              workspaces.put({ id: workspaceId, name: "My workspace", createdAt: now, updatedAt: now } satisfies DrawWorkspace, workspaceId);
+              workspaces.put({ id: workspaceId, name: doc.document.title || "My workspace", createdAt: now, updatedAt: now } satisfies DrawWorkspace, workspaceId);
               canvases.put({ id: canvasId, workspaceId, name: doc.document.title, documentId: doc.document.id, createdAt: now, updatedAt: now } satisfies DrawCanvas, canvasId);
               meta.put({ workspaceId, canvasId } satisfies ActiveCanvasPointer, ACTIVE_POINTER_KEY);
               meta.put(true, INITIALIZED_KEY);
@@ -621,9 +624,17 @@ export async function saveCurrentDocument(document: DrawDocument, options: { rep
       if (!options.replaceDocument && current
         && (current.document.documentRevision ?? 0) === (document.document.documentRevision ?? 0)
         && (current.document.viewRevision ?? 0) === (document.document.viewRevision ?? 0)
-        && JSON.stringify(current) !== JSON.stringify(document)
-        && (autosaveSceneAndMetadata(current) !== autosaveSceneAndMetadata(document)
-          || previousOrder?.sessionId === writeOrder.sessionId && previousOrder.sequence > writeOrder.sequence)) return;
+        && JSON.stringify(current) !== JSON.stringify(document)) {
+        const sameDrawing = autosaveSceneAndMetadata(current) === autosaveSceneAndMetadata(document);
+        const olderWrite = previousOrder?.sessionId === writeOrder.sessionId && previousOrder.sequence > writeOrder.sequence;
+        if (!sameDrawing || olderWrite) {
+          // A delayed write with older app state can arrive after the same
+          // drawing was already saved. Treat that idempotent stale write as
+          // saved while keeping the newer persisted app state intact.
+          if (sameDrawing && olderWrite) savedDocument = current;
+          return;
+        }
+      }
 
       const next = structuredClone(document);
       if (options.replaceDocument) {
@@ -1510,7 +1521,8 @@ export async function loadCanvasDocument(canvasId: string): Promise<DrawDocument
 }
 
 export async function createWorkspace(name: string): Promise<DrawWorkspace> {
-  return (await createWorkspaceWithCanvas(name, "Untitled drawing")).workspace;
+  const workspaceName = name.trim() || "Untitled workspace";
+  return (await createWorkspaceWithCanvas(workspaceName, workspaceName)).workspace;
 }
 
 /** Create a project and its only board in one transaction. */
@@ -1570,7 +1582,10 @@ export async function renameCanvas(canvasId: string, name: string): Promise<Draw
   try {
     const tx = db.transaction([CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE], "readwrite");
     const canvases = tx.objectStore(CANVASES_STORE);
+    const documents = tx.objectStore(DOCUMENTS_STORE);
+    const meta = tx.objectStore(WORKSPACE_META_STORE);
     const request = canvases.get(canvasId);
+    const activePointerRequest = meta.get(ACTIVE_POINTER_KEY);
     let renamed: DrawCanvas | undefined;
     let failure: Error | undefined;
     request.onsuccess = () => {
@@ -1586,9 +1601,12 @@ export async function renameCanvas(canvasId: string, name: string): Promise<Draw
           document.document.title = nextName;
           document.document.documentRevision += 1;
           renamed = { ...canvas, name: nextName, updatedAt: Date.now() };
-          tx.objectStore(DOCUMENTS_STORE).put(document, documentKey(canvas.documentId));
+          documents.put(document, documentKey(canvas.documentId));
+          if ((activePointerRequest.result as ActiveCanvasPointer | undefined)?.canvasId === canvasId) {
+            documents.put(document, CURRENT_DOCUMENT_KEY);
+          }
           canvases.put(renamed, canvasId);
-          incrementWorkspaceCatalogRevision(tx.objectStore(WORKSPACE_META_STORE));
+          incrementWorkspaceCatalogRevision(meta);
         } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); tx.abort(); }
       };
       docRequest.onerror = () => { failure = docRequest.error ?? new Error("Could not read the canvas document."); tx.abort(); };

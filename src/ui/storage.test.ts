@@ -98,6 +98,7 @@ describe("local Draw autosave", () => {
     expect((await listWorkspaces())[0].name).toBe("Platform");
     expect((await listCanvases(workspace.id))[0].name).toBe("Service map");
     expect((await loadCanvasDocument(canvas.id))?.document.title).toBe("Service map");
+    expect((await loadCurrentDocument())?.document.title).toBe("Service map");
   });
 
   it("duplicates an editable canvas into a new independent document", async () => {
@@ -122,7 +123,7 @@ describe("local Draw autosave", () => {
   it("creates a default board atomically with a workspace and rejects a second board in that workspace", async () => {
     const workspace = await createWorkspace("Single board project");
     const [board] = await listCanvases(workspace.id);
-    expect(board).toMatchObject({ workspaceId: workspace.id, name: "Untitled drawing" });
+    expect(board).toMatchObject({ workspaceId: workspace.id, name: "Single board project" });
     await expect(createCanvas(workspace.id, "Second board")).rejects.toThrow(/already has a board/i);
     expect(await listCanvases(workspace.id)).toEqual([board]);
   });
@@ -1198,7 +1199,7 @@ describe("local Draw autosave", () => {
     expect(await loadCurrentDocument()).toEqual(newer);
   });
 
-  it("keeps the newer app-state-only autosave when equal-revision writes finish out of order", async () => {
+  it("treats an older app-state-only autosave as saved without replacing newer state", async () => {
     const before = createEmptyDocument("Equal revision view");
     await saveCurrentDocument(before);
     const older = structuredClone(before);
@@ -1208,7 +1209,7 @@ describe("local Draw autosave", () => {
     newer.document.appState = { ...newer.document.appState, scrollX: 25 };
     newer.document.canvas.viewport = { x: 25, y: 0, zoom: 1 };
     await saveCurrentDocument(newer, { writeToken: { sessionId: "test-session", sequence: 2 } });
-    expect(await saveCurrentDocument(older, { writeToken: { sessionId: "test-session", sequence: 1 } })).toEqual({ saved: false });
+    expect(await saveCurrentDocument(older, { writeToken: { sessionId: "test-session", sequence: 1 } })).toMatchObject({ saved: true });
     expect((await loadCurrentDocument())?.document.appState.scrollX).toBe(25);
   });
 
