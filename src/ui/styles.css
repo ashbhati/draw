@@ -67,3 +67,39 @@
 .draw-image-source p{font-size:13px;color:#65636b;line-height:1.5}.draw-web-search{display:grid;gap:8px;margin-top:20px}.draw-web-search label{font-size:13px;font-weight:600}.draw-web-search>div{display:flex;gap:8px}.draw-web-search input{min-width:0;flex:1;border:1px solid #d8d5df;border-radius:6px;padding:8px;font-size:13px}.draw-web-search input:focus-visible{outline:2px solid #6965db}
 @media(max-width:600px){.draw-web-search>div{flex-direction:column}}
 .editor-shell label:has(>.default-sidebar-trigger),.excalidraw [data-testid="addToLibrary"]{display:none}
+
+/* Keep workspace identity and file actions together in the primary toolbar. */
+.topbar{gap:12px}
+.topbar-leading{display:flex;align-items:center;gap:15px;min-width:0;flex:0 1 auto}
+.brand{flex:0 0 auto}
+.workspace-toolbar{display:flex;align-items:center;min-width:0}
+.workspace-toolbar .workspace-combobox{height:35px;min-width:145px;max-width:min(230px,24vw);padding:0 27px 0 10px;border:0;border-radius:6px;background:#f1f0ff;color:#34334a;font-family:inherit;font-size:13px;font-weight:500;cursor:pointer}
+.workspace-toolbar .workspace-combobox:focus-visible{outline:2px solid #6965db;outline-offset:1px}
+.toolbar-divider{display:block;width:1px;height:30px;flex:0 0 1px;background:#dedbd1;margin:0 2px}
+.toolbar-actions{gap:7px;min-width:0;flex:0 1 auto;white-space:nowrap}
+.file-actions-divider{margin-left:4px;margin-right:4px}
+.export-divider{margin-left:1px;margin-right:1px}
+.export-group .export-main{width:35px;min-width:35px;height:35px;padding:0;display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:0}
+.export-group .export-main svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.export-group .export-main:hover{background:#f1f0ff;color:#5753c9}
+.export-group .export-main:disabled{opacity:.45;cursor:default}
+@media(max-width:1180px){
+  .topbar{height:auto;min-height:67px;flex-basis:auto;flex-wrap:wrap;justify-content:flex-start;padding:8px 14px;row-gap:8px}
+  .topbar-leading{flex:1 1 auto}
+  .leading-divider{display:none}
+  .toolbar-actions{flex:1 1 100%;justify-content:flex-end;flex-wrap:wrap}
+}
+@media(max-width:850px){.toolbar-actions{justify-content:flex-start}}
+@media(max-width:640px){
+  .topbar-leading{flex-wrap:wrap;gap:8px}
+  .workspace-toolbar .workspace-combobox{min-width:120px;max-width:min(180px,42vw)}
+  .workspace-controls{gap:2px;padding:3px}
+  .workspace-action{width:30px;height:30px}
+  .toolbar-actions{gap:5px}
+}
+@media(max-width:420px){
+  .topbar{align-items:flex-start;flex-direction:row;justify-content:flex-start}
+  .topbar-leading,.toolbar-actions{width:100%}
+  .topbar-leading{align-items:center}
+  .toolbar-actions{justify-content:flex-start}
+}

@@ -258,7 +258,6 @@ export default function App() {
   const editorSecret = useRef<string | null>(null);
   const bridgeSync = useMemo(() => createBridgeSynchronizer(clientId.current, () => editorSecret.current), []);
   const writerOwned = useRef(false);
-  const titleInput = useRef<HTMLInputElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const lastMcpOperation = useRef<{ id: string; revision: number } | null>(null);
   const lastUndoneOperation = useRef<{ id: string; revision: number } | null>(null);
@@ -896,7 +895,7 @@ export default function App() {
   const createNewWorkspace = async () => {
     try {
       await settleEditorBeforeSwitch();
-      const created = await createWorkspaceWithCanvas("New workspace", "Untitled drawing");
+      const created = await createWorkspaceWithCanvas("New workspace", "New workspace");
       await setActiveCanvas(created.canvas.id);
       await activateWorkspaceLibrary(created.workspace.id);
       lastMcpOperation.current = null; lastUndoneOperation.current = null;
@@ -948,7 +947,12 @@ export default function App() {
 
   const saveFile = () => {
     if (!doc) return;
-    download(new Blob([serializeDrawFile(docRef.current ?? doc)], { type: "application/vnd.draw+json;charset=utf-8" }), filename(workspaces.find((workspace) => workspace.id === activeWorkspaceId)?.name ?? doc.document.title, "draw"));
+    const workspaceName = workspaces.find((workspace) => workspace.id === activeWorkspaceId)?.name ?? doc.document.title;
+    const current = docRef.current ?? doc;
+    const portableDocument = current.document.title === workspaceName
+      ? current
+      : { ...current, document: { ...current.document, title: workspaceName } };
+    download(new Blob([serializeDrawFile(portableDocument)], { type: "application/vnd.draw+json;charset=utf-8" }), filename(workspaceName, "draw"));
     setMessage("Editable Draw file saved.");
   };
 
@@ -2004,19 +2008,25 @@ export default function App() {
 
   return <main className={`draw-app bg-${background}`}>
     <header className="topbar">
-      <div className="brand"><span className="brand-mark">D</span><span className="brand-name">draw</span><span className="brand-divider"/><span className="doc-title"><input ref={titleInput} aria-label="Drawing title" disabled={!canWrite} value={doc.document.title} onChange={(event) => {
-        const next = { ...doc, document: { ...doc.document, title: event.target.value, documentRevision: doc.document.documentRevision + 1 } };
-        setDocument(next);
-        setCanvases((current) => current.map((canvas) => canvas.id === activeCanvasId ? { ...canvas, name: event.target.value } : canvas));
-        if (autosaveBlocked) { setStatus("error"); return; }
-        setStatus("saving");
-        autosave.schedule(next);
-        bridgeAutosave.schedule(next);
-      }} /></span></div>
+      <div className="topbar-leading">
+        <div className="brand"><span className="brand-mark">D</span><span className="brand-name">draw</span></div>
+        <nav className="workspace-toolbar" aria-label="Workspace management">
+          <div className="workspace-controls" role="group" aria-label="Workspace controls">
+            <select className="workspace-combobox" aria-label="Saved workspaces" title="Choose the active workspace" value={activeWorkspaceId} disabled={!canWrite} onChange={(event) => void selectWorkspace(event.target.value)}>
+              {workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}
+            </select>
+            <button className="workspace-action" aria-label="New workspace" title="Create a new workspace" disabled={!canWrite} onClick={() => void createNewWorkspace()}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg></button>
+            <button className="workspace-action" aria-label="Rename workspace" title="Rename the selected workspace" disabled={!canWrite} onClick={() => void renameActiveWorkspace()}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 5 4 4M4 20l5-1L20 8a2.8 2.8 0 0 0-4-4L5 15l-1 5Z" /></svg></button>
+            <button className="workspace-action workspace-action-danger" aria-label="Delete workspace" title="Delete the selected workspace and its drawing" disabled={!canWrite || !workspaces.length} onClick={() => void removeActiveWorkspace()}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v5m4-5v5" /></svg></button>
+          </div>
+        </nav>
+      </div>
+      <span className="toolbar-divider leading-divider" aria-hidden="true" />
       <div className="toolbar-actions">
         <span className={`save-indicator ${status}`}><i />{statusText}</span>
         <button className="button button-quiet" disabled={!canWrite} onClick={() => { setConnectError(""); setConnectOpen(true); }} title="Pair this editor with the local MCP bridge">{editorConnected ? "MCP connected" : "Connect MCP"}</button>
         <button ref={mcpClientsTrigger} className="button button-quiet" disabled={!canWrite || mcpManagementOpening} aria-busy={mcpManagementOpening} onClick={() => void openMcpManagement()} title="Pair or revoke local MCP clients">MCP clients</button>
+        <span className="toolbar-divider file-actions-divider" aria-hidden="true" />
         <button className="button button-quiet file-action" aria-label="Open" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open a .draw file as a new workspace" : "Close the other Draw tab to open files here"}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v2M3 7v13h17l2-10H7L3 20" /></svg></button>
         <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
         {libraryRecoveries.length > 0 && <button className="button button-quiet" aria-label="Library recovery backups" title="View preserved library backups" onClick={() => setLibraryRecoveryOpen(true)}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><path d="M12 8v5m0 3h.01M12 3 2 21h20L12 3Z" /></svg></button>}
@@ -2027,19 +2037,10 @@ export default function App() {
           } catch (error) { setMessage(`Could not download recovery data: ${error instanceof Error ? error.message : String(error)}`); }
         })()}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4" /></svg></button>}
         <button className="button button-quiet file-action" aria-label="Save" onClick={saveFile} title="Save the editable .draw file"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 3h12l4 4v14H3V3h2Zm2 0v6h10V3M7 21v-8h10v8" /></svg></button>
-        <div className="export-group"><button className="button button-quiet export-main" disabled={exportScope === "selection" && !selectionAvailable} title={exportScope === "selection" && !selectionAvailable ? "Select one or more objects to export a selection" : undefined} onClick={() => void exportImage("image/png")}>Export</button><select aria-label="Export scope" value={exportScope} onChange={(event) => setExportScope(event.target.value as "canvas" | "selection")}><option value="canvas">Whole drawing</option><option value="selection">Selection only</option></select><select aria-label="Image export format" value="image/png" onChange={(event) => void exportImage(event.target.value as "image/png" | "image/jpeg")}><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option></select></div>
+        <span className="toolbar-divider export-divider" aria-hidden="true" />
+        <div className="export-group"><button className="button button-quiet export-main file-action" aria-label="Export image" disabled={exportScope === "selection" && !selectionAvailable} title={exportScope === "selection" && !selectionAvailable ? "Select one or more objects to export a selection" : "Export a shareable image"} onClick={() => void exportImage("image/png")}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M14 3h7v7M10 14 21 3M19 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h6" /></svg></button><select aria-label="Export scope" value={exportScope} onChange={(event) => setExportScope(event.target.value as "canvas" | "selection")}><option value="canvas">Whole drawing</option><option value="selection">Selection only</option></select><select aria-label="Image export format" value="image/png" onChange={(event) => void exportImage(event.target.value as "image/png" | "image/jpeg")}><option value="image/png">PNG</option><option value="image/jpeg">JPEG</option></select></div>
       </div>
     </header>
-    <nav className="project-toolbar" aria-label="Workspace management">
-      <div className="workspace-controls" role="group" aria-label="Workspace controls">
-        <select className="workspace-combobox" aria-label="Saved workspaces" title="Choose the active workspace" value={activeWorkspaceId} disabled={!canWrite} onChange={(event) => void selectWorkspace(event.target.value)}>
-          {workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}
-        </select>
-        <button className="workspace-action" aria-label="New workspace" title="Create a new workspace" disabled={!canWrite} onClick={() => void createNewWorkspace()}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg></button>
-        <button className="workspace-action" aria-label="Rename workspace" title="Rename the selected workspace" disabled={!canWrite} onClick={() => void renameActiveWorkspace()}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 5 4 4M4 20l5-1L20 8a2.8 2.8 0 0 0-4-4L5 15l-1 5Z" /></svg></button>
-        <button className="workspace-action workspace-action-danger" aria-label="Delete workspace" title="Delete the selected workspace and its drawing" disabled={!canWrite || !workspaces.length} onClick={() => void removeActiveWorkspace()}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v5m4-5v5" /></svg></button>
-      </div>
-    </nav>
     <dialog ref={imageDialog} className="draw-image-picker draw-image-source" aria-labelledby="draw-image-picker-title" onCancel={(event) => { event.preventDefault(); closeImagePicker(); }}>
       <div className="draw-dialog-heading"><h2 id="draw-image-picker-title">Insert image</h2><button className="button button-quiet" onClick={closeImagePicker} aria-label="Close image options">×</button></div>
       <div className="draw-image-source-actions">
@@ -2073,7 +2074,7 @@ export default function App() {
       if (target.matches('input[name="editor-current-shape"][aria-label="Insert image"]') && (event.key === " " || event.key === "Enter")) {
         event.preventDefault(); event.stopPropagation(); openImagePicker();
       }
-    }}><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onCurrentEditorChange} onLibraryChange={onCurrentLibraryChange} viewModeEnabled={!canWrite} theme="light" name={doc.document.title} UIOptions={EDITOR_UI_OPTIONS}
+    }}><Excalidraw key={editorKey} initialData={initialData} excalidrawAPI={onEditorReady} onChange={onCurrentEditorChange} onLibraryChange={onCurrentLibraryChange} viewModeEnabled={!canWrite} theme="light" name={workspaces.find((workspace) => workspace.id === activeWorkspaceId)?.name ?? doc.document.title} UIOptions={EDITOR_UI_OPTIONS}
       renderTopRightUI={renderCanvasToolbar}>{DRAW_MENU}</Excalidraw></div>
       </section>
     </div>
