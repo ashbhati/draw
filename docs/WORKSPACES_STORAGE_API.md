@@ -1,4 +1,4 @@
-# Workspace storage API (V2 foundation)
+# Workspace storage API (V1.2.0)
 
 Draw stores workspaces and boards locally in IndexedDB. A workspace represents one project and contains exactly one board; each board points to one editable `DrawDocument`. A board is not a `.draw` file: the portable file remains a self-contained format v1 document and can be moved independently.
 

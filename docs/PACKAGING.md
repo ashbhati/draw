@@ -1,9 +1,13 @@
 # Draw package and local MCP runtime
 
+## V1.2.0 source release
+
+Draw V1.2.0 is available on GitHub as commit `96d8fb6` and tag [`v1.2.0`](https://github.com/ashbhati/draw/tree/v1.2.0). The package metadata is version `1.2.0`. The GitHub source release is available, but the package has not been published to npm because the repository still has no owner-selected root project license.
+
 ## Supported package slice
 
-- Distribution: a public npm CLI package named `@ashbhati/draw`.
-- Runtime: Node.js 20.19+ or 22.12+ on macOS and Linux.
+- Intended distribution: a public npm CLI package named `@ashbhati/draw` (not yet published).
+- Runtime: macOS/Linux with Node.js in the range `>=20.19.0 <21 || >=22.12.0`.
 - `draw start`: serves the production Vite build on loopback and starts the per-user MCP IPC socket.
 - `draw mcp`: runs the MCP stdio host and sends MCP bridge operations through that Unix domain socket.
 - The browser editor connects to the local app over loopback HTTP, authenticates with the one-use terminal launch code, and receives bridge events on a short-lived ticketed Server-Sent Events stream.
@@ -32,7 +36,7 @@ Starting Draw opens the local URL from an interactive terminal; `draw start --no
 
 ## Package validation and release gate
 
-Run the complete release gate before publishing or cutting a release:
+Run the complete release gate before publishing the npm package or cutting a future release:
 
 ```sh
 npm ci
@@ -42,6 +46,8 @@ npm run test:release
 
 `test:release` runs unit/config tests, the production build, the Chrome browser suite, production MCP round-trip, and a real `npm pack` + clean-prefix install followed by the packaged Chrome/MCP round-trip. The packaged CLI tests run from an empty temporary working directory with no `node_modules`, covering `draw help`, `draw start`, and `draw mcp`. GitHub Actions runs this release gate on Node 20 and 22 for pull requests and main-branch pushes.
 
+For V1.2.0, the release checks passed: 286 unit tests, the build, 58 editor Chrome E2E flows, the production MCP/IPC flow, and the installed-package MCP E2E flow. The local machine did not have Playwright's bundled Chromium installed, so those browser flows used system Chrome. CI installs Playwright Chromium before running `test:release`.
+
 To run only the packaged browser check against an already installed tarball:
 
 ```sh
@@ -50,7 +56,7 @@ DRAW_PACKAGE_BIN=/absolute/path/to/test-prefix/node_modules/@ashbhati/draw/bin/d
 
 This flow starts `draw start` in a trusted pseudo-terminal, connects the production UI in Chrome, pairs a local stdio MCP host through `draw mcp`, rejects unpaired HTTP reads, and creates and verifies an editable diagram through IPC. Before transmitting a paired capability, the MCP client verifies that the socket and parent directory are owned by its OS user, are not symlinks, and have private permissions. Overlong socket paths fail with guidance to set `DRAW_RUNTIME_DIR` to a shorter per-user path. The end-user manual acceptance flow should also save and reopen a `.draw` file and export PNG/JPEG.
 
-**Publishing is gated on the owner selecting and adding a root project license.** This PR intentionally adds no license file or SPDX identifier and does not publish the package. Once the owner selects the project license, add it at the repository root, set the package's `license` field to the matching SPDX identifier, choose a release version, and publish with `npm publish --access public` from the reviewed release tag.
+**npm publication is gated on the owner selecting and adding a root project license.** No license file or SPDX identifier is present. Once the owner selects the project license, add it at the repository root, set the package's `license` field to the matching SPDX identifier, and publish the reviewed package version from its release tag with `npm publish --access public`.
 
 ## Deferred platform work
 

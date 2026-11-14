@@ -16,6 +16,7 @@
     "src/ui/autosave.ts",
     "dist/",
     "README.md",
+    "CHANGELOG.md",
     "PLAN.md",
     "docs/PACKAGING.md",
     "docs/ASSET_ATTRIBUTION.md",

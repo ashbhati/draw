@@ -2,20 +2,20 @@
 
 ## Product goal
 
-Build a local-first, Excalidraw-like drawing tool for creating and editing hand-drawn diagrams on one persistent infinite canvas. The initial visual direction is the charcoal chalkboard style in the GAI World deck and the supplied human-machine flow example.
+Draw is a local-first, Excalidraw-like drawing tool for creating and editing diagrams on infinite canvases. The visual direction is the charcoal Blackboard style in the GAI World deck and the supplied human-machine flow example.
 
-The first release is for one person on one canvas. It should be easy to draw manually, ask Codex to create or edit diagrams through MCP, save the editable work, close the app, and return to it later.
+The project began with one local canvas. The current V1.2.0 release organizes projects as workspaces, each with one editable infinite board, and lets a human or an MCP-connected agent create and edit the same native drawing.
 
 ## Product principles
 
 - **The `.draw` file is the editable source.** It stores the canvas scene and its diagram elements, not just a rendered image.
 - **PNG and JPEG are flattened exports.** They are for sharing and do not preserve editable objects.
-- **One infinite canvas can hold multiple diagrams.** Project folders and multiple pages are deferred.
+- **A workspace represents one project and contains one infinite board.** Create a separate workspace for each project; multiple boards within one workspace are deferred.
 - **Background is a document choice.** Start with Blackboard and Whiteboard presets and restore the selected preset when reopening a `.draw` file.
 - **Draw owns the product and file format.** Excalidraw's MIT-licensed React editor package is the recommended starting point for drawing interactions, not a requirement to support Excalidraw file import/export.
 - **AI creates native editable objects.** Generated diagrams should be text, shapes, arrows, and paths that can be selected and edited after creation.
 
-## First release scope
+## Original V1 scope (delivered)
 
 ### Canvas and editing
 
@@ -91,35 +91,48 @@ Connect Codex to the open document for diagram creation and targeted edits. Veri
 - Create a diagram through MCP, edit it manually, save/reopen it, and confirm the result remains intact. **[Status: covered in Chrome E2E]**
 - Use the supplied Specification → Implementation → Validation example as a visual check for layout, chalk contrast, yellow emphasis, and editability. **[Status: covered in Chrome E2E using the committed top-row reconstruction; lower human/machine illustrations remain visual guidance]**
 
-## V1 implementation status
+## V1.0 implementation record
 
-V1 is implemented and its review fixes are merged. It includes one infinite canvas, Blackboard/Whiteboard presets, editable `.draw` save/open, browser-local autosave, flattened PNG/JPEG export, and MCP creation/targeted edits. The left quick-start rail and Excalidraw outbound menu links were removed; canvas selection is in the main toolbar. The Blackboard uses a natural slate texture with irregular chalk residue and uniform cover scaling on the live canvas and image exports. Default MCP node fills are transparent on Blackboard so the texture remains visible; the texture source and applicable terms are recorded in [docs/ASSET_ATTRIBUTION.md](./docs/ASSET_ATTRIBUTION.md).
+V1.0 delivered the original one-canvas baseline: Blackboard/Whiteboard presets, editable `.draw` save/open, browser-local autosave, flattened PNG/JPEG export, and initial MCP diagram creation/targeted edits. The left quick-start rail and Excalidraw outbound menu links were removed; background selection was placed in the main editor toolbar. The Blackboard uses a natural slate texture with irregular chalk residue and uniform cover scaling on the live board and image exports. Default MCP node fills are transparent on Blackboard so the texture remains visible. The texture source and applicable terms are recorded in [docs/ASSET_ATTRIBUTION.md](./docs/ASSET_ATTRIBUTION.md).
 
-The acceptance flows are covered by automated Chrome E2E, including pan/zoom, manual drawing, both backgrounds, editable save/reopen, assets, image exports, the supplied reference diagram, MCP edits, wide-canvas seam checks, wide/short texture-scale checks, and compact-flow live/PNG/JPEG texture comparisons. The Playwright server now uses an isolated loopback port by default and will not silently reuse another server. On the merged main branch after PRs [#23](https://github.com/ashbhati/draw/pull/23), [#24](https://github.com/ashbhati/draw/pull/24), [#25](https://github.com/ashbhati/draw/pull/25), and [#27](https://github.com/ashbhati/draw/pull/27), `npm test` passes 79/79, `npm run build` succeeds with the existing large-chunk advisory, and system Chrome passes all 30 E2E flows. The latest Blackboard refinement was tracked in [issue #26](https://github.com/ashbhati/draw/issues/26). Safari and Firefox have not been checked.
+The initial acceptance flows covered pan/zoom, manual drawing, both backgrounds, editable save/reopen, assets, image exports, the supplied reference diagram, MCP edits, and Blackboard texture comparisons. The full release status is updated below.
 
-The MCP bridge currently requires the Vite development server and an open Draw tab. A packaged production/desktop host remains outside this V1 local development workflow and needs separate release scope.
+## V1.2.0 release status
 
-## Revisit after the first release
+V1.2.0 is tagged on `main` as [`v1.2.0`](https://github.com/ashbhati/draw/tree/v1.2.0). It completes the local V2 scope recorded in this plan:
 
-Keep these out of the first build, then prioritize them based on actual use:
+- **Workspaces:** each project has one board; workspaces can be created, switched, renamed, deleted, and restored after reload. Opening a `.draw` file creates a separate workspace.
+- **MCP parity for core drawing work:** agents can read the active drawing, create and edit native elements, select, arrange, group, duplicate, delete, undo/redo their eligible changes, manage viewport and background settings, import/open/save `.draw`, and export PNG/JPEG. Workspace lifecycle and image/library operations are available through MCP where supported.
+- **MCP connection:** Draw authenticates the editor tab with a one-use launch code. An MCP host then requests an in-app approval without a manually copied pairing secret. Approved host access survives host and app restarts until revoked; credentials are stored locally with restrictive permissions.
+- **Images:** the human image picker supports local images and direct image URLs discovered via Google Images. MCP image search/insertion uses the Openverse API with embedded image data and attribution metadata.
+- **Runtime:** the packaged CLI runs the production app and MCP host through private per-user local IPC on macOS and Linux.
+- **Manual UI refinement:** export controls retain readable labels and compact MCP controls use accessible icon buttons.
+
+V1.2.0 validation passed 286 unit tests, 58 Chrome editor E2E flows, the production MCP/IPC round trip, and the installed-package MCP E2E flow. The build passed with the existing large-chunk advisory. The default local release command expects Playwright Chromium to be installed; on this machine the same browser flows were run with system Chrome. The npm package is not published because the repository still has no owner-selected root project license; the GitHub source tag is available.
+
+Known limits for this release: one board per workspace, MCP file save never overwrites an existing file (`PATH_EXISTS`), Google Images is an external search tab rather than an embedded gallery, and the package supports macOS/Linux only. Details are in [README.md](README.md), [docs/PACKAGING.md](docs/PACKAGING.md), and [docs/MCP_CAPABILITY_MATRIX.md](docs/MCP_CAPABILITY_MATRIX.md).
+
+## Deferred beyond V1.2.0
+
+These remain deferred beyond V1.2.0 and can be prioritized based on actual use:
 
 - Cloud sync, user accounts, collaboration, view/edit permissions, and comments.
 - Excalidraw file import/export or compatibility, if it becomes useful.
-- Broader Excalidraw feature coverage after a focused feature audit.
-- Additional board/background presets, richer illustration tools, and presentation workflows.
-- Package the app and MCP bridge for a production or desktop workflow.
+- Multiple boards within one workspace.
+- A first-party online image results gallery and additional image providers; the current Google Images flow opens an external search tab.
+- A human-facing reusable-library interface; legacy library storage and MCP tools remain for compatibility.
+- Additional background presets, richer illustration tools, and presentation workflows.
+- Windows support and signed/notarized desktop installers.
 
-## V2 workspace and canvas progress
+## Workspace model
 
-Issue [#34](https://github.com/ashbhati/draw/issues/34) adds browser-local project organization after V1. The storage foundation is merged in PR [#47](https://github.com/ashbhati/draw/pull/47): per-canvas documents and autosave, isolated revisions/history, V1 single-document migration, and safe active-canvas recovery. The initial V2 UI supported multiple canvases per workspace; that description is retained here as implementation history. Issue [#11](https://github.com/ashbhati/draw/issues/11) adds reusable library items scoped to a workspace, including selected elements, bound labels, referenced assets, editable insertion, and item management. Cloud sync and packaged production MCP remain separate backlog items.
-
-**Current V2 workspace behavior:** the app presents one infinite board per workspace. Schema 11 migrates every existing board into its own workspace while keeping its editable drawing, document/canvas IDs, active selection, and library data. Creating or opening a `.draw` file creates a separate workspace. The saved-workspace list is an accessible icon-triggered menu; create, rename, and delete are accessible icon actions with tooltips. Browser autosave is a local working copy, separate from explicit portable `.draw` Save. See [Autosave recovery](docs/AUTOSAVE_RECOVERY.md) for local recovery behavior. MCP canvas-named compatibility operations that create or duplicate a board create a new workspace; deleting a board requires the confirmed workspace deletion flow.
+Draw stores workspaces and their one-board documents in browser-local IndexedDB. Schema 11 migrates older boards into individual workspaces while preserving editable scenes, IDs, histories, active selection, and library data. The workspace dropdown changes the active project; adjacent icon buttons create, rename, and delete workspaces. Deleting a workspace requires confirmation and removes its board and associated local data. Browser autosave is the local working copy; explicit `.draw` Save remains the portable backup/transfer format. MCP canvas-named compatibility tools create/select workspaces with one board. See [Workspace storage](docs/WORKSPACES_STORAGE_API.md) and [Autosave recovery](docs/AUTOSAVE_RECOVERY.md).
 
 ## Initial decisions
 
-- **Canvas model:** one infinite scene, multiple diagrams within it.
+- **Workspace model:** one infinite board per project workspace; multiple diagrams within that board.
 - **Persistence:** local working autosave plus portable `.draw` documents.
 - **Initial backgrounds:** Blackboard and Whiteboard.
 - **Image exports:** PNG and JPEG; flattened by definition.
 - **Interoperability:** no Excalidraw-file compatibility requirement for v1.
-- **Future scope:** revisit the deferred capabilities after the first release is implemented and used.
+- **Current release:** V1.2.0; deferred work is listed in [Deferred beyond V1.2.0](#deferred-beyond-v120).

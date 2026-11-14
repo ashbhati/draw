@@ -2,9 +2,19 @@
 
 Draw is a local-first, Excalidraw-based infinite canvas for editable diagrams. The `.draw` file is the editable source; PNG and JPEG exports are flattened images.
 
+## V1.2.0 release
+
+The latest source release is [`v1.2.0`](https://github.com/ashbhati/draw/tree/v1.2.0). It includes project workspaces, editable `.draw` import/export, image export, online image insertion, and MCP tools for creating and editing diagrams. MCP hosts now request approval in Draw without a manually copied pairing secret; approved hosts stay connected across restarts until revoked. The release tag is available on GitHub; npm publication remains pending the owner's choice of a root project license. See the [changelog](CHANGELOG.md) for release notes.
+
+### Human and agent workflows
+
+People and MCP-connected agents work on the same editable Draw document. A person can draw directly in the editor; an agent can create or update native diagram elements through Draw MCP. The owner can inspect and continue editing the agent's result in Draw.
+
+![A human edits through the Draw UI and an agent uses Draw MCP; both produce the same editable diagram.](docs/reference/draw-human-agent-mcp-overview.png)
+
 ## Install and launch
 
-The planned end-user distribution is the public npm package `@ashbhati/draw`. It supports macOS and Linux with Node.js 20.19+ or 22.12+.
+The intended end-user distribution is the public npm package `@ashbhati/draw`. The package targets macOS and Linux. Its Node.js engine range is `>=20.19.0 <21 || >=22.12.0`.
 
 Once the package is published:
 
@@ -76,13 +86,16 @@ When running from source, start `npm run dev` yourself in a trusted terminal. Ty
     "draw": {
       "command": "npm",
       "args": ["--silent", "--prefix", "/absolute/path/to/draw", "run", "mcp"],
-      "env": { "DRAW_MCP_BASE_URL": "http://127.0.0.1:5173" }
+      "env": {
+        "DRAW_MCP_BASE_URL": "http://127.0.0.1:5173",
+        "DRAW_MCP_DOCUMENT_DIR": "/absolute/path/to/a/dedicated/draw-documents-folder"
+      }
     }
   }
 }
 ```
 
-Replace `/absolute/path/to/draw` with the root of the exact Draw checkout and revision serving the page; the MCP client inherits its own working directory, so plain `npm run mcp` can accidentally start a different, older Draw copy. If Vite uses a loopback port other than `5173`, set `DRAW_MCP_BASE_URL` to that server's actual origin. Record the checkout revision with `git -C /absolute/path/to/draw rev-parse HEAD`, and restart the Vite server and reconnect MCP after changing checkouts. Before pairing, inspect the client's tool list (`tools/list` in MCP) and confirm it includes `pair_mcp_client`, `get_current_canvas`, `create_elements`, `list_workspaces`, `save_document`, and `export_image`. If any expected V2 tools are missing, correct `--prefix` and reconnect before pairing. The development bridge uses loopback HTTP and requires the Draw tab to remain open. Its localhost pairing surface is intended only for trusted local development, not as the production MCP transport.
+Replace `/absolute/path/to/draw` with the root of the exact Draw checkout and revision serving the page; the MCP client inherits its own working directory, so plain `npm run mcp` can accidentally start a different, older Draw copy. If Vite uses a loopback port other than `5173`, set `DRAW_MCP_BASE_URL` to that server's actual origin. Record the checkout revision with `git -C /absolute/path/to/draw rev-parse HEAD`, and restart the Vite server and reconnect MCP after changing checkouts. Before pairing, inspect the client's tool list (`tools/list` in MCP) and confirm it includes `pair_mcp_client`, `get_current_canvas`, `create_elements`, `list_workspaces`, `save_document`, and `export_image`. If any expected tools are missing, correct `--prefix` and reconnect before pairing. The development bridge uses loopback HTTP and requires the Draw tab to remain open. Its localhost pairing surface is intended only for trusted local development, not as the production MCP transport.
 
 The bridge requires the paired capability on document reads, confirmations, and commands, and separately requires the active editor-tab secret for editor sync and acknowledgements. In the Vite development bridge, any local process that can reach the loopback route can request an approval prompt. The prompt does not authenticate the process: its name can be spoofed, so approval is only as trustworthy as your judgment that you initiated the pairing and verified the displayed fingerprint. Use only trusted local MCP hosts while running the development server. The packaged runtime restricts MCP routes to its private Unix socket; same-OS-user processes remain trusted.
 
@@ -97,26 +110,9 @@ npm run test:e2e
 
 The e2e suite runs the app locally in Chromium and selects an available loopback port for each run. To pin a run to a specific port, set `DRAW_E2E_BASE_URL`, for example `DRAW_E2E_BASE_URL=http://127.0.0.1:5197 npm run test:e2e`. It starts its own strict-port server and does not reuse an existing server by default. Set `DRAW_E2E_REUSE_SERVER=1` only when intentionally reusing the server at that URL. Playwright downloads its browser separately; on managed systems where its default browser cache is unavailable, set `PLAYWRIGHT_BROWSERS_PATH` to a writable directory when installing and running the suite.
 
-## Configure a development MCP client
+## MCP tool reference
 
-From a source checkout, use an explicit absolute repository path so the MCP host and Vite development UI come from the same checkout and revision. Do not rely on the MCP client's current working directory. For clients using JSON MCP configuration, the server entry is:
-
-```json
-{
-  "mcpServers": {
-    "draw": {
-      "command": "npm",
-      "args": ["--silent", "--prefix", "/absolute/path/to/draw", "run", "mcp"],
-      "env": {
-        "DRAW_MCP_BASE_URL": "http://127.0.0.1:5173",
-        "DRAW_MCP_DOCUMENT_DIR": "/absolute/path/to/a/dedicated/draw-documents-folder"
-      }
-    }
-  }
-}
-```
-
-`DRAW_MCP_DOCUMENT_DIR` must be an absolute path to an existing folder. It is used only by MCP file tools (`open_document`, `save_document`, `export_image`, and `.draw` import); those tools are confined to that folder. Before pairing, verify the advertised tools as described in [Development MCP setup](#development-mcp-setup). Automated browser coverage pairs a source-run MCP host and reads the active canvas through the Vite bridge.
+To configure the source-run server, follow [Development MCP setup](#development-mcp-setup). Set `DRAW_MCP_DOCUMENT_DIR` to an existing absolute folder to enable MCP file operations; file tools are confined to that folder. The packaged runtime uses the private per-user IPC socket described in [Connect an MCP client](#connect-an-mcp-client).
 
 Available tools:
 
@@ -129,7 +125,7 @@ Available tools:
 - `update_elements`: move, resize, recolor, or change text on existing elements.
 - `delete_elements`, `duplicate_elements`, `group_elements`, `ungroup_elements`, and `arrange_elements`: edit selected element IDs with revision-guarded batches. `arrange_elements` supports layer order, alignment, and distribution.
 - `set_selection`: select or clear element IDs in the editor; selection is temporary and is not saved in `.draw`.
-- `undo_operation` and `redo_operation`: act on the latest eligible MCP operation by its returned `operationId`. Draw rejects an undo after any later human scene change; eligibility is intentionally not retained across page reloads or MCP restarts.
+- `undo_operation` and `redo_operation`: act on the latest eligible MCP operation by its returned `operationId`. Draw rejects an undo after a later human or other-client scene change. Operation history and idempotent retries persist across editor reloads and MCP host restarts within their retention period.
 - `set_canvas_settings` and `set_viewport`: set the document title/background or pan, zoom, and fit-to-content. Scene and view revisions are tracked separately.
 - `save_document`, `open_document`, and `export_image`: save editable `.draw` documents, reopen them, and return PNG/JPEG image artifacts. Direct file operations require `DRAW_MCP_DOCUMENT_DIR`; MCP paths are basenames within that folder. Existing output files fail with `PATH_EXISTS` and are never overwritten; save-as to a new filename. Safe overwrite is tracked in [issue #39](https://github.com/ashbhati/draw/issues/39). Replacing a populated canvas returns `NEEDS_CONFIRMATION` with a one-use token; approve or deny it in Draw, then retry `open_document` with the token. Editor-side sync, acknowledgements, and approval require the active tab's secret; MCP reads, confirmation requests, and commands require the paired host capability.
 - `list_workspaces` and `list_canvases`: read stable IDs, active workspace/canvas, catalog revision, and the active editable document with its revisions. The UI presents one board per workspace; `list_canvases` returns that workspace's sole board.
