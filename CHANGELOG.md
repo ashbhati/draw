@@ -2,14 +2,14 @@
 
 This file records user-visible Draw releases. GitHub source tags and npm package versions are recorded separately when they differ.
 
-## [1.2.1] — prepared 2026-11-14
+## [1.2.1] — 2026-11-14
 
-- Prepared the first public npm distribution of the local Draw app as `@ashbhati/draw` for macOS and Linux.
+- Released the local Draw app as the public npm package `@ashbhati/draw` for macOS and Linux.
 - Added the MIT project license and npm package metadata, including links to the source repository, homepage, and issue tracker.
 - Clarified that Draw is a visual app with small launch commands, not a command-line drawing interface.
 - Kept the V1.2.0 feature set unchanged.
 
-The npm package has not been published yet. This entry will be finalized with the first npm release.
+See the [v1.2.1 GitHub release](https://github.com/ashbhati/draw/releases/tag/v1.2.1).
 
 ## [1.2.0] — 2026-11-12
 
