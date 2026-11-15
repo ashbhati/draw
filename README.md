@@ -2,9 +2,9 @@
 
 Draw is a local-first, Excalidraw-based infinite canvas for editable diagrams. The `.draw` file is the editable source; PNG and JPEG exports are flattened images.
 
-## V1.2.1 npm release
+## V1.2.2 npm release
 
-Draw is distributed from npm as `@ashbhati/draw`. Version 1.2.1 carries the V1.2.0 feature set: project workspaces, editable `.draw` import/export, image export, online image insertion, and MCP tools for creating and editing diagrams. Draw is licensed under MIT. See the [changelog](CHANGELOG.md) and [GitHub release](https://github.com/ashbhati/draw/releases/tag/v1.2.1) for details.
+Draw is distributed from npm as `@ashishbhatia/draw`. Version 1.2.2 carries the V1.2.0 feature set: project workspaces, editable `.draw` import/export, image export, online image insertion, and MCP tools for creating and editing diagrams. Draw is licensed under MIT. See the [changelog](CHANGELOG.md) and [GitHub release](https://github.com/ashbhati/draw/releases/tag/v1.2.2) for details.
 
 ### Human and agent workflows
 
@@ -14,12 +14,12 @@ People and MCP-connected agents work on the same editable Draw document. A perso
 
 ## Install and launch
 
-The npm package `@ashbhati/draw` installs the local Draw app. It targets macOS and Linux and requires Node.js `>=20.19.0 <21 || >=22.12.0`.
+The npm package `@ashishbhatia/draw` installs the local Draw app. It targets macOS and Linux and requires Node.js `>=20.19.0 <21 || >=22.12.0`.
 
 Install and launch it with:
 
 ```sh
-npm install --global @ashbhati/draw
+npm install --global @ashishbhatia/draw
 draw start
 ```
 
@@ -70,7 +70,7 @@ The app and MCP host communicate through a Unix domain socket in a per-user dire
 
 An MCP host is the configured connection in an MCP app such as Herdr, not an individual Codex or Claude conversation. Agents using the same configured host share its Draw access. Draw asks for approval once per host; its credential survives MCP host and Draw restarts and remains active until revoked. Revoking a host in Draw blocks its future requests and cancels its pending bridge work. Draw itself must be running, and its editor tab connected, while an agent works. The editor launch code authenticates that tab and is separate from the host's persistent authorization.
 
-To upgrade, run `npm install --global @ashbhati/draw@latest`. To uninstall, run `npm uninstall --global @ashbhati/draw`. Your `.draw` files and local browser autosave are not removed by uninstalling the package.
+To upgrade, run `npm install --global @ashishbhatia/draw@latest`. To uninstall, run `npm uninstall --global @ashishbhatia/draw`. Your `.draw` files and local browser autosave are not removed by uninstalling the package.
 
 For contributors using the Vite bridge, see [Development MCP setup](#development-mcp-setup).
 

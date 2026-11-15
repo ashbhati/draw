@@ -1,9 +1,10 @@
-import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const projectRoot = process.cwd();
+const packageName = JSON.parse(await readFile(join(projectRoot, "package.json"), "utf8")).name;
 const npmCli = process.env.npm_execpath;
 if (!npmCli) throw new Error("Run this release check through npm so npm_execpath is available.");
 const root = await mkdtemp(join(tmpdir(), "draw-release-package-"));
@@ -22,7 +23,7 @@ try {
   runNpm(["pack", "--pack-destination", packageDirectory], npmEnv);
   const tarball = join(packageDirectory, (await readdir(packageDirectory)).find((file) => file.endsWith(".tgz")) ?? "");
   runNpm(["install", "--prefix", installDirectory, tarball], npmEnv);
-  const packageBin = join(installDirectory, "node_modules", "@ashbhati", "draw", "bin", "draw.js");
+  const packageBin = join(installDirectory, "node_modules", ...packageName.split("/"), "bin", "draw.js");
   runNpm(["run", "test:e2e:package"], { ...npmEnv, DRAW_PACKAGE_BIN: packageBin });
 } finally {
   await rm(root, { recursive: true, force: true });

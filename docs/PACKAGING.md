@@ -1,12 +1,12 @@
 # Draw package and local MCP runtime
 
-## V1.2.1 npm distribution
+## V1.2.2 npm distribution
 
-Draw's V1.2.0 feature set is available on GitHub as commit `96d8fb6` and tag [`v1.2.0`](https://github.com/ashbhati/draw/tree/v1.2.0). The first npm distribution is version `1.2.1`, licensed under MIT, with source tag [`v1.2.1`](https://github.com/ashbhati/draw/tree/v1.2.1).
+Draw's V1.2.0 feature set is available on GitHub as commit `96d8fb6` and tag [`v1.2.0`](https://github.com/ashbhati/draw/tree/v1.2.0). The first npm distribution is version `1.2.2`, licensed under MIT, with source tag [`v1.2.2`](https://github.com/ashbhati/draw/tree/v1.2.2).
 
 ## Supported package slice
 
-- Distribution: the public npm package named `@ashbhati/draw` installs the local Draw app and its small `draw start` and `draw mcp` launch commands.
+- Distribution: the public npm package named `@ashishbhatia/draw` installs the local Draw app and its small `draw start` and `draw mcp` launch commands.
 - Runtime: macOS/Linux with Node.js in the range `>=20.19.0 <21 || >=22.12.0`.
 - `draw start`: serves the production Vite build on loopback and starts the per-user MCP IPC socket.
 - `draw mcp`: runs the MCP stdio host and sends MCP bridge operations through that Unix domain socket.
@@ -26,10 +26,10 @@ The Vite development bridge remains a separate, loopback-only development transp
 Install from npm:
 
 ```sh
-npm install --global @ashbhati/draw
+npm install --global @ashishbhatia/draw
 draw start
-npm install --global @ashbhati/draw@latest
-npm uninstall --global @ashbhati/draw
+npm install --global @ashishbhatia/draw@latest
+npm uninstall --global @ashishbhatia/draw
 ```
 
 Starting Draw opens the local URL from an interactive terminal; `draw start --no-open` prints the URL without launching a browser. The user keeps the process running and opens the URL in Chrome or another supported browser. The package does not host drawings remotely. `.draw` files remain the editable copies; browser autosave lives in that browser profile and is not removed by package upgrades or uninstall.
@@ -46,12 +46,12 @@ npm run test:release
 
 `test:release` runs unit/config tests, the production build, the Chrome browser suite, production MCP round-trip, and a real `npm pack` + clean-prefix install followed by the packaged Chrome/MCP round-trip. The installed-package checks run from an empty temporary working directory with no `node_modules`, covering `draw help`, `draw start`, and `draw mcp`. GitHub Actions runs this release gate on Node 20 and 22 for pull requests and main-branch pushes.
 
-For V1.2.0, the release checks passed: 286 unit tests, the build, 58 editor Chrome E2E flows, the production MCP/IPC flow, and the installed-package MCP E2E flow. The V1.2.1 package preview includes the MIT license and generated app bundle. The local machine did not have Playwright's bundled Chromium installed, so the V1.2.0 browser flows used system Chrome. CI installs Playwright Chromium before running `test:release`.
+For V1.2.0, the release checks passed: 286 unit tests, the build, 58 editor Chrome E2E flows, the production MCP/IPC flow, and the installed-package MCP E2E flow. The V1.2.2 package preview includes the MIT license and generated app bundle. The local machine did not have Playwright's bundled Chromium installed, so the V1.2.0 browser flows used system Chrome. CI installs Playwright Chromium before running `test:release`.
 
 To run only the packaged browser check against an already installed tarball:
 
 ```sh
-DRAW_PACKAGE_BIN=/absolute/path/to/test-prefix/node_modules/@ashbhati/draw/bin/draw.js npm run test:e2e:package
+DRAW_PACKAGE_BIN=/absolute/path/to/test-prefix/node_modules/@ashishbhatia/draw/bin/draw.js npm run test:e2e:package
 ```
 
 This flow starts `draw start` in a trusted pseudo-terminal, connects the production UI in Chrome, pairs a local stdio MCP host through `draw mcp`, rejects unpaired HTTP reads, and creates and verifies an editable diagram through IPC. Before transmitting a paired capability, the MCP client verifies that the socket and parent directory are owned by its OS user, are not symlinks, and have private permissions. Overlong socket paths fail with guidance to set `DRAW_RUNTIME_DIR` to a shorter per-user path. The end-user manual acceptance flow should also save and reopen a `.draw` file and export PNG/JPEG.

@@ -1,13 +1,13 @@
 {
-  "name": "@ashbhati/draw",
-  "version": "1.2.1",
+  "name": "@ashishbhatia/draw",
+  "version": "1.2.2",
   "description": "A local-first infinite canvas for editable diagrams, with Blackboard and Whiteboard styles and optional MCP agent integration.",
   "private": false,
   "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ashbhati/draw.git"
+    "url": "git+https://github.com/ashbhati/draw.git"
   },
   "homepage": "https://github.com/ashbhati/draw#readme",
   "bugs": {
