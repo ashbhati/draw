@@ -1,6 +1,15 @@
 # Changelog
 
-This file records user-visible Draw releases. GitHub source tags are separate from npm publication; Draw V1.2.0 is tagged on GitHub but has not been published to npm.
+This file records user-visible Draw releases. GitHub source tags and npm package versions are recorded separately when they differ.
+
+## [1.2.1] — prepared 2026-11-14
+
+- Prepared the first public npm distribution of the local Draw app as `@ashbhati/draw` for macOS and Linux.
+- Added the MIT project license and npm package metadata, including links to the source repository, homepage, and issue tracker.
+- Clarified that Draw is a visual app with small launch commands, not a command-line drawing interface.
+- Kept the V1.2.0 feature set unchanged.
+
+The npm package has not been published yet. This entry will be finalized with the first npm release.
 
 ## [1.2.0] — 2026-11-12
 
@@ -18,7 +27,7 @@ This file records user-visible Draw releases. GitHub source tags are separate fr
 - Production MCP/IPC E2E and installed-package MCP E2E passed.
 - Production build passed with the existing large-chunk advisory.
 
-The npm package remains unpublished until the owner selects and adds a root project license. See [Packaging](docs/PACKAGING.md).
+See [Packaging](docs/PACKAGING.md) for installation details and platform support.
 
 ## [1.1.0]
 

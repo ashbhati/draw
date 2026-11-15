@@ -1,8 +1,25 @@
 {
   "name": "@ashbhati/draw",
-  "version": "1.2.0",
+  "version": "1.2.1",
+  "description": "A local-first infinite canvas for editable diagrams, with Blackboard and Whiteboard styles and optional MCP agent integration.",
   "private": false,
+  "license": "MIT",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ashbhati/draw.git"
+  },
+  "homepage": "https://github.com/ashbhati/draw#readme",
+  "bugs": {
+    "url": "https://github.com/ashbhati/draw/issues"
+  },
+  "keywords": [
+    "diagram-editor",
+    "whiteboard",
+    "blackboard",
+    "infinite-canvas",
+    "mcp"
+  ],
   "bin": {
     "draw": "bin/draw.js"
   },
@@ -15,6 +32,7 @@
     "src/ui/storage.ts",
     "src/ui/autosave.ts",
     "dist/",
+    "LICENSE",
     "README.md",
     "CHANGELOG.md",
     "PLAN.md",

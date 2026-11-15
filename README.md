@@ -2,9 +2,9 @@
 
 Draw is a local-first, Excalidraw-based infinite canvas for editable diagrams. The `.draw` file is the editable source; PNG and JPEG exports are flattened images.
 
-## V1.2.0 release
+## V1.2.1 npm package preparation
 
-The latest source release is [`v1.2.0`](https://github.com/ashbhati/draw/tree/v1.2.0). It includes project workspaces, editable `.draw` import/export, image export, online image insertion, and MCP tools for creating and editing diagrams. MCP hosts now request approval in Draw without a manually copied pairing secret; approved hosts stay connected across restarts until revoked. The release tag is available on GitHub; npm publication remains pending the owner's choice of a root project license. See the [changelog](CHANGELOG.md) for release notes.
+The first npm distribution is being prepared as `@ashbhati/draw@1.2.1`, carrying the V1.2.0 feature set: project workspaces, editable `.draw` import/export, image export, online image insertion, and MCP tools for creating and editing diagrams. Draw is licensed under MIT. The npm package is not published yet; use the source setup below in the meantime. See the [changelog](CHANGELOG.md) for details.
 
 ### Human and agent workflows
 
@@ -14,9 +14,9 @@ People and MCP-connected agents work on the same editable Draw document. A perso
 
 ## Install and launch
 
-The intended end-user distribution is the public npm package `@ashbhati/draw`. The package targets macOS and Linux. Its Node.js engine range is `>=20.19.0 <21 || >=22.12.0`.
+When published, the npm package `@ashbhati/draw` installs the local Draw app. It targets macOS and Linux and requires Node.js `>=20.19.0 <21 || >=22.12.0`.
 
-Once the package is published:
+After publication, install and launch it with:
 
 ```sh
 npm install --global @ashbhati/draw
@@ -26,8 +26,6 @@ draw start
 `draw start` serves the production app on `http://127.0.0.1:4173` and opens the local browser when started from an interactive terminal. Use `draw start --no-open` to open the URL yourself, or `draw start --port 4300` to choose a different port. Keep the terminal process running while you use Draw. Draw autosaves the active workspace in the current browser on this device. Autosave is the local working copy; use **Save** (the floppy-disk icon) to create a portable editable `.draw` file. Use **Open** (the open-file icon) to import a `.draw` file as a separate workspace, and **Export** to create a flattened PNG or JPEG for sharing.
 
 The `.draw` file preserves editable elements, canvas settings, and embedded images. PNG and JPEG files do not preserve editable data. Save `.draw` files in a folder you back up; browser autosave is separate, stays in that browser profile and device, and is not a substitute for saving a portable file. If Draw cannot load its autosave, use its recovery panel to export the quarantined working copy or start a fresh workspace. See [Autosave recovery](docs/AUTOSAVE_RECOVERY.md).
-
-Public npm publication is pending the owner's choice of a root project license. No license has been selected or added by this implementation. Install commands above are ready for that release and do not work until the package is published.
 
 ## Run from source
 
