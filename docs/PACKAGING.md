@@ -1,8 +1,10 @@
 # Draw package and local MCP runtime
 
-## V1.2.3 npm distribution
+## V1.3.0 npm distribution
 
-Draw's V1.2.0 feature set is available on GitHub as commit `96d8fb6` and tag [`v1.2.0`](https://github.com/ashbhati/draw/tree/v1.2.0). The first npm distribution is version `1.2.3`, licensed under MIT, with source tag [`v1.2.3`](https://github.com/ashbhati/draw/tree/v1.2.3).
+Version `1.3.0` extends the `1.2.3` npm release with editable workspace bundle backup/import, the `draw doctor` health check, improved Google Images insertion, and MCP insertion of local PNG/JPEG files. It is licensed under MIT and published as `@ashbhatia/draw`.
+
+The first npm distribution was version `1.2.3`, with source tag [`v1.2.3`](https://github.com/ashbhati/draw/tree/v1.2.3). The original V1.2.0 feature set is available on GitHub as commit `96d8fb6` and tag [`v1.2.0`](https://github.com/ashbhati/draw/tree/v1.2.0).
 
 ## Supported package slice
 
@@ -49,7 +51,7 @@ npm run test:release
 
 `test:release` runs unit/config tests, the production build, the Chrome browser suite, production MCP round-trip, and a real `npm pack` + clean-prefix install followed by the packaged Chrome/MCP round-trip. The installed-package checks run from an empty temporary working directory with no `node_modules`, covering `draw help`, `draw start`, and `draw mcp`. GitHub Actions runs this release gate on Node 20 and 22 for pull requests and main-branch pushes.
 
-For V1.2.0, the release checks passed: 286 unit tests, the build, 58 editor Chrome E2E flows, the production MCP/IPC flow, and the installed-package MCP E2E flow. The V1.2.3 package preview includes the MIT license and generated app bundle. The local machine did not have Playwright's bundled Chromium installed, so the V1.2.0 browser flows used system Chrome. CI installs Playwright Chromium before running `test:release`.
+For V1.3.0, `npm run test:release` passed: 301 unit/config tests, the production build, 61 Chrome editor E2E flows, the production MCP/IPC flow, and the installed-package MCP E2E flow. The build has the existing large JavaScript chunk advisory. The V1.2.0 release checks passed 286 unit tests, 58 editor Chrome E2E flows, the production MCP/IPC flow, and the installed-package MCP E2E flow. The 1.2.3 package included the MIT license and generated app bundle. CI installs Playwright Chromium before running `test:release`.
 
 To run only the packaged browser check against an already installed tarball:
 

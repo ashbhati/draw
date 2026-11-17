@@ -2,9 +2,9 @@
 
 Draw is a local-first, Excalidraw-based infinite canvas for editable diagrams. The `.draw` file is the editable source; PNG and JPEG exports are flattened images.
 
-## V1.2.3 npm release
+## V1.3.0 npm release
 
-Draw is distributed from npm as `@ashbhatia/draw`. Version 1.2.3 carries the V1.2.0 feature set: project workspaces, editable `.draw` import/export, image export, online image insertion, and MCP tools for creating and editing diagrams. Draw is licensed under MIT. See the [changelog](CHANGELOG.md) and [GitHub release](https://github.com/ashbhati/draw/releases/tag/v1.2.3) for details.
+Draw is distributed from npm as `@ashbhatia/draw`. Version 1.3.0 adds portable `.drawbundle` workspace backups, `draw doctor` health checks, easier Google Images insertion using copy and paste, and MCP insertion of local images. Draw is licensed under MIT. See the [changelog](CHANGELOG.md) and [GitHub release](https://github.com/ashbhati/draw/releases/tag/v1.3.0) for details.
 
 ### Human and agent workflows
 

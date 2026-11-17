@@ -4,7 +4,7 @@
 
 Draw is a local-first, Excalidraw-like drawing tool for creating and editing diagrams on infinite canvases. The visual direction is the charcoal Blackboard style in the GAI World deck and the supplied human-machine flow example.
 
-The project began with one local canvas. The current V1.2.0 release organizes projects as workspaces, each with one editable infinite board, and lets a human or an MCP-connected agent create and edit the same native drawing.
+The project began with one local canvas. The current V1.3.0 release organizes projects as workspaces, each with one editable infinite board, and lets a human or an MCP-connected agent create and edit the same native drawing.
 
 ## Product principles
 
@@ -108,13 +108,24 @@ V1.2.0 is tagged on `main` as [`v1.2.0`](https://github.com/ashbhati/draw/tree/v
 - **Runtime:** the packaged CLI runs the production app and MCP host through private per-user local IPC on macOS and Linux.
 - **Manual UI refinement:** export controls retain readable labels and compact MCP controls use accessible icon buttons.
 
-V1.2.0 validation passed 286 unit tests, 58 Chrome editor E2E flows, the production MCP/IPC round trip, and the installed-package MCP E2E flow. The build passed with the existing large-chunk advisory. The default local release command expects Playwright Chromium to be installed; on this machine the same browser flows were run with system Chrome. The npm package is not published because the repository still has no owner-selected root project license; the GitHub source tag is available.
+V1.2.0 validation passed 286 unit tests, 58 Chrome editor E2E flows, the production MCP/IPC round trip, and the installed-package MCP E2E flow. The build passed with the existing large-chunk advisory. The default local release command expects Playwright Chromium to be installed; on this machine the same browser flows were run with system Chrome. The public npm package followed as version 1.2.3 after the MIT license and package metadata were added.
 
 Known limits for this release: one board per workspace, MCP file save never overwrites an existing file (`PATH_EXISTS`), Google Images is an external search tab rather than an embedded gallery, and the package supports macOS/Linux only. Details are in [README.md](README.md), [docs/PACKAGING.md](docs/PACKAGING.md), and [docs/MCP_CAPABILITY_MATRIX.md](docs/MCP_CAPABILITY_MATRIX.md).
 
-## Deferred beyond V1.2.0
+## V1.3.0 release status
 
-These remain deferred beyond V1.2.0 and can be prioritized based on actual use:
+V1.3.0 adds the following capabilities to the published Draw app:
+
+- **Google Images insertion:** copy an image from a search result/source page and paste it into Draw. MCP agents can insert local PNG/JPEG files from the configured document directory.
+- **Health check:** `draw doctor` checks app readiness, MCP transport, paired-client count, editor connection, and active workspace; `--json` provides a machine-readable report.
+- **Workspace portability:** download and restore `.drawbundle` backups containing workspaces, editable documents, and embedded images. Import adds workspaces without replacing existing ones.
+- **Toolbar clarity:** workspace bundle backup and damaged-data recovery use distinct icons.
+
+Release validation results are recorded in [docs/PACKAGING.md](docs/PACKAGING.md).
+
+## Deferred beyond V1.3.0
+
+These remain deferred beyond V1.3.0 and can be prioritized based on actual use:
 
 - Cloud sync, user accounts, collaboration, view/edit permissions, and comments.
 - Excalidraw file import/export or compatibility, if it becomes useful.
@@ -135,4 +146,4 @@ Draw stores workspaces and their one-board documents in browser-local IndexedDB.
 - **Initial backgrounds:** Blackboard and Whiteboard.
 - **Image exports:** PNG and JPEG; flattened by definition.
 - **Interoperability:** no Excalidraw-file compatibility requirement for v1.
-- **Current release:** V1.2.0; deferred work is listed in [Deferred beyond V1.2.0](#deferred-beyond-v120).
+- **Current release:** V1.3.0; deferred work is listed in [Deferred beyond V1.3.0](#deferred-beyond-v130).

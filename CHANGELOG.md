@@ -2,6 +2,18 @@
 
 This file records user-visible Draw releases. GitHub source tags and npm package versions are recorded separately when they differ.
 
+## [1.3.0] — 2026-11-16
+
+- Added `.drawbundle` backup and import for all local workspaces, editable diagrams, and embedded images.
+- Added `draw doctor` for local app and MCP health checks, with human-readable and JSON output.
+- Made Google Images insertion work by letting users paste a copied image directly into Draw; MCP agents can also insert local PNG/JPEG files from the configured document directory.
+- Distinguished workspace bundle backups from damaged-data recovery in the toolbar.
+
+### Validation
+
+- `npm run test:release` passed: 301 unit/config tests, the production build, 61 Chrome editor E2E flows, the production MCP/IPC flow, and the installed-package MCP E2E flow.
+- The production build reports the existing advisory about large JavaScript chunks.
+
 ## [1.2.3] — 2026-11-14
 
 - Released the local Draw app as the public npm package `@ashbhatia/draw` for macOS and Linux.
