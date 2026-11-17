@@ -6,10 +6,11 @@ Draw's V1.2.0 feature set is available on GitHub as commit `96d8fb6` and tag [`v
 
 ## Supported package slice
 
-- Distribution: the public npm package named `@ashbhatia/draw` installs the local Draw app and its small `draw start` and `draw mcp` launch commands.
+- Distribution: the public npm package named `@ashbhatia/draw` installs the local Draw app and its `draw start`, `draw mcp`, and `draw doctor` commands.
 - Runtime: macOS/Linux with Node.js in the range `>=20.19.0 <21 || >=22.12.0`.
 - `draw start`: serves the production Vite build on loopback and starts the per-user MCP IPC socket.
 - `draw mcp`: runs the MCP stdio host and sends MCP bridge operations through that Unix domain socket.
+- `draw doctor`: performs read-only checks of the local app, selected MCP transport, active paired-client count, editor connection, and loaded workspace. Use `draw doctor --json` for machine-readable output. It never prints credentials or client identities.
 - The browser editor connects to the local app over loopback HTTP, authenticates with the one-use terminal launch code, and receives bridge events on a short-lived ticketed Server-Sent Events stream.
 - Agent MCP operations must use the private socket and paired host capability. Editor sync and acknowledgements require the active editor secret. MCP mutations are handled against the currently authenticated editor tab and active document.
 
@@ -33,6 +34,8 @@ npm uninstall --global @ashbhatia/draw
 ```
 
 Starting Draw opens the local URL from an interactive terminal; `draw start --no-open` prints the URL without launching a browser. The user keeps the process running and opens the URL in Chrome or another supported browser. The package does not host drawings remotely. `.draw` files remain the editable copies; browser autosave lives in that browser profile and is not removed by package upgrades or uninstall.
+
+Use the toolbar's **Backup workspaces** button to download a versioned `.drawbundle` containing all local workspaces and editable documents. The **Open** button restores a bundle as additional workspaces; imported items are named with an “(imported)” suffix and existing local data is retained. The bundle includes each document's embedded image assets. Legacy workspace libraries, undo/redo and MCP operation history, and browser recovery records remain in the original browser profile and are not included.
 
 ## Package validation and release gate
 

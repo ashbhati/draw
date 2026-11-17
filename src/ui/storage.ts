@@ -1,4 +1,4 @@
-import { createEmptyDocument, normalizeStoredDrawDocument, validateDrawDocument, type DrawDocument } from "../document/document";
+import { createEmptyDocument, normalizeStoredDrawDocument, parseDrawFile, validateDrawDocument, type DrawDocument } from "../document/document";
 import { normalizeDrawImageAttributions } from "../document/attribution";
 import { compactOperationLedger, operationLedgerKey, OPERATION_SNAPSHOT_RETENTION_MS, OPERATION_TOMBSTONE_RETENTION_MS, sameSceneSnapshot, type DurableMcpOperation, type DurableMcpOperationResult, type DurableMcpRedo, type DurableMcpTombstone, type OperationLedgerEntry } from "../integrations/operation-ledger";
 
@@ -30,6 +30,11 @@ const MCP_COMPACTION_INTERVAL = 32;
 const MAX_DOCUMENT_SNAPSHOTS = 100;
 export const MCP_WORKSPACE_RECEIPT_LIMIT = 1_000;
 const MCP_WORKSPACE_RECEIPT_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+const WORKSPACE_BUNDLE_FORMAT = "draw-workspace-bundle";
+const WORKSPACE_BUNDLE_VERSION = 1;
+export const MAX_WORKSPACE_BUNDLE_BYTES = 250 * 1024 * 1024;
+const MAX_BUNDLE_WORKSPACES = 100;
+const MAX_BUNDLE_CANVASES = 1_000;
 const MAX_LIBRARY_OPERATION_RECEIPTS = 256;
 const LIBRARY_OPERATION_RECEIPT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 
@@ -37,6 +42,7 @@ type AutosaveOrder = { sessionId: string; sequence: number };
 
 export interface DrawWorkspace { id: string; name: string; createdAt: number; updatedAt: number }
 export interface DrawCanvas { id: string; workspaceId: string; name: string; documentId: string; createdAt: number; updatedAt: number }
+export interface DrawWorkspaceBundleImportResult { workspaces: DrawWorkspace[]; canvasCount: number; activeCanvasId: string }
 export interface LegacyDocumentRecovery {
   source: string;
   raw: unknown;
@@ -131,6 +137,17 @@ export class WorkspaceLibraryConflictError extends Error {
 
 function documentKey(id: string): IDBValidKey { return ["draw-document", id]; }
 function writeOrderKey(id: string): IDBValidKey { return ["draw-write-order", id]; }
+
+export function assertWorkspaceBundleFileSize(size: number): void {
+  if (!Number.isSafeInteger(size) || size < 0) throw new Error("Workspace backup file size is invalid.");
+  if (size > MAX_WORKSPACE_BUNDLE_BYTES) throw new Error("Workspace backup exceeds the 250 MiB bundle limit.");
+}
+
+/** Check the bundle limit before asking the browser to read the file into memory. */
+export async function readWorkspaceBundleText(file: Pick<Blob, "size" | "text">): Promise<string> {
+  assertWorkspaceBundleFileSize(file.size);
+  return file.text();
+}
 
 function recoveryRecord(raw: unknown, metadata?: unknown, reason?: string): LegacyDocumentRecovery {
   let original = raw;
@@ -801,6 +818,143 @@ export async function listCanvases(workspaceId: string): Promise<DrawCanvas[]> {
     const [items] = await Promise.all([requestValue<DrawCanvas[]>(req), waitForTransaction(tx)]);
     return items.sort((a, b) => a.createdAt - b.createdAt);
   } finally { db.close(); }
+}
+
+/** Create a self-contained JSON backup containing every workspace and editable canvas document. */
+export async function exportWorkspaceBundle(): Promise<string> {
+  const database = await openDatabase();
+  try {
+    const tx = database.transaction([WORKSPACES_STORE, CANVASES_STORE, DOCUMENTS_STORE], "readonly");
+    const workspacesRequest = tx.objectStore(WORKSPACES_STORE).getAll();
+    const canvasesRequest = tx.objectStore(CANVASES_STORE).getAll();
+    const documentStore = tx.objectStore(DOCUMENTS_STORE);
+    const documentsRequest = documentStore.getAll();
+    const documentKeysRequest = documentStore.getAllKeys();
+    const [workspaces, canvases, storedDocuments, storedDocumentKeys] = await Promise.all([
+      requestValue<DrawWorkspace[]>(workspacesRequest), requestValue<DrawCanvas[]>(canvasesRequest),
+      requestValue<unknown[]>(documentsRequest), requestValue<IDBValidKey[]>(documentKeysRequest), waitForTransaction(tx),
+    ]).then(([a, b, c, d]) => [a, b, c, d] as const);
+    const documentsById = new Map<string, unknown>();
+    for (const [index, value] of storedDocuments.entries()) {
+      const key = storedDocumentKeys[index];
+      if (!Array.isArray(key) || key[0] !== "draw-document" || typeof key[1] !== "string") continue;
+      if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+      const candidate = value as Partial<DrawDocument>;
+      const document = candidate.document;
+      if (candidate.format !== "draw" || typeof document !== "object" || document === null || document.id !== key[1]) continue;
+      documentsById.set(key[1], candidate);
+    }
+    const bundleWorkspaces = workspaces.sort((a, b) => a.createdAt - b.createdAt).map((workspace) => {
+      const workspaceCanvases = canvases.filter((canvas) => canvas.workspaceId === workspace.id).sort((a, b) => a.createdAt - b.createdAt);
+      if (workspaceCanvases.length === 0) throw new DrawStorageRecoveryError(`Workspace ${workspace.id} has no restorable canvas.`);
+      return {
+        name: workspace.name,
+        canvases: workspaceCanvases.map((canvas) => {
+          const storedDocument = documentsById.get(canvas.documentId);
+          if (!storedDocument) throw new DrawStorageRecoveryError(`Canvas ${canvas.id} is missing its editable document.`);
+          validateDrawDocument(storedDocument);
+          const document = structuredClone(storedDocument as DrawDocument);
+          normalizeDrawImageAttributions(document, "trusted-storage");
+          return { name: canvas.name, document };
+        }),
+      };
+    });
+    const bundle = { format: WORKSPACE_BUNDLE_FORMAT, version: WORKSPACE_BUNDLE_VERSION, createdAt: new Date().toISOString(), workspaces: bundleWorkspaces };
+    const serialized = `${JSON.stringify(bundle, null, 2)}\n`;
+    assertWorkspaceBundleFileSize(new TextEncoder().encode(serialized).byteLength);
+    return serialized;
+  } finally { database.close(); }
+}
+
+function parseWorkspaceBundle(value: string | unknown): Array<{ name: string; canvases: Array<{ name: string; document: DrawDocument }> }> {
+  let serialized: string;
+  let raw: unknown;
+  if (typeof value === "string") {
+    serialized = value;
+    assertWorkspaceBundleFileSize(new TextEncoder().encode(serialized).byteLength);
+    try { raw = JSON.parse(serialized); } catch { throw new Error("Workspace backup is not valid JSON."); }
+  } else {
+    try { serialized = JSON.stringify(value); } catch { throw new Error("Workspace backup is not valid JSON data."); }
+    if (typeof serialized !== "string") throw new Error("Workspace backup is not valid JSON data.");
+    assertWorkspaceBundleFileSize(new TextEncoder().encode(serialized).byteLength);
+    raw = value;
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new Error("Expected a Draw workspace backup bundle.");
+  const bundle = raw as Record<string, unknown>;
+  if (bundle.format !== WORKSPACE_BUNDLE_FORMAT) throw new Error('Expected a Draw workspace backup with format "draw-workspace-bundle".');
+  if (bundle.version !== WORKSPACE_BUNDLE_VERSION) throw new Error(`Unsupported Draw workspace backup version ${String(bundle.version)}.`);
+  if (!Array.isArray(bundle.workspaces) || bundle.workspaces.length < 1 || bundle.workspaces.length > MAX_BUNDLE_WORKSPACES) throw new Error(`Workspace backup must contain between 1 and ${MAX_BUNDLE_WORKSPACES} workspaces.`);
+  let canvasCount = 0;
+  return bundle.workspaces.map((entry, workspaceIndex) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new Error(`Workspace ${workspaceIndex + 1} is malformed.`);
+    const workspace = entry as Record<string, unknown>;
+    if (typeof workspace.name !== "string" || !workspace.name.trim() || workspace.name.length > 200) throw new Error(`Workspace ${workspaceIndex + 1} must have a name of 1 to 200 characters.`);
+    if (!Array.isArray(workspace.canvases) || workspace.canvases.length < 1) throw new Error(`Workspace "${workspace.name}" must contain at least one canvas.`);
+    const canvases = workspace.canvases.map((canvasValue, canvasIndex) => {
+      canvasCount += 1;
+      if (canvasCount > MAX_BUNDLE_CANVASES) throw new Error(`Workspace backup exceeds the ${MAX_BUNDLE_CANVASES} canvas limit.`);
+      if (typeof canvasValue !== "object" || canvasValue === null || Array.isArray(canvasValue)) throw new Error(`Canvas ${canvasIndex + 1} in "${workspace.name}" is malformed.`);
+      const canvas = canvasValue as Record<string, unknown>;
+      if (typeof canvas.name !== "string" || !canvas.name.trim() || canvas.name.length > 200) throw new Error(`Canvas ${canvasIndex + 1} in "${workspace.name}" must have a name of 1 to 200 characters.`);
+      let document: DrawDocument;
+      try { document = parseDrawFile(canvas.document); }
+      catch (error) { throw new Error(`Canvas "${canvas.name}" in "${workspace.name}" could not be restored: ${error instanceof Error ? error.message : String(error)}`); }
+      document.document.id = crypto.randomUUID();
+      document.document.title = canvas.name.trim();
+      document.document.documentRevision = 0;
+      document.document.viewRevision = 0;
+      validateDrawDocument(document);
+      return { name: canvas.name.trim(), document };
+    });
+    return { name: workspace.name.trim(), canvases };
+  });
+}
+
+/** Import validated workspace backups transactionally, creating new copies without replacing existing work. */
+export async function importWorkspaceBundle(value: string | unknown): Promise<DrawWorkspaceBundleImportResult> {
+  const imported = parseWorkspaceBundle(value);
+  const timestamp = Date.now();
+  const workspaces: DrawWorkspace[] = [];
+  const canvases: DrawCanvas[] = [];
+  const documents: DrawDocument[] = [];
+  let firstActive: { workspaceId: string; canvasId: string } | undefined;
+  for (const [workspaceIndex, sourceWorkspace] of imported.entries()) {
+    const id = crypto.randomUUID();
+    const importedSuffix = " (imported)";
+    const name = `${sourceWorkspace.name.slice(0, 200 - importedSuffix.length)}${importedSuffix}`;
+    const workspace = { id, name, createdAt: timestamp + workspaceIndex, updatedAt: timestamp + workspaceIndex } satisfies DrawWorkspace;
+    workspaces.push(workspace);
+    for (const [canvasIndex, sourceCanvas] of sourceWorkspace.canvases.entries()) {
+      const document = sourceCanvas.document;
+      const canvasId = crypto.randomUUID();
+      const createdAt = timestamp + workspaceIndex * MAX_BUNDLE_CANVASES + canvasIndex;
+      const canvas = { id: canvasId, workspaceId: id, name: sourceCanvas.name, documentId: document.document.id, createdAt, updatedAt: createdAt } satisfies DrawCanvas;
+      canvases.push(canvas);
+      documents.push(document);
+      firstActive ??= { workspaceId: id, canvasId };
+    }
+  }
+  if (!firstActive || documents.length === 0) throw new Error("Workspace backup contains no editable canvases.");
+
+  const database = await openDatabase();
+  try {
+    const tx = database.transaction([WORKSPACES_STORE, CANVASES_STORE, DOCUMENTS_STORE, WORKSPACE_META_STORE], "readwrite");
+    const workspaceStore = tx.objectStore(WORKSPACES_STORE);
+    const canvasStore = tx.objectStore(CANVASES_STORE);
+    const documentStore = tx.objectStore(DOCUMENTS_STORE);
+    for (const workspace of workspaces) workspaceStore.put(workspace, workspace.id);
+    for (const canvas of canvases) canvasStore.put(canvas, canvas.id);
+    for (const document of documents) documentStore.put(document, documentKey(document.document.id));
+    const activeDocument = documents[0]!;
+    documentStore.put(activeDocument, CURRENT_DOCUMENT_KEY);
+    documentStore.put({ sessionId: AUTOSAVE_SESSION_ID, sequence: ++autosaveSequence } satisfies AutosaveOrder, writeOrderKey(activeDocument.document.id));
+    const meta = tx.objectStore(WORKSPACE_META_STORE);
+    meta.put(firstActive, ACTIVE_POINTER_KEY);
+    meta.put(true, INITIALIZED_KEY);
+    incrementWorkspaceCatalogRevision(meta);
+    await waitForTransaction(tx);
+    return { workspaces, canvasCount: canvases.length, activeCanvasId: firstActive.canvasId };
+  } finally { database.close(); }
 }
 
 /** Return the active project catalog and its monotonic revision for MCP optimistic concurrency. */

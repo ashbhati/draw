@@ -2,10 +2,11 @@ import { mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/pro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadDrawFile, loadDrawFileSnapshot, writeNewArtifact } from "./mcp-file-access";
+import { loadDrawFile, loadDrawFileSnapshot, loadMcpImageFile, writeNewArtifact } from "./mcp-file-access";
 import { serializeDrawFile, createEmptyDocument } from "../document/document";
 
 const roots: string[] = [];
+const png = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jJ5sAAAAASUVORK5CYII=", "base64"));
 async function makeRoot() {
   const root = await mkdtemp(join(tmpdir(), "draw-mcp-files-"));
   roots.push(root);
@@ -15,6 +16,19 @@ async function makeRoot() {
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 describe("MCP document file access", () => {
+  it("safely reads an embedded PNG from the configured image folder", async () => {
+    const root = await makeRoot();
+    await writeFile(join(root, "robot.png"), png);
+    expect(await loadMcpImageFile(root, "robot.png")).toMatchObject({ mimeType: "image/png", width: 1, height: 1, dataURL: expect.stringMatching(/^data:image\/png;base64,/) });
+  });
+
+  it("rejects image paths outside the configured folder and content that is not a PNG or JPEG", async () => {
+    const root = await makeRoot();
+    await writeFile(join(root, "notes.png"), "not an image");
+    await expect(loadMcpImageFile(root, "../notes.png")).rejects.toThrow(/plain filename/i);
+    await expect(loadMcpImageFile(root, "notes.png")).rejects.toThrow(/bytes do not match/i);
+  });
+
   it("writes and reloads a native editable Draw file under the configured root", async () => {
     const root = await makeRoot();
     const source = createEmptyDocument("Round trip");

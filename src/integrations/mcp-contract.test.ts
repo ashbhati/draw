@@ -289,6 +289,13 @@ describe("MCP tool input contract", () => {
     })).toThrow(/valid Openverse ID/i);
   });
 
+  it("allows a local image insertion without fabricated provider attribution", () => {
+    expect(parseMcpToolInputImpl("insert_image", {
+      documentId: "doc-1", expectedDocumentRevision: 2, idempotencyKey: "local-image-1", x: 10, y: 20,
+      dataURL: `data:image/png;base64,${"A".repeat(64)}`, mimeType: "image/png",
+    })).toMatchObject({ operation: "insert_image", input: { documentId: "doc-1", mimeType: "image/png", x: 10, y: 20 } });
+  });
+
   it("rejects pressure values on lines and arrows and rejects zero-length paths", () => {
     expect(() => parseMcpToolInput("create_elements", { elements: [
       { id: "line", type: "line", x: 0, y: 0, points: [[0, 0, 0.5], [10, 10, 0.5]] },

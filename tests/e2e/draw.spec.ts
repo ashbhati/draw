@@ -1777,6 +1777,33 @@ test("image tool offers device and Google web import, embeds bytes, and saves wi
   await expect.poll(async () => (await freshBridgeDocument(page)).document.elements.some((el: any) => el.customData?.drawSourceUrl === "https://images.example/robot.png")).toBe(true);
 });
 
+test("Google Images result links explain the paste flow and copied images insert into the active workspace", async ({ page }) => {
+  await page.locator("label").filter({ has: page.getByRole("radio", { name: "Insert image", exact: true }) }).click();
+  const dialog = page.getByRole("dialog", { name: "Insert image" });
+  await dialog.getByRole("button", { name: "From the web" }).click();
+  await dialog.getByLabel("Image URL", { exact: true }).fill("https://www.google.com/search?udm=2&q=robot+clipart");
+  await dialog.getByRole("button", { name: "Add image", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toContainText("Copy image");
+
+  const png = Buffer.from(await page.evaluate(() => {
+    const canvas = document.createElement("canvas"); canvas.width = 12; canvas.height = 12;
+    canvas.getContext("2d")!.fillRect(0, 0, 12, 12);
+    return canvas.toDataURL("image/png").split(",")[1];
+  }), "base64");
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.evaluate(async (base64) => {
+    const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": new Blob([bytes], { type: "image/png" }) })]);
+  }, png.toString("base64"));
+  await dialog.getByRole("button", { name: "Paste copied image", exact: true }).click();
+  await expect.poll(async () => {
+    const document = await freshBridgeDocument(page);
+    const image = document.document.elements.find((element: any) => element.type === "image");
+    return image && document.document.assets[image.fileId]?.dataURL;
+  }).toMatch(/^data:image\/png;base64,/);
+  await expect(dialog).not.toBeVisible();
+});
+
 test("web image import reports blocked sources and Escape restores toolbar focus", async ({ page }) => {
   await page.route("https://images.example/blocked.png", (route) => route.abort("failed"));
   await page.locator("label").filter({ has: page.getByRole("radio", { name: "Insert image", exact: true }) }).click();
@@ -1937,6 +1964,38 @@ test("stdio MCP searches Openverse, inserts by provider ID, and saves a reopenab
   } finally {
     await mcp.close();
     await rm(documentDir, { recursive: true, force: true });
+  }
+});
+
+test("stdio MCP inserts a bounded local PNG from the configured folder as an editable embedded image", async ({ page, baseURL }) => {
+  if (!baseURL) throw new Error("Playwright baseURL is required for the MCP local image test.");
+  const directory = await mkdtemp(join(tmpdir(), "draw-local-image-mcp-"));
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jJ5sAAAAASUVORK5CYII=", "base64");
+  await writeFile(join(directory, "robot.png"), png);
+  const mcp = await startStdioMcp(baseURL, directory);
+  try {
+    const available = await mcp.request("tools/list", {});
+    expect(available.result.tools.map((tool: any) => tool.name)).toContain("insert_local_image");
+    const current = await freshBridgeDocument(page);
+    const request = {
+      documentId: current.document.id, expectedDocumentRevision: current.document.documentRevision,
+      idempotencyKey: "e2e-local-image-insert", filename: "robot.png", x: 120, y: 180,
+    };
+    const inserted = await mcp.call("insert_local_image", request);
+    expect(inserted.error).toBeUndefined();
+    expect(JSON.parse(inserted.result.content[0].text)).toMatchObject({ embedded: true, filename: "robot.png" });
+    const changed = await freshBridgeDocument(page);
+    const image = changed.document.elements.find((element: any) => element.type === "image");
+    expect(image).toBeTruthy();
+    expect(changed.document.assets[image.fileId]).toMatchObject({ dataURL: `data:image/png;base64,${png.toString("base64")}` });
+
+    const retry = await mcp.call("insert_local_image", request);
+    expect(retry.error).toBeUndefined();
+    expect(JSON.parse(retry.result.content[0].text)).toEqual(JSON.parse(inserted.result.content[0].text));
+    expect((await freshBridgeDocument(page)).document.elements.filter((element: any) => element.type === "image")).toHaveLength(1);
+  } finally {
+    await mcp.close();
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
@@ -2865,6 +2924,39 @@ test("workspaces create, switch, rename, delete, and survive reload with one boa
   await page.getByRole("button", { name: "Delete workspace" }).click();
   await expect.poll(() => workspaceCount(page)).toBe(2);
   await expectActiveWorkspaceName(page, "Research workspace");
+});
+
+test("workspace bundles export and restore multiple editable workspaces without replacing originals", async ({ page }) => {
+  const originalWorkspaceName = (await page.getByRole("combobox", { name: "Saved workspaces" }).locator("option:checked").innerText()).trim();
+  await page.getByRole("button", { name: "New workspace" }).click();
+  await expect.poll(() => workspaceCount(page)).toBe(2);
+  const activeWorkspaceName = (await page.getByRole("combobox", { name: "Saved workspaces" }).locator("option:checked").innerText()).trim();
+  await page.locator('.excalidraw label[title^="Rectangle"]').click();
+  const board = await page.locator(".excalidraw canvas").last().boundingBox();
+  if (!board) throw new Error("The active canvas is unavailable.");
+  await page.mouse.move(board.x + board.width / 2 - 60, board.y + board.height / 2 - 35);
+  await page.mouse.down();
+  await page.mouse.move(board.x + board.width / 2 + 60, board.y + board.height / 2 + 35, { steps: 2 });
+  await page.mouse.up();
+  await expect(page.getByRole("button", { name: "Backup workspaces", exact: true })).toBeVisible();
+  const downloadWait = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Backup workspaces", exact: true }).click();
+  const backup = await downloadWait;
+  expect(backup.suggestedFilename()).toBe("Draw-workspaces.drawbundle");
+  const bundle = JSON.parse(await readFile(await backup.path(), "utf8"));
+  expect(bundle).toMatchObject({ format: "draw-workspace-bundle", version: 1 });
+  expect(bundle.workspaces).toHaveLength(2);
+  expect(bundle.workspaces[0].canvases[0].document.format).toBe("draw");
+  const backedUpActiveWorkspace = bundle.workspaces.find((workspace: any) => workspace.name === activeWorkspaceName);
+  expect(backedUpActiveWorkspace?.canvases[0].document.document.elements.some((element: any) => element.type === "rectangle" && !element.isDeleted)).toBe(true);
+
+  await page.locator('input[type="file"][accept*=".drawbundle"]').setInputFiles({
+    name: "Draw-workspaces.drawbundle", mimeType: "application/vnd.draw.workspace-bundle+json", buffer: Buffer.from(JSON.stringify(bundle)),
+  });
+  await expect.poll(() => workspaceCount(page)).toBe(4);
+  await expectActiveWorkspaceName(page, `${originalWorkspaceName} (imported)`);
+  await expect.poll(async () => (await readLocalDocument(page))?.format).toBe("draw");
+  await expect(page.getByText(/Existing workspaces were kept/)).toBeVisible();
 });
 
 test("pending autosave is preserved when switching workspaces", async ({ page }) => {

@@ -78,14 +78,15 @@ async function startInstalledMcp(bin: string, runtimeDirectory: string, configHo
   };
 }
 
-async function runInstalledCommand(bin: string, args: string[], cwd: string): Promise<{ code: number | null; output: string }> {
-  const child = spawn(process.execPath, [bin, ...args], { cwd, stdio: ["ignore", "pipe", "pipe"] });
+async function runInstalledCommand(bin: string, args: string[], cwd: string, env = process.env): Promise<{ code: number | null; output: string; stdout: string }> {
+  const child = spawn(process.execPath, [bin, ...args], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
-  child.stdout.setEncoding("utf8").on("data", (chunk: string) => { output += chunk; });
+  let stdout = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; output += chunk; });
   child.stderr.setEncoding("utf8").on("data", (chunk: string) => { output += chunk; });
   return new Promise((resolve, reject) => {
     child.once("error", reject);
-    child.once("exit", (code) => resolve({ code, output }));
+    child.once("exit", (code) => resolve({ code, output, stdout }));
   });
 }
 
@@ -109,11 +110,12 @@ test("installed npm package serves the production app and MCP edits it over loca
     const help = await runInstalledCommand(bin, ["help"], neutralCwd);
     expect(help.code, help.output).toBe(0);
     expect(help.output).toContain("draw start");
+    expect(help.output).toContain("draw doctor");
     // `script` gives the installed CLI a real terminal so launch-code display
     // follows the same trusted-terminal path users receive.
     runtimeProcess = spawn("script", buildPackagePtyArgs(bin, ["start", "--port", String(port), "--no-open"]), {
       cwd: neutralCwd,
-      env: { ...process.env, DRAW_RUNTIME_DIR: join(root, "run") },
+      env: { ...process.env, DRAW_RUNTIME_DIR: join(root, "run"), XDG_CONFIG_HOME: configHome },
       stdio: ["ignore", "pipe", "pipe"],
     }) as ChildProcessWithoutNullStreams;
     runtimeProcess.stdout.setEncoding("utf8");
@@ -138,6 +140,16 @@ test("installed npm package serves the production app and MCP edits it over loca
     await expect(page.getByRole("heading", { name: "Approve MCP client?" })).toBeVisible();
     await page.getByRole("button", { name: "Approve client" }).click();
     expect((await pairing).result.isError).not.toBe(true);
+
+    const doctor = await runInstalledCommand(bin, ["doctor", "--port", String(port), "--json"], neutralCwd, {
+      ...process.env, DRAW_RUNTIME_DIR: join(root, "run"), XDG_CONFIG_HOME: configHome,
+    });
+    expect(doctor.code, doctor.output).toBe(0);
+    expect(JSON.parse(doctor.stdout)).toMatchObject({ ready: true, transport: "private-socket", checks: expect.arrayContaining([
+      expect.objectContaining({ id: "paired", status: "pass" }),
+      expect.objectContaining({ id: "editor", status: "pass" }),
+      expect.objectContaining({ id: "canvas", status: "pass" }),
+    ]) });
 
     expect((await page.request.get(`${url}__draw/api/document?flush=1`)).status()).toBe(403);
     const current = JSON.parse((await mcp.tool("get_current_canvas", {})).result.content[0].text);

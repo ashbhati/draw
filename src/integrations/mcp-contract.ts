@@ -98,7 +98,7 @@ export type InsertImageInput = {
   height?: number;
   mimeType: "image/png" | "image/jpeg";
   dataURL: string;
-  attribution: {
+  attribution?: {
     provider: "Openverse";
     providerId: string;
     title: string;
@@ -636,11 +636,14 @@ function parseEmbeddedImage(value: unknown): McpCommand {
   if (typeof dataURL !== "string" || dataURL.length > maximumLength || !new RegExp(`^data:${mimeType.replace("/", "\\/")};base64,[A-Za-z0-9+/]+=*$`).test(dataURL)) {
     throw new McpValidationError("insert_image.dataURL must be a base64 PNG or JPEG no larger than 2 MiB.");
   }
-  const raw = requireRecord(input.attribution, "insert_image.attribution");
-  const attributionFields = new Set(["provider", "providerId", "title", "creator", "creatorUrl", "sourceUrl", "license", "licenseVersion", "licenseUrl", "attribution", "source", "capturedAt", "verification"]);
-  for (const field of Object.keys(raw)) if (!attributionFields.has(field)) throw new McpValidationError(`insert_image.attribution has unsupported field "${field}".`);
-  const normalizedAttribution = normalizeImageAttribution(raw, "unverified", true);
-  if (!normalizedAttribution) throw new McpValidationError("insert_image.attribution must contain a valid Openverse ID, title, supported license, capture date, and safe optional metadata.");
+  let normalizedAttribution: InsertImageInput["attribution"];
+  if (input.attribution !== undefined) {
+    const raw = requireRecord(input.attribution, "insert_image.attribution");
+    const attributionFields = new Set(["provider", "providerId", "title", "creator", "creatorUrl", "sourceUrl", "license", "licenseVersion", "licenseUrl", "attribution", "source", "capturedAt", "verification"]);
+    for (const field of Object.keys(raw)) if (!attributionFields.has(field)) throw new McpValidationError(`insert_image.attribution has unsupported field "${field}".`);
+    normalizedAttribution = normalizeImageAttribution(raw, "unverified", true) ?? undefined;
+    if (!normalizedAttribution) throw new McpValidationError("insert_image.attribution must contain a valid Openverse ID, title, supported license, capture date, and safe optional metadata.");
+  }
   let idempotencyPayload: InsertImageInput["idempotencyPayload"];
   if (input.idempotencyPayload !== undefined) {
     const stable = requireRecord(input.idempotencyPayload, "insert_image.idempotencyPayload");
@@ -662,7 +665,7 @@ function parseEmbeddedImage(value: unknown): McpCommand {
     ...(input.height !== undefined ? { height: optionalDimension(input.height, "insert_image.height") } : {}),
     mimeType,
     dataURL,
-    attribution: normalizedAttribution,
+    ...(normalizedAttribution ? { attribution: normalizedAttribution } : {}),
     ...(idempotencyPayload ? { idempotencyPayload } : {}),
   } };
 }

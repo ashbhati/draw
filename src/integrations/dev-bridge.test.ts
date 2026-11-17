@@ -97,6 +97,17 @@ function createBridgeHarness(options: DrawMcpBridgeOptions = {}, config: { mode?
 }
 
 describe("Draw MCP Vite bridge", () => {
+  it("reports read-only editor and canvas readiness without exposing credentials", async () => {
+    const bridge = createBridgeHarness();
+    expect((await bridge.request("GET", "/__draw/api/health")).body).toMatchObject({ ok: true, editorConnected: false, documentLoaded: false });
+    const document = createEmptyDocument("Doctor check");
+    await bridge.registerClient("doctor-tab");
+    await bridge.editorRequest("doctor-tab", "PUT", "/__draw/api/document", { clientId: "doctor-tab", document });
+    const health = await bridge.request("GET", "/__draw/api/health");
+    expect(health).toMatchObject({ status: 200, body: { ok: true, editorConnected: true, documentLoaded: true } });
+    expect(JSON.stringify(health.body)).not.toMatch(/secret|capability|credential/i);
+  });
+
   it("requires a caller-bound one-use editor approval for workspace library deletion", async () => {
     const bridge = createBridgeHarness({ commandTimeoutMs: 1_000 });
     const document = createEmptyDocument("Library confirmation");

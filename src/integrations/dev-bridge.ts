@@ -73,6 +73,11 @@ const API_ROOT = "/__draw/api";
 const DEFAULT_COMMAND_TIMEOUT_MS = 20_000;
 const DEFAULT_LATE_ACK_RETENTION_MS = 60_000;
 const DEFAULT_MAX_BODY_BYTES = 100 * 1024 * 1024;
+const HEALTH_ROUTE = `${API_ROOT}/health`;
+
+function isHealthRoute(method: string | undefined, path: string): boolean {
+  return method === "GET" && path === HEALTH_ROUTE;
+}
 
 export function isMcpOnlyRoute(method: string | undefined, path: string): boolean {
   return (method === "GET" && path === `${API_ROOT}/document`)
@@ -80,8 +85,13 @@ export function isMcpOnlyRoute(method: string | undefined, path: string): boolea
     || (method === "POST" && /^\/__draw\/api\/confirmations\/[^/]+\/consume$/.test(path));
 }
 
+/** Routes allowed over the private runtime socket, including its non-sensitive health probe. */
+export function isPrivateIpcRoute(method: string | undefined, path: string): boolean {
+  return isMcpOnlyRoute(method, path) || isHealthRoute(method, path);
+}
+
 function isMcpRoute(method: string | undefined, path: string): boolean {
-  return isMcpOnlyRoute(method, path)
+  return isPrivateIpcRoute(method, path)
     || (method === "GET" && path === `${API_ROOT}/mcp/clients`)
     || (method === "PUT" && /^\/__draw\/api\/mcp\/clients\/[^/]+$/.test(path));
 }
@@ -338,11 +348,11 @@ export function createDrawMcpPlugin(options: DrawMcpBridgeOptions = {}): Plugin 
         }
 
         try {
-          const authManager = await getAuth();
           if (request.method === "GET" && path === `${API_ROOT}/health`) {
-            sendJson(response, 200, { ok: true });
+            sendJson(response, 200, { ok: true, editorConnected: activeClientId !== null, documentLoaded: document !== null });
             return;
           }
+          const authManager = await getAuth();
 
           if (server.config.isProduction && request.method === "POST" && path === `${API_ROOT}/events/ticket`) {
             const authenticated = await authorizedEditor(request);

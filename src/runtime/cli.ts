@@ -3,19 +3,21 @@ import { fileURLToPath } from "node:url";
 import { resolve, join } from "node:path";
 import { createDrawRuntimeServer } from "./server";
 import { getDefaultDrawRuntimeDirectory } from "./ipc";
+import { formatDrawDoctorReport, inspectDrawHealth } from "./doctor";
 
-export type DrawCommand = "start" | "mcp" | "help";
-export type DrawCommandOptions = { openBrowser?: boolean; port?: number };
+export type DrawCommand = "start" | "mcp" | "doctor" | "help";
+export type DrawCommandOptions = { openBrowser?: boolean; port?: number; json?: boolean };
 
 export function parseDrawCommand(args: string[]): { command: DrawCommand; options: DrawCommandOptions } {
-  const known = new Set<DrawCommand>(["start", "mcp", "help"]);
+  const known = new Set<DrawCommand>(["start", "mcp", "doctor", "help"]);
   const command = (args[0] ?? "start") as DrawCommand;
-  if (!known.has(command)) throw new Error(`Unknown command: ${command}. Use draw start, draw mcp, or draw help.`);
+  if (!known.has(command)) throw new Error(`Unknown command: ${command}. Use draw start, draw mcp, draw doctor, or draw help.`);
   const options: DrawCommandOptions = {};
   for (let index = 1; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--no-open" && command === "start") options.openBrowser = false;
-    else if (argument === "--port" && command === "start") {
+    else if (argument === "--json" && command === "doctor") options.json = true;
+    else if (argument === "--port" && (command === "start" || command === "doctor")) {
       const port = Number(args[++index]);
       if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Draw port must be an integer between 1 and 65535.");
       options.port = port;
@@ -60,9 +62,13 @@ async function runMcpHost(): Promise<void> {
 export async function runDrawCli(args = process.argv.slice(2)): Promise<void> {
   const { command, options } = parseDrawCommand(args);
   if (command === "help") {
-    console.log("Draw — editable local diagram canvas\n\nUsage:\n  draw start [--port PORT] [--no-open]\n  draw mcp\n  draw help\n");
+    console.log("Draw — editable local diagram canvas\n\nUsage:\n  draw start [--port PORT] [--no-open]\n  draw mcp\n  draw doctor [--port PORT] [--json]\n  draw help\n");
   } else if (command === "start") await startApp(options);
-  else await runMcpHost();
+  else if (command === "doctor") {
+    const report = await inspectDrawHealth({ ...(options.port ? { port: options.port } : {}) });
+    console.log(options.json ? JSON.stringify(report, null, 2) : formatDrawDoctorReport(report));
+    if (!report.ready) process.exitCode = 1;
+  } else await runMcpHost();
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

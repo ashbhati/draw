@@ -13,7 +13,7 @@ import {
 import { isSafeHttpsUrl } from "./document/attribution";
 import { composeBackgroundSvg, hasSelectedExportElements, renderExportBlob, selectExportElements } from "./export/background";
 import { recolorForBackgroundPreset } from "./export/background-recolor";
-import { listWorkspaceLibraryRecoveries, exportWorkspaceLibraryRecovery, createFreshWorkspaceFromRecovery, exportLegacyDocumentRecovery, loadLegacyDocumentRecovery, addWorkspaceLibraryItem, saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createWorkspaceWithCanvas, createCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, listCanvases, listWorkspaces, loadCanvasDocument, loadWorkspaceLibrary, loadWorkspaceLibraryState, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, saveWorkspaceLibrary, setActiveCanvas, type DrawCanvas, type DrawLibraryItem, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
+import { listWorkspaceLibraryRecoveries, exportWorkspaceBundle, importWorkspaceBundle, readWorkspaceBundleText, exportWorkspaceLibraryRecovery, createFreshWorkspaceFromRecovery, exportLegacyDocumentRecovery, loadLegacyDocumentRecovery, addWorkspaceLibraryItem, saveCurrentDocument, loadCurrentDocument, commitMcpOperation, commitMcpWorkspaceOperation, getMcpWorkspaceCatalog, loadMcpWorkspaceOperationReceipt, restoreMcpCommandSnapshot, loadMcpOperation, loadLatestMcpUndoOperation, loadLatestMcpRedoOperation, createWorkspace, createWorkspaceWithCanvas, createCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, listCanvases, listWorkspaces, loadCanvasDocument, loadWorkspaceLibrary, loadWorkspaceLibraryState, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, saveWorkspaceLibrary, setActiveCanvas, type DrawCanvas, type DrawLibraryItem, type DrawWorkspace, type McpWorkspaceAction as StorageMcpWorkspaceAction } from "./ui/storage";
 import { cloneLibraryElements, collectLibrarySelection, collectReferencedLibraryAssets, libraryItemsEquivalentForPersistence, reloadLibraryAfterConflict, resolveLibraryWorkspaceFromCatalog, shouldPersistLibraryChange } from "./ui/draw-library";
 import { applyElementUpdates, routeBoundArrows, type EditableSceneElement } from "./integrations/scene-updates";
 import { acquireWriterLock, type WriterLock } from "./ui/writer-lock";
@@ -30,7 +30,7 @@ import { canRestoreCancelledMcpCommand } from "./integrations/mcp-cancellation";
 import { canRedoMcpOperation, canUndoMcpOperation, hashMcpOperation, resolveOperationReplay, type DurableMcpOperation } from "./integrations/operation-ledger";
 import { validateEmbeddedImage, type OpenverseAttribution } from "./integrations/openverse";
 
-import { fetchWebImage, googleImagesSearchUrl } from "./integrations/web-image";
+import { fetchWebImage, googleImagesSearchUrl, readClipboardImage } from "./integrations/web-image";
 
 type Status = "loading" | "ready" | "saving" | "saved" | "error";
 type BridgeCommand = { id: string; clientId: string; clientIdentity: string; operation: string; input: any; document?: DrawDocument };
@@ -840,6 +840,23 @@ export default function App() {
   const openFile = async (file?: File) => {
     if (!file) return;
     try {
+      if (file.name.toLowerCase().endsWith(".drawbundle")) {
+        const bundleText = await readWorkspaceBundleText(file);
+        await settleEditorBeforeSwitch();
+        autosave.cancelPending(); bridgeAutosave.cancelPending();
+        const imported = await importWorkspaceBundle(bundleText);
+        const activeWorkspace = imported.workspaces[0]!;
+        const activeCanvas = (await listCanvases(activeWorkspace.id)).find((canvas) => canvas.id === imported.activeCanvasId);
+        if (!activeCanvas) throw new Error("The imported workspace bundle's active canvas is missing.");
+        const restored = await loadCanvasDocument(activeCanvas.id);
+        if (!restored) throw new Error("The imported workspace bundle has no editable canvas.");
+        await activateWorkspaceLibrary(activeWorkspace.id);
+        lastMcpOperation.current = null; lastUndoneOperation.current = null;
+        setDocument(restored); setEditorKey((key) => key + 1); setStatus("saved");
+        await refreshWorkspaceList(activeWorkspace.id, activeCanvas.id);
+        setMessage(`Restored ${imported.workspaces.length} workspace${imported.workspaces.length === 1 ? "" : "s"} from backup. Existing workspaces were kept.`);
+        return;
+      }
       const imported = await parseDrawFile(await file.text());
       await settleEditorBeforeSwitch();
       autosave.cancelPending(); bridgeAutosave.cancelPending();
@@ -854,6 +871,17 @@ export default function App() {
     }
     catch (error) { setMessage(error instanceof Error ? error.message : "Could not open this Draw file."); }
     finally { if (fileInput.current) fileInput.current.value = ""; }
+  };
+
+  const backupWorkspaces = async () => {
+    try {
+      await settleEditorBeforeSwitch();
+      const bundle = await exportWorkspaceBundle();
+      download(new Blob([bundle], { type: "application/vnd.draw.workspace-bundle+json;charset=utf-8" }), filename("Draw-workspaces", "drawbundle"));
+      setMessage("Workspace backup downloaded with editable drawings and embedded images. Legacy libraries, edit history, and recovery records stay in this browser and are not included.");
+    } catch (error) {
+      setMessage(error instanceof Error ? `Could not back up workspaces: ${error.message}` : "Could not back up workspaces.");
+    }
   };
 
   const refreshWorkspaceList = async (selectWorkspaceId = activeWorkspaceId, selectCanvasId = activeCanvasId) => {
@@ -1003,6 +1031,17 @@ export default function App() {
     if (!writerOwned.current) return;
     setImageSource("choose"); setImageSearchError(""); setImagePickerOpen(true);
   };
+  const insertImageInCanvas = async (image: Awaited<ReturnType<typeof readClipboardImage>>, documentId: string, api: ExcalidrawImperativeAPI, sourceUrl?: string) => {
+    const bitmap = await createImageBitmap(await (await fetch(image.dataURL)).blob());
+    bitmap.close();
+    if (activeDocumentIdRef.current !== documentId || apiRef.current !== api || !writerOwned.current) throw new Error("The workspace changed. Open the image tool again to insert into the active workspace.");
+    const state = api.getAppState();
+    const zoom = state.zoom.value;
+    const element = await addEmbeddedImage(image, { x: (state.width / 2) / zoom - state.scrollX, y: (state.height / 2) / zoom - state.scrollY });
+    if (sourceUrl) element.customData = { drawSourceUrl: sourceUrl };
+    api.updateScene({ elements: [...api.getSceneElementsIncludingDeleted(), element], appState: { selectedElementIds: { [element.id]: true } }, captureUpdate: CaptureUpdateAction.IMMEDIATELY });
+    closeImagePicker(); setMessage("Image embedded in this workspace. Save a .draw file to keep an editable copy.");
+  };
   const insertWebImage = async () => {
     const documentId = activeDocumentIdRef.current;
     const api = apiRef.current;
@@ -1012,18 +1051,27 @@ export default function App() {
     setImageInsertBusy(true); setImageSearchError("");
     try {
       const image = await fetchWebImage(webImageUrl, { signal: controller.signal });
-      const bitmap = await createImageBitmap(await (await fetch(image.dataURL)).blob());
-      bitmap.close();
       controller.signal.throwIfAborted();
-      if (activeDocumentIdRef.current !== documentId || apiRef.current !== api || !writerOwned.current) throw new Error("The workspace changed. Open the image tool again to insert into the active workspace.");
-      const state = api.getAppState();
-      const zoom = state.zoom.value;
-      const element = await addEmbeddedImage(image, { x: (state.width / 2) / zoom - state.scrollX, y: (state.height / 2) / zoom - state.scrollY });
-      element.customData = { drawSourceUrl: image.sourceUrl };
-      api.updateScene({ elements: [...api.getSceneElementsIncludingDeleted(), element], appState: { selectedElementIds: { [element.id]: true } }, captureUpdate: CaptureUpdateAction.IMMEDIATELY });
-      closeImagePicker(); setMessage("Image embedded in this workspace. Save a .draw file to keep an editable copy.");
+      await insertImageInCanvas(image, documentId, api, image.sourceUrl);
     } catch (error) {
       if (!controller.signal.aborted) setImageSearchError(error instanceof Error ? error.message : "Could not insert this image.");
+    } finally {
+      if (imageRequest.current === controller) { imageRequest.current = null; setImageInsertBusy(false); }
+    }
+  };
+  const insertClipboardImage = async () => {
+    const documentId = activeDocumentIdRef.current;
+    const api = apiRef.current;
+    if (!api || !documentId || !writerOwned.current) return;
+    const controller = new AbortController();
+    imageRequest.current?.abort(); imageRequest.current = controller;
+    setImageInsertBusy(true); setImageSearchError("");
+    try {
+      const image = await readClipboardImage();
+      controller.signal.throwIfAborted();
+      await insertImageInCanvas(image, documentId, api);
+    } catch (error) {
+      if (!controller.signal.aborted) setImageSearchError(error instanceof Error ? error.message : "Could not insert the copied image.");
     } finally {
       if (imageRequest.current === controller) { imageRequest.current = null; setImageInsertBusy(false); }
     }
@@ -1476,7 +1524,7 @@ export default function App() {
           elements: relationships,
         };
       } else if (event.operation === "insert_image") {
-        const input = event.input as { dataURL: string; mimeType: "image/png" | "image/jpeg"; attribution: OpenverseAttribution; x: number; y: number; width?: number; height?: number };
+        const input = event.input as { dataURL: string; mimeType: "image/png" | "image/jpeg"; attribution?: OpenverseAttribution; x: number; y: number; width?: number; height?: number };
         const encoded = input.dataURL.split(",", 2)[1];
         if (!encoded) throw new Error("Image data is malformed.");
         const binary = atob(encoded);
@@ -1491,7 +1539,7 @@ export default function App() {
         const height = input.height ?? (input.width ? Math.max(24, Math.round(input.width * validated.height / validated.width)) : defaultHeight);
         const [imageElement] = convertToExcalidrawElements([{
           id: randomId(), type: "image", fileId, x: input.x, y: input.y, width, height,
-          customData: { drawAttribution: input.attribution },
+          ...(input.attribution ? { customData: { drawAttribution: input.attribution } } : {}),
         }] as any[], { regenerateIds: false }) as any[];
         if (!imageElement) throw new Error("Could not create the image element.");
         filesToRestore = [file];
@@ -1501,7 +1549,7 @@ export default function App() {
           documentRevision: current.document.documentRevision + 1, viewRevision: current.document.viewRevision,
           background: current.document.canvas.background, viewport: current.document.canvas.viewport,
         });
-        result = { addedElementIds: [imageElement.id], assetId: fileId, attribution: input.attribution };
+        result = { addedElementIds: [imageElement.id], assetId: fileId, ...(input.attribution ? { attribution: input.attribution } : {}) };
       } else if (event.operation === "update_elements") {
         const update = applyElementUpdates(elements, event.input.updates, measureTextWithExcalidraw);
         elements = update.elements;
@@ -2042,8 +2090,9 @@ export default function App() {
         <button className={`button button-quiet mcp-toolbar-button${editorConnected ? " connected" : ""}`} aria-label={editorConnected ? "MCP connected" : "Connect MCP"} disabled={!canWrite} onClick={() => { setConnectError(""); setConnectOpen(true); }} title={editorConnected ? "Editor connected to the local MCP bridge" : "Connect this editor to the local MCP bridge"}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.07 0l3-3A5 5 0 0 0 13 2.93l-1.72 1.71M14 11a5 5 0 0 0-7.07 0l-3 3A5 5 0 0 0 11 21.07l1.71-1.72" /></svg></button>
         <button ref={mcpClientsTrigger} className="button button-quiet mcp-toolbar-button" aria-label="MCP clients" disabled={!canWrite || mcpManagementOpening} aria-busy={mcpManagementOpening} onClick={() => void openMcpManagement()} title="Manage connected MCP clients"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" /></svg></button>
         <span className="toolbar-divider file-actions-divider" aria-hidden="true" />
-        <button className="button button-quiet file-action" aria-label="Open" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open a .draw file as a new workspace" : "Close the other Draw tab to open files here"}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v2M3 7v13h17l2-10H7L3 20" /></svg></button>
-        <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,application/vnd.draw+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
+        <button className="button button-quiet file-action" aria-label="Open" disabled={!canWrite} onClick={() => fileInput.current?.click()} title={canWrite ? "Open a .draw file or restore a .drawbundle backup" : "Close the other Draw tab to open files here"}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v2M3 7v13h17l2-10H7L3 20" /></svg></button>
+        <input ref={fileInput} className="visually-hidden" type="file" accept=".draw,.drawbundle,application/vnd.draw+json,application/vnd.draw.workspace-bundle+json,application/json" onChange={(event) => void openFile(event.target.files?.[0])} />
+        <button className="button button-quiet file-action" aria-label="Backup workspaces" disabled={!canWrite} onClick={() => void backupWorkspaces()} title="Download a .drawbundle backup of workspace drawings and embedded images; legacy libraries and edit history are not included"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m4 7.5 8-4.5 8 4.5v9L12 21l-8-4.5v-9ZM4 7.5l8 4.5 8-4.5M12 12v5m-2-2 2 2 2-2" /></svg></button>
         {libraryRecoveries.length > 0 && <button className="button button-quiet" aria-label="Library recovery backups" title="View preserved library backups" onClick={() => setLibraryRecoveryOpen(true)}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><path d="M12 8v5m0 3h.01M12 3 2 21h20L12 3Z" /></svg></button>}
         {recoveryDataAvailable && !recoveryAvailable && <button className="button button-quiet" aria-label="Download recovery backup (JSON)" title="Recovery backup: preserved damaged autosave data (JSON), not the current drawing" onClick={() => void (async () => {
           try {
@@ -2067,7 +2116,9 @@ export default function App() {
           <label htmlFor="draw-image-query">Search Google Images</label>
           <div><input id="draw-image-query" value={imageQuery} onChange={(event) => setImageQuery(event.target.value)} maxLength={200} placeholder="e.g. chalk robot" /><button className="button" disabled={!imageQuery.trim()} type="submit">Search Google Images ↗</button></div>
         </form>
-        <p>Google Images opens in a new tab. Copy the image address from the source site, then paste it below. Search results do not grant permission to reuse an image.</p>
+        <p>Google Images opens in a new tab. Right-click the image you want, choose <strong>Copy image</strong>, return here, then paste it below. Search results do not grant permission to reuse an image.</p>
+        <button className="button" type="button" disabled={!canWrite || imageInsertBusy} onClick={() => void insertClipboardImage()}>{imageInsertBusy ? "Adding…" : "Paste copied image"}</button>
+        <p>Or paste a direct PNG or JPEG image URL. Google result-page links are not image URLs.</p>
         <form className="draw-web-search" onSubmit={(event) => { event.preventDefault(); void insertWebImage(); }}>
           <label htmlFor="draw-web-image-url">Image URL</label>
           <div><input id="draw-web-image-url" type="url" value={webImageUrl} onChange={(event) => setWebImageUrl(event.target.value)} placeholder="https://example.com/image.png" required /><button className="button" disabled={!canWrite || imageInsertBusy || !webImageUrl.trim()} type="submit">{imageInsertBusy ? "Adding…" : "Add image"}</button></div>

@@ -1,7 +1,7 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import "fake-indexeddb/auto";
 import { createEmptyDocument, parseDrawFile, serializeDrawFile } from "../document/document";
-import { addWorkspaceLibraryItem, commitMcpOperation, commitMcpWorkspaceOperation, createCanvas, createFreshWorkspaceFromRecovery, createWorkspace, createWorkspaceWithCanvas, deleteCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, duplicateCanvas, DrawStorageRecoveryError, exportLegacyDocumentRecovery, exportWorkspaceLibraryRecovery, getMcpWorkspaceCatalog, listCanvases, listWorkspaces, listWorkspaceLibraryRecoveries, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadLegacyDocumentRecovery, loadMcpOperation, loadMcpWorkspaceOperationReceipt, loadWorkspaceLibrary, loadWorkspaceLibraryState, MCP_WORKSPACE_RECEIPT_LIMIT, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, restoreMcpCommandSnapshot, saveCurrentDocument, saveWorkspaceLibrary, setActiveCanvas, WorkspaceLibraryConflictError } from "./storage";
+import { addWorkspaceLibraryItem, assertWorkspaceBundleFileSize, commitMcpOperation, commitMcpWorkspaceOperation, createCanvas, createFreshWorkspaceFromRecovery, createWorkspace, createWorkspaceWithCanvas, deleteCanvas, deleteWorkspace, deleteWorkspaceLibraryItem, duplicateCanvas, DrawStorageRecoveryError, exportLegacyDocumentRecovery, exportWorkspaceBundle, exportWorkspaceLibraryRecovery, getMcpWorkspaceCatalog, importWorkspaceBundle, listCanvases, listWorkspaces, listWorkspaceLibraryRecoveries, loadCanvasDocument, loadCurrentDocument, loadLatestMcpRedoOperation, loadLatestMcpUndoOperation, loadLegacyDocumentRecovery, loadMcpOperation, loadMcpWorkspaceOperationReceipt, loadWorkspaceLibrary, loadWorkspaceLibraryState, MAX_WORKSPACE_BUNDLE_BYTES, MCP_WORKSPACE_RECEIPT_LIMIT, readWorkspaceBundleText, renameCanvas, renameWorkspace, renameWorkspaceLibraryItem, restoreMcpCommandSnapshot, saveCurrentDocument, saveWorkspaceLibrary, setActiveCanvas, WorkspaceLibraryConflictError } from "./storage";
 import { canRedoMcpOperation, canUndoMcpOperation, OPERATION_RESULT_RETENTION_MS, OPERATION_SNAPSHOT_RETENTION_MS, resolveOperationReplay, type DurableMcpOperation } from "../integrations/operation-ledger";
 
 describe("local Draw autosave", () => {
@@ -118,6 +118,88 @@ describe("local Draw autosave", () => {
     expect(copy?.document.documentRevision).toBe(0);
     expect(copyCanvas.workspaceId).not.toBe(originalCanvas.workspaceId);
     expect(await listCanvases(copyCanvas.workspaceId)).toEqual([copyCanvas]);
+  });
+
+  it("backs up all workspaces and restores them as independent editable copies", async () => {
+    const first = createEmptyDocument("Service map");
+    first.document.elements.push({ id: "service-node", type: "rectangle", x: 11, y: 22, width: 90, height: 40 });
+    first.document.assets["asset-1"] = { id: "asset-1", dataURL: "data:image/png;base64,AA==" };
+    const second = createEmptyDocument("Research notes");
+    second.document.elements.push({ id: "idea", type: "text", x: 9, y: 14, text: "Keep editable" });
+    const originalA = await createWorkspaceWithCanvas("Platform", "Service map", first);
+    const originalB = await createWorkspaceWithCanvas("Research", "Research notes", second);
+    await saveWorkspaceLibrary(originalA.workspace.id, [{ id: "legacy-library-item", name: "Legacy saved shape", created: Date.now(), elements: [], assets: {} }], 0);
+
+    const bundleText = await exportWorkspaceBundle();
+    const bundle = JSON.parse(bundleText);
+    expect(bundle).toMatchObject({ format: "draw-workspace-bundle", version: 1 });
+    expect(bundle.workspaces.map((workspace: any) => workspace.name)).toEqual(["Platform", "Research"]);
+    expect(bundle.workspaces[0]).not.toHaveProperty("library");
+
+    const imported = await importWorkspaceBundle(bundleText);
+    expect(imported).toMatchObject({ canvasCount: 2 });
+    expect(imported.workspaces).toHaveLength(2);
+    const all = await listWorkspaces();
+    expect(all).toHaveLength(4);
+    const importedA = all.find((workspace) => workspace.id === imported.workspaces[0]?.id)!;
+    const importedB = all.find((workspace) => workspace.id === imported.workspaces[1]?.id)!;
+    expect(importedA.name).toBe("Platform (imported)");
+    expect(importedB.name).toBe("Research (imported)");
+    const aDoc = await loadCanvasDocument((await listCanvases(importedA.id))[0]!.id);
+    const bDoc = await loadCanvasDocument((await listCanvases(importedB.id))[0]!.id);
+    expect(aDoc?.document.id).not.toBe(originalA.document.document.id);
+    expect(aDoc?.document.elements).toEqual(first.document.elements);
+    expect(aDoc?.document.assets).toEqual(first.document.assets);
+    expect(bDoc?.document.elements).toEqual(second.document.elements);
+    expect((await loadCurrentDocument())?.document.id).toBe(aDoc?.document.id);
+    expect(await loadWorkspaceLibrary(importedA.id)).toEqual([]);
+  });
+
+  it("preserves canvas order and activates the first canvas when restoring a multi-canvas bundle", async () => {
+    const bundle = {
+      format: "draw-workspace-bundle", version: 1,
+      workspaces: [{ name: "Imported project", canvases: [
+        { name: "Overview", document: createEmptyDocument("Overview") },
+        { name: "Details", document: createEmptyDocument("Details") },
+      ] }],
+    };
+    const imported = await importWorkspaceBundle(bundle);
+    const canvases = await listCanvases(imported.workspaces[0]!.id);
+    expect(canvases.map((canvas) => canvas.name)).toEqual(["Overview", "Details"]);
+    expect(imported.activeCanvasId).toBe(canvases[0]!.id);
+    const active = await getMcpWorkspaceCatalog();
+    expect(active.activeWorkspaceId).toBe(imported.workspaces[0]!.id);
+    expect(active.activeCanvasId).toBe(imported.activeCanvasId);
+  });
+
+  it("backs up healthy workspaces when the document store contains an invalid orphan", async () => {
+    await createWorkspaceWithCanvas("Healthy project", "Current drawing");
+    const database = await openDrawDatabaseForTest();
+    const transaction = database.transaction("documents", "readwrite");
+    transaction.objectStore("documents").put({ format: "draw", document: { id: "orphan-invalid" } }, ["draw-document", "orphan-invalid"]);
+    await transactionDone(transaction);
+    database.close();
+
+    const bundle = JSON.parse(await exportWorkspaceBundle());
+    expect(bundle.workspaces).toHaveLength(1);
+    expect(bundle.workspaces[0].name).toBe("Healthy project");
+  });
+
+  it("rejects an oversized workspace backup before reading its file contents", async () => {
+    const text = vi.fn(async () => "{}");
+    await expect(readWorkspaceBundleText({ size: MAX_WORKSPACE_BUNDLE_BYTES + 1, text })).rejects.toThrow(/250 MiB/);
+    expect(text).not.toHaveBeenCalled();
+  });
+
+  it("validates every workspace bundle document before writing any imported workspace", async () => {
+    await createWorkspace("Existing workspace");
+    const before = await listWorkspaces();
+    const invalidBundle = JSON.stringify({ format: "draw-workspace-bundle", version: 1, workspaces: [
+      { name: "Valid one", canvases: [{ name: "One", document: createEmptyDocument("One") }] },
+      { name: "Broken", canvases: [{ name: "Broken", document: { format: "draw", formatVersion: 999 } }] },
+    ] });
+    await expect(importWorkspaceBundle(invalidBundle)).rejects.toThrow(/unsupported|invalid|document/i);
+    expect(await listWorkspaces()).toEqual(before);
   });
 
   it("creates a default board atomically with a workspace and rejects a second board in that workspace", async () => {

@@ -31,6 +31,10 @@ describe("production Draw runtime", () => {
     expect(home.status).toBe(200);
     expect(await home.text()).toContain("production draw");
 
+    const health = await fetch(new URL("/__draw/api/health", server.url));
+    expect(health.status).toBe(200);
+    expect(await health.json()).toEqual({ ok: true, editorConnected: false, documentLoaded: false });
+
     for (const [path, init] of [
       ["/__draw/api/document?flush=1", { method: "GET" }],
       ["/__draw/api/commands", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ operation: "pair_mcp_client", input: {} }) }],
@@ -74,6 +78,8 @@ describe("production Draw runtime", () => {
 
   it("accepts only MCP API traffic through the protected socket and rejects editor endpoints there", async () => {
     const server = await startRuntime();
+    const health = await requestDrawIpc(server.socketPath, "/__draw/api/health");
+    expect(health).toMatchObject({ status: 200, body: { ok: true, editorConnected: false, documentLoaded: false } });
     const response = await requestDrawIpc(server.socketPath, "/__draw/api/mcp/pair", {
       method: "POST", body: JSON.stringify({}),
     });

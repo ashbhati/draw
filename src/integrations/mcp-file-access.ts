@@ -4,6 +4,7 @@ import { link, lstat, open, readFile, realpath, unlink } from "node:fs/promises"
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { DrawDocumentError, parseDrawFile, serializeDrawFile, type DrawDocument } from "../document/document";
+import { MAX_IMAGE_BYTES as MAX_EMBEDDED_IMAGE_BYTES, validateEmbeddedImage } from "./openverse";
 
 const MAX_DRAW_BYTES = 100 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
@@ -61,6 +62,26 @@ export async function loadDrawFileSnapshot(root: string, filename: string): Prom
 
 export async function loadDrawFile(root: string, filename: string): Promise<DrawDocument> {
   return (await loadDrawFileSnapshot(root, filename)).document;
+}
+
+/** Read a PNG or JPEG only from the configured MCP folder, then validate and embed it. */
+export async function loadMcpImageFile(root: string, filename: string): Promise<Awaited<ReturnType<typeof validateEmbeddedImage>>> {
+  const extension = extname(filename).toLowerCase();
+  const kind = extension === ".png" ? "png" : extension === ".jpg" || extension === ".jpeg" ? "jpeg" : null;
+  if (!kind) throw new Error("Image filename must end in .png, .jpg, or .jpeg.");
+  const { target } = await targetInRoot(root, filename, kind, false);
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error("MCP image target must be a regular file.");
+    if (stat.size === 0 || stat.size > MAX_EMBEDDED_IMAGE_BYTES) throw new Error("Image must be between 1 byte and 2 MiB.");
+    const bytes = await handle.readFile();
+    if (bytes.byteLength === 0 || bytes.byteLength > MAX_EMBEDDED_IMAGE_BYTES) throw new Error("Image must be between 1 byte and 2 MiB.");
+    return await validateEmbeddedImage(bytes, kind === "png" ? "image/png" : "image/jpeg");
+  } finally {
+    await handle?.close();
+  }
 }
 
 export async function drawFileFingerprint(root: string, filename: string): Promise<string> {

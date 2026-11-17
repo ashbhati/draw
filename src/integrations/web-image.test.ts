@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { fetchWebImage, googleImagesSearchUrl } from "./web-image";
+import { fetchWebImage, googleImagesSearchUrl, isGoogleImagesSearchUrl, validateClipboardImage } from "./web-image";
 
 const png = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jJ5sAAAAASUVORK5CYII=", "base64"));
 describe("web image import", () => {
@@ -8,6 +8,20 @@ describe("web image import", () => {
     expect(url.origin).toBe("https://www.google.com");
     expect(url.searchParams.get("q")).toBe("robot & chalk #1");
     expect(url.searchParams.get("udm")).toBe("2");
+  });
+  it("recognizes Google Images result links and does not mistake them for image files", () => {
+    expect(isGoogleImagesSearchUrl("https://www.google.com/search?udm=2&q=robot+clipart#sv=abc")).toBe(true);
+    expect(isGoogleImagesSearchUrl("https://www.google.com/search?tbm=isch&q=robot")).toBe(true);
+    expect(isGoogleImagesSearchUrl("https://images.example/robot.png")).toBe(false);
+    expect(isGoogleImagesSearchUrl("not a URL")).toBe(false);
+  });
+  it("validates PNG bytes copied from the browser clipboard", async () => {
+    const image = await validateClipboardImage(new Blob([png], { type: "image/png" }));
+    expect(image).toMatchObject({ width: 1, height: 1, mimeType: "image/png", dataURL: expect.stringMatching(/^data:image\/png;base64,/) });
+  });
+  it("rejects unsupported and oversized clipboard images", async () => {
+    await expect(validateClipboardImage(new Blob(["<svg/>"] , { type: "image/svg+xml" }))).rejects.toThrow(/PNG or JPEG/);
+    await expect(validateClipboardImage(new Blob([new Uint8Array(2 * 1024 * 1024 + 1)], { type: "image/png" }))).rejects.toThrow(/2 MiB/);
   });
   it("embeds validated image bytes using an anonymous CORS request", async () => {
     const fetcher = vi.fn().mockResolvedValue(new Response(png, { headers: { "content-type": "image/png" } }));

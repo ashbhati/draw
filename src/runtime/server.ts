@@ -3,7 +3,7 @@ import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import { extname, join, resolve, sep } from "node:path";
 import type { Plugin, ViteDevServer } from "vite";
-import { createDrawMcpPlugin, isMcpOnlyRoute, type DrawMcpBridgeOptions } from "../integrations/dev-bridge";
+import { createDrawMcpPlugin, isPrivateIpcRoute, type DrawMcpBridgeOptions } from "../integrations/dev-bridge";
 import { createPrivateIpcServer, getDefaultDrawRuntimeDirectory } from "./ipc";
 
 const MIME_TYPES: Record<string, string> = {
@@ -146,7 +146,7 @@ export async function createDrawRuntimeServer(options: DrawRuntimeServerOptions)
   const runtimeDirectory = options.runtimeDirectory ?? getDefaultDrawRuntimeDirectory();
   const ipc = await createPrivateIpcServer(runtimeDirectory, (request, response) => {
     const path = new URL(request.url ?? "/", "http://draw.local").pathname;
-    if (!isMcpOnlyRoute(request.method, path)) {
+    if (!isPrivateIpcRoute(request.method, path)) {
       sendJson(response, 403, { error: "The Draw IPC socket accepts MCP tool routes only." });
       return;
     }

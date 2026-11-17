@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { readLocalMcpCredential, getLocalMcpIdentity, writeLocalMcpCredential } from "./mcp-client-credentials";
 import * as z from "zod/v4";
 import { parseMcpToolInput, summarizeCurrentCanvas } from "./mcp-contract";
-import { loadDrawFileSnapshot, writeNewArtifact } from "./mcp-file-access";
+import { loadDrawFileSnapshot, loadMcpImageFile, writeNewArtifact } from "./mcp-file-access";
 import { assertInlineArtifactSize } from "./mcp-result-limits";
 import { shouldRequireOpenConfirmation } from "../document/open-safety";
 import { serializeDrawFile } from "../document/document";
@@ -289,6 +289,28 @@ function createServer() {
     assertDocumentContext(document, input.documentId, input.expectedDocumentRevision);
     const results = await searchOpenverseImages(input.query, { ...(input.page ? { page: input.page } : {}), ...(input.category ? { category: input.category } : { category: "illustration" }), ...(input.license ? { license: input.license } : {}) });
     return textResult({ results, count: results.length, page: input.page ?? 1, notice: "Verify the individual license and attribution before reuse; Openverse does not guarantee item-level licensing." });
+  });
+
+  server.registerTool("insert_local_image", {
+    description: "Insert a PNG or JPEG from DRAW_MCP_DOCUMENT_DIR as an editable image embedded in the active Draw document. Use only a plain filename in that configured folder; the image is copied into the .draw document and remains available offline. Maximum 2 MiB and 16 megapixels. Existing files are never modified.",
+    inputSchema: z.object({
+      documentId: z.string().min(1).max(200), expectedDocumentRevision: z.number().int().nonnegative(), idempotencyKey: idempotencyKeySchema,
+      filename: z.string().min(1).max(160), x: z.number().finite(), y: z.number().finite(),
+      width: z.number().finite().min(24).max(5000).optional(), height: z.number().finite().min(24).max(5000).optional(),
+    }).strict(),
+  }, async (input) => {
+    const document = await bridgeRequest("/__draw/api/document?flush=1");
+    // A same-key retry may carry the now-stale original revision; let the
+    // durable operation ledger replay it, while still binding to this document.
+    assertDocumentIdentity(document, input.documentId);
+    const image = await loadMcpImageFile(fileRoot(), input.filename);
+    const command = parseMcpToolInput("insert_image", {
+      documentId: input.documentId, expectedDocumentRevision: input.expectedDocumentRevision, idempotencyKey: input.idempotencyKey,
+      x: input.x, y: input.y, ...(input.width !== undefined ? { width: input.width } : {}), ...(input.height !== undefined ? { height: input.height } : {}),
+      mimeType: image.mimeType, dataURL: image.dataURL,
+    });
+    const result = await bridgeRequest("/__draw/api/commands", { method: "POST", body: JSON.stringify(command) });
+    return textResult({ ...result.result, embedded: true, filename: input.filename });
   });
 
   server.registerTool("insert_openverse_image", {
